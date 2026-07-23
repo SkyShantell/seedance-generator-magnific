@@ -12,6 +12,10 @@ import os
 import re
 import time
 import requests
+import shutil
+import subprocess
+import tempfile
+import textwrap
 from datetime import datetime
 from urllib.parse import urlparse
 from html import unescape as html_unescape
@@ -68,6 +72,154 @@ def fetch_video_bytes(video_url: str) -> bytes | None:
         return resp.content
     except Exception:
         return None
+
+
+FONT_CANDIDATES = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    "C:/Windows/Fonts/arialbd.ttf",
+]
+
+
+def get_ffmpeg_executable() -> str | None:
+    """Find FFmpeg from the OS, with imageio-ffmpeg as an optional fallback."""
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path:
+        return ffmpeg_path
+
+    try:
+        import imageio_ffmpeg  # Optional fallback.
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def get_overlay_font() -> str | None:
+    """Return a bold font file that FFmpeg drawtext can use."""
+    for candidate in FONT_CANDIDATES:
+        if Path(candidate).exists():
+            return candidate
+    return None
+
+
+def wrap_hook_text(hook: str, width: int = 20, max_lines: int = 5) -> str:
+    """Wrap a TikTok hook into short centered lines without breaking words."""
+    cleaned = re.sub(r"\s+", " ", (hook or "").strip())
+    lines = textwrap.wrap(
+        cleaned,
+        width=width,
+        break_long_words=False,
+        break_on_hyphens=False,
+    )
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        if len(" ".join(lines)) < len(cleaned):
+            lines[-1] = lines[-1].rstrip(" .") + "…"
+    return "\n".join(lines)
+
+
+def _escape_filter_path(path: str) -> str:
+    """Escape a file path for use inside an FFmpeg filter string."""
+    return path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+
+
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=100)
+def add_hook_with_ffmpeg(video_url: str, hook: str) -> tuple[bytes | None, str | None]:
+    """Download a completed video and add the selected hook with FFmpeg.
+
+    Returns (processed_mp4_bytes, error_message). Results are cached by URL and
+    hook, so Streamlit reruns do not repeatedly encode the same video.
+    """
+    if not video_url:
+        return None, "No completed video URL was provided."
+    if not hook or not hook.strip():
+        return fetch_video_bytes(video_url), None
+
+    ffmpeg_path = get_ffmpeg_executable()
+    if not ffmpeg_path:
+        return None, (
+            "FFmpeg is not installed on the app server. Add a packages.txt file "
+            "containing ffmpeg."
+        )
+
+    source_bytes = fetch_video_bytes(video_url)
+    if not source_bytes:
+        return None, "The completed video could not be downloaded from Magnific."
+
+    wrapped_lines = wrap_hook_text(hook).splitlines()
+    font_path = get_overlay_font()
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="seedance_hook_") as temp_dir:
+            temp_path = Path(temp_dir)
+            input_path = temp_path / "input.mp4"
+            output_path = temp_path / "output_with_hook.mp4"
+            input_path.write_bytes(source_bytes)
+
+            line_filters = []
+            for line_index, line in enumerate(wrapped_lines):
+                text_path = temp_path / f"hook_{line_index}.txt"
+                text_path.write_text(line, encoding="utf-8")
+
+                drawtext_parts = []
+                if font_path:
+                    drawtext_parts.append(f"fontfile='{_escape_filter_path(font_path)}'")
+                else:
+                    drawtext_parts.append("font='DejaVu Sans:style=Bold'")
+
+                drawtext_parts.extend([
+                    f"textfile='{_escape_filter_path(str(text_path))}'",
+                    "fontcolor=white",
+                    "fontsize=h*0.045",
+                    "borderw=4",
+                    "bordercolor=black@0.88",
+                    "shadowcolor=black@0.55",
+                    "shadowx=2",
+                    "shadowy=2",
+                    "x=(w-text_w)/2",
+                    f"y=h*0.13+{line_index}*h*0.058",
+                ])
+                line_filters.append("drawtext=" + ":".join(drawtext_parts))
+
+            video_filter = ",".join(line_filters)
+
+            command = [
+                ffmpeg_path,
+                "-hide_banner",
+                "-loglevel", "error",
+                "-y",
+                "-i", str(input_path),
+                "-map", "0:v:0",
+                "-map", "0:a?",
+                "-vf", video_filter,
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-crf", "18",
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-movflags", "+faststart",
+                str(output_path),
+            ]
+
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=240,
+                check=False,
+            )
+
+            if completed.returncode != 0 or not output_path.exists():
+                details = (completed.stderr or "Unknown FFmpeg error").strip().splitlines()
+                return None, details[-1] if details else "Unknown FFmpeg error"
+
+            return output_path.read_bytes(), None
+
+    except subprocess.TimeoutExpired:
+        return None, "FFmpeg timed out while adding the hook."
+    except Exception as exc:
+        return None, f"FFmpeg overlay failed: {exc}"
 
 # ── Constants ───────────────────────────────────────────────────────
 MAGNIFIC_MCP_URL = "https://mcp.magnific.com"
@@ -134,15 +286,11 @@ Return ONLY valid JSON (no markdown, no backticks):
 {{"product_name": "...", "hook_options": ["hook 1", "hook 2", "hook 3", "hook 4", "hook 5"], "caption": "tiktok caption (NOT the hook — a separate short caption for the post)", "hashtags": "#tag1 #tag2..."}}"""
 
 TEXTHOOK_PROMPT_SYSTEM = """You are a TikTok Shop affiliate content producer. Write a
-Seedance 2.0 video prompt that BURNS IN on-screen text as part of the AI render.
-
-The selected text hook to burn in: {selected_hook}
+Seedance 2.0 video prompt for a clean text-hook b-roll video.
 
 HARD RULES:
 - SILENT video — NO audio, NO voiceover
-- The text hook MUST appear as large bold white text with a subtle dark drop shadow,
-  centered in the upper third of the frame. The text appears at 00:00 and stays on
-  screen for the entire video. It looks like a native TikTok text overlay.
+- ABSOLUTELY NO on-screen text, captions, subtitles, overlays, signs, watermarks, or logos
 - No face, no person, no character — only a hand in the reveal shot
 - Two acts: random b-roll (~3s) → hard cut to product reveal (~5s)
 - ~8 seconds total, 9:16 vertical
@@ -150,37 +298,31 @@ HARD RULES:
 
 CRITICAL — B-ROLL RULES:
 The opening b-roll must be a RANDOM mundane real-life scene. It must NOT relate to the
-product in any way. Pick from scenes like:
+product in any way. Pick ONE scene at random, such as:
 - Person's feet walking on a sidewalk
 - Cars driving on a highway at golden hour
 - Coffee being poured into a mug
 - Rain droplets on a window
 - Hand pushing a grocery cart down an aisle
 - Laundry tumbling in a dryer
-- Dog trotting ahead on a leash (shot from behind)
-- Crosswalk signal changing, crowd crossing
+- Dog trotting ahead on a leash, filmed from behind
+- Crosswalk signal changing while a crowd crosses
 - Leaves blowing across a parking lot
-- Steam rising off pavement after rain
-Pick ONE at random. The more unrelated to the product, the better — that's the style.
+- Steam rising from pavement after rain
+The more unrelated to the product, the better.
 
 Prompt template:
 9:16 vertical, TikTok UGC aesthetic, silent, no audio, no voiceover. Handheld phone-camera
 feel with natural micro-shake. Warm bright daylight, slightly saturated. No face, no person,
-no character — only a hand in the second half.
+no character — only a hand in the second half. No text or graphics anywhere in the video.
 
-Large bold white text with subtle dark drop shadow centered in the upper third of the frame
-reads: "{selected_hook}" — the text appears immediately and stays on screen the entire video.
+[00:00-00:03] Establishing b-roll: first-person POV of one random mundane scene that is
+completely unrelated to the product. Casual handheld drift. No product on screen.
 
-[00:00-00:03] Establishing b-roll: first-person POV [RANDOM MUNDANE SCENE — NOT related to
-the product]. Casual handheld drift. No product on screen. The white text hook is visible
-in the upper third.
-
-[00:03-00:08] Hard cut to outdoors on a surface. A single medium-brown-skinned hand holds up
-[PRODUCT + visual detail] toward camera, slowly rotating and tilting so the detail catches
-warm light. Hand fills lower half. Soft blurred background. The white text hook remains
-visible in the upper third.
-
-No face. No person above the wrist.
+[00:03-00:08] Hard cut to an outdoor or casual real-life surface. A single
+medium-brown-skinned hand holds up [PRODUCT + visual detail] toward camera, slowly rotating
+and tilting so the detail catches warm light. Hand fills the lower half. Soft blurred
+background. No face. No person above the wrist.
 
 Return ONLY valid JSON (no markdown, no backticks):
 {{"product_name": "...", "prompt": "the full seedance prompt under 1900 chars", "char_count": 123}}"""
@@ -364,7 +506,8 @@ def write_prompt(
         system = SHOE_VIDEO_SYSTEM.format(voiceover_instruction=vo)
         dur = duration
     else:
-        system = TEXTHOOK_PROMPT_SYSTEM.format(selected_hook=selected_hook or "")
+        # The selected hook is added after generation with FFmpeg.
+        system = TEXTHOOK_PROMPT_SYSTEM
         dur = 8
 
     try:
@@ -656,7 +799,7 @@ repeat these steps to get a fresh one.
         else:
             duration = 8
             voice_script = None
-            st.caption("Always 8s, silent. You'll get the text hook to burn in via CapCut.")
+            st.caption("Always 8s and silent. The selected hook is added afterward with FFmpeg.")
 
     # ════════════════════════════════════════════════════════════════
     #  STEP 1 — PASTE LINKS
@@ -934,9 +1077,9 @@ repeat these steps to get a fresh one.
                 elif result.get("error"):
                     st.error(f"Error: {result['error']}")
 
-                # Show which hook was burned in
+                # Show the selected hook. Manual videos still need the FFmpeg step afterward.
                 if result.get("accepted_hook"):
-                    st.success(f"🔥 Burned-in hook: {result['accepted_hook']}")
+                    st.success(f"📝 Selected hook: {result['accepted_hook']}")
                 if result.get("caption"):
                     st.text_input("Caption:", value=result["caption"], key=f"cap_{i}")
                 if result.get("hashtags"):
@@ -981,6 +1124,7 @@ repeat these steps to get a fresh one.
                         "image_url": fp["image_url"],
                         "source_url": fp["source_url"],
                         "prompt": r.get("prompt", ""),
+                        "accepted_hook": r.get("accepted_hook"),
                         "hook_options": r.get("hook_options"),
                         "caption": r.get("caption"),
                         "hashtags": r.get("hashtags"),
@@ -1067,14 +1211,14 @@ repeat these steps to get a fresh one.
             else:
                 st.warning(f"⚠️ **{product['name']}** — Status: {gen_result['status']}")
 
-            # Show which hook was burned into the video
+            # Save the hook so FFmpeg can add it after the video completes
             if hook_data_for_product:
                 gen_result["accepted_hook"] = selected_hook
                 gen_result["hook_options"] = hook_data_for_product.get("hook_options", [])
                 gen_result["caption"] = hook_data_for_product.get("caption")
                 gen_result["hashtags"] = hook_data_for_product.get("hashtags")
                 if selected_hook:
-                    st.info(f"🔥 Burned-in hook: {selected_hook}")
+                    st.info(f"📝 Hook queued for FFmpeg: {selected_hook}")
                 if hook_data_for_product.get("caption"):
                     st.caption(f"Caption: {hook_data_for_product['caption']}")
                 if hook_data_for_product.get("hashtags"):
@@ -1112,12 +1256,12 @@ repeat these steps to get a fresh one.
     if saved_gens:
         st.divider()
         st.subheader("④ Past Generations")
-        st.caption(f"{len(saved_gens)} saved — survives page refreshes. Check status, watch videos, or regenerate.")
+        st.caption(f"{len(saved_gens)} saved — refresh statuses to show finished videos, add hooks with FFmpeg, download, or regenerate.")
 
         # Bulk actions
         action_col1, action_col2, action_col3 = st.columns(3)
         if magnific_token and api_key:
-            check_all = action_col1.button("🔄 Check All Statuses", use_container_width=True)
+            check_all = action_col1.button("🔄 Refresh & Show Finished", use_container_width=True)
         else:
             check_all = False
         clear_completed = action_col2.button("🧹 Clear Completed", use_container_width=True)
@@ -1168,30 +1312,49 @@ repeat these steps to get a fresh one.
                 if creation_id:
                     st.caption(f"Creation ID: `{creation_id}`")
 
-                # Show video if completed and we have a URL — kept small so
-                # multiple videos fit comfortably on the page
+                # Show a completed video directly on the site. For text-hook videos,
+                # FFmpeg adds the selected hook before preview and download.
                 video_url = result.get("url") or result.get("preview_url")
                 if video_url and status == "completed":
                     video_col, _spacer = st.columns([1, 2])
                     with video_col:
-                        try:
-                            st.video(video_url)
-                        except Exception:
-                            st.markdown(f"🎬 [Watch video]({video_url})")
+                        display_bytes = None
+                        display_error = None
+                        hook_text = result.get("accepted_hook", "")
 
-                        video_bytes = fetch_video_bytes(video_url)
-                        if video_bytes:
+                        if hook_text:
+                            with st.spinner("Adding the hook with FFmpeg..."):
+                                display_bytes, display_error = add_hook_with_ffmpeg(video_url, hook_text)
+                        else:
+                            display_bytes = fetch_video_bytes(video_url)
+
+                        if display_bytes:
+                            st.video(display_bytes)
                             safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', product_name)[:40]
+                            suffix = "_with_hook" if hook_text else ""
                             st.download_button(
-                                "⬇️ Download video",
-                                data=video_bytes,
-                                file_name=f"{safe_name}_{creation_id or i}.mp4",
+                                "⬇️ Download finished video",
+                                data=display_bytes,
+                                file_name=f"{safe_name}_{creation_id or i}{suffix}.mp4",
                                 mime="video/mp4",
                                 key=f"dl_{i}",
                                 use_container_width=True,
                             )
                         else:
-                            st.caption("⚠️ Couldn't fetch video for download — use the player above or the link.")
+                            try:
+                                st.video(video_url)
+                            except Exception:
+                                st.markdown(f"🎬 [Watch original video]({video_url})")
+                            if display_error:
+                                st.error(f"Hook overlay error: {display_error}")
+                            else:
+                                st.caption("⚠️ Couldn't fetch the video for download.")
+
+                        with st.expander("Original video", expanded=False):
+                            try:
+                                st.video(video_url)
+                            except Exception:
+                                st.markdown(f"🎬 [Watch original video]({video_url})")
 
                 # Show product image thumbnail
                 if result.get("image_url") and status != "completed":
@@ -1232,6 +1395,10 @@ repeat these steps to get a fresh one.
                         new_result["source_url"] = result.get("source_url", "")
                         new_result["style"] = result.get("style", "")
                         new_result["duration"] = result.get("duration", 15)
+                        new_result["accepted_hook"] = result.get("accepted_hook")
+                        new_result["hook_options"] = result.get("hook_options", [])
+                        new_result["caption"] = result.get("caption")
+                        new_result["hashtags"] = result.get("hashtags")
                         new_result["generated_at"] = datetime.now().isoformat()
                         # Add new generation, keep old one
                         add_generation(new_result)
@@ -1245,10 +1412,21 @@ repeat these steps to get a fresh one.
                     if result.get("image_url"):
                         st.text_input("Image URL:", value=result["image_url"], key=f"img_{i}")
 
-            # Show which hook was burned into this video
+            # The hook is editable because FFmpeg adds it after generation.
             if result.get("accepted_hook"):
-                with st.expander(f"📝 Text Hook — {product_name}", expanded=False):
-                    st.success(f"🔥 Burned-in hook: {result['accepted_hook']}")
+                with st.expander(f"📝 FFmpeg Text Hook — {product_name}", expanded=False):
+                    st.info(f"Current hook: {result['accepted_hook']}")
+                    edited_hook = st.text_area(
+                        "Edit the hook without regenerating the AI video:",
+                        value=result["accepted_hook"],
+                        key=f"edit_hook_{i}",
+                        height=90,
+                    )
+                    if st.button("✅ Save hook & rebuild preview", key=f"save_hook_{i}"):
+                        saved_gens[i]["accepted_hook"] = edited_hook.strip()
+                        save_generations(saved_gens)
+                        st.rerun()
+
                     if result.get("hook_options"):
                         st.caption("Other options that were available:")
                         for h in result["hook_options"]:
