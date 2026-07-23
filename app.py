@@ -1,13 +1,12 @@
 """
-Seedance Video Generator — Streamlit App
-=========================================
-Paste TikTok Shop links → pick a video style → hit Generate.
-Built for VAs who don't touch the terminal.
+Seedance Video Generator — Streamlit App (v2)
+==============================================
+Paste TikTok Shop links → pick a style → select the right product photo →
+generate videos automatically OR get prompts to generate manually.
 """
 
 import streamlit as st
 import anthropic
-import base64
 import json
 import os
 import re
@@ -42,43 +41,24 @@ HEADERS = {
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  SYSTEM PROMPTS — one per video style
+#  SYSTEM PROMPTS
 # ═══════════════════════════════════════════════════════════════════
 
-SHOE_VIDEO_PROMPT = """You are a TikTok Shop affiliate content producer specializing in
-shoe/footwear product videos. You generate Seedance 2.0 video prompts and use
-Magnific tools to create the videos.
+SHOE_VIDEO_SYSTEM = """You are a TikTok Shop affiliate content producer. Write a Seedance 2.0
+video prompt for the product described. Follow these HARD RULES:
+- 9:16 vertical, TikTok UGC aesthetic
+- NO person above the ankle — EVER
+- NO on-screen text, captions, subtitles, overlays, signs, logos
+- Feet-and-shoes ONLY — the shoe IS the star
+- Warm natural lighting, phone-camera handheld feel
+- 3 timecoded shots (looking-down POV → low side-angle → back to overhead)
 
-## Your workflow:
-
-1. ANALYZE the product — identify: shoe type, color, pattern, material, sole
-   type, standout features (buckles, bows, straps, cushioning, etc.)
-
-2. WRITE a Seedance 2.0 prompt following these HARD RULES:
-   - 9:16 vertical, TikTok UGC aesthetic
-   - NO person above the ankle — EVER
-   - NO on-screen text, captions, subtitles, overlays, signs, logos
-   - Max duration as specified
-   - Feet-and-shoes ONLY — the shoe IS the star
-   - Warm natural lighting, phone-camera handheld feel
-   - 3 timecoded shots (looking-down POV → low side-angle → back to overhead)
-
-3. UPLOAD the product image to Magnific using creations_upload_image with the
-   provided URL
-
-4. GENERATE the video using video_generate with:
-   - The Seedance prompt you wrote
-   - The uploaded creation as a reference
-   - Model slug: bytedance-seedance-fast-2.0
-   - Aspect ratio: 9:16, resolution: 720p
-   - Duration as specified
-
-## Shot structure:
+Shot structure:
 [00:00-00:05] Looking-down POV. Feet in [product] on [surface]. [Opening movement].
 [00:05-00:10] Low side-angle. Camera tilts to reveal [feature]. Foot lifts, sets down.
 [00:10-00:15] Overhead POV. [Natural movement]. [Product detail] catches warm light.
 
-## Surface matching:
+Surface matching:
 - Sandals/flip-flops → light hardwood, tile, poolside concrete
 - Sneakers → pavement, gym floor, clean concrete
 - Boots → wood floor, outdoor path, autumn leaves
@@ -87,69 +67,45 @@ Magnific tools to create the videos.
 
 {voiceover_instruction}
 
-IMPORTANT: Return ONLY valid JSON (no markdown, no backticks, no extra text):
-{{"product_name": "...", "prompt_used": "the full seedance prompt", "creation_id": "the magnific creation identifier for the video", "status": "queued", "error": null}}
-"""
+Return ONLY valid JSON (no markdown, no backticks):
+{{"product_name": "...", "prompt": "the full seedance prompt under 1900 chars", "char_count": 123}}"""
 
-TEXTHOOK_BROLL_PROMPT = """You are a TikTok Shop affiliate content producer. You generate
-"text-hook + vibey b-roll → product reveal" style videos using Seedance 2.0 via Magnific.
+TEXTHOOK_SYSTEM = """You are a TikTok Shop affiliate content producer. Write a
+"text-hook + vibey b-roll → product reveal" Seedance 2.0 prompt AND a text hook.
 
-## Style rules:
-This is a SILENT video — NO audio, NO voiceover. The "script" is a written text hook
-the user burns in later via CapCut/TikTok. The AI render must contain ZERO on-screen text.
+HARD RULES:
+- SILENT video — NO audio, NO voiceover
+- Zero on-screen text in the AI render (user burns text in later)
+- No face, no person, no character — only a hand in the reveal
+- Two acts: vibey b-roll (~3s) → hard cut to product reveal (~5s)
+- ~8 seconds total, 9:16 vertical
+- Under 1,900 characters
 
-## Structure (~8 seconds):
-Two acts:
-1. VIBEY B-ROLL (00:00-00:03) — mundane real-life establishing shot (sunny street, park,
-   sky). Has NOTHING to do with the product. Sets a relatable "my real life" mood.
-2. PRODUCT REVEAL (00:03-00:08) — hard cut. A single hand holds the product up outdoors,
-   slowly rotating/tilting so it catches warm light. Soft blurred background.
+Prompt template:
+9:16 vertical, TikTok UGC aesthetic, silent, no audio, no voiceover. Handheld phone-camera
+feel with natural micro-shake. Warm bright daylight, slightly saturated. No face, no person,
+no character — only a hand in the second half.
 
-## Hard rules:
-- SILENT. No audio, no voiceover, no Seedance audio generation
-- Zero rendered on-screen text — no captions, subtitles, overlays, signs, logos
-- No face, no person, no character — only a hand appears, and ONLY in the reveal
-- No arm above the wrist
-- ~8 seconds, 9:16 vertical
-- Under 1,900 characters for the prompt
+[00:00-00:03] Establishing b-roll: first-person POV [SCENE]. Mundane real-life vibe, slow
+handheld drift. No product on screen.
 
-## Prompt template:
-9:16 vertical, TikTok UGC aesthetic, silent, no audio, no voiceover. Handheld one-hand
-phone-camera feel with natural micro-shake. Warm bright natural daylight, slightly
-saturated. No face, no person, no character — only a hand appears in the second half.
+[00:03-00:08] Hard cut to outdoors on [SURFACE]. A single hand holds up [PRODUCT + detail]
+toward camera, slowly rotating and tilting so [detail] catches warm light. Hand fills lower
+half. Soft blurred background.
 
-[00:00-00:03] Establishing b-roll: first-person POV [SCENE]. Mundane real-life vibe,
-slow handheld drift. No product on screen.
+No face. No person above the wrist. No text, captions, subtitles, overlays, logos.
 
-[00:03-00:08] Hard cut to outdoors on [SURFACE]. A single hand holds up [PRODUCT +
-visual detail] toward the camera, slowly rotating and tilting it so [detail] catches
-warm light. Hand fills lower half. Soft blurred background.
-
-No face. No person above the wrist. No text, captions, subtitles, overlays, logos, or
-written words of any kind anywhere in the frame.
-
-## Text hook (write this for the user):
-Write a text hook using the "broke-flex" formula:
-- Gen-z texting voice: ur, bc, &, lowercase drift, no period
-- Deadpan, self-deprecating money humor. Relatable, not salesy
-- Exactly one 😭 (or 😩/💀) at the end. No emoji spam
+Text hook rules (gen-z texting voice):
+- ur, bc, &, lowercase drift, no period
+- Deadpan, self-deprecating money humor
+- Exactly one 😭 at the end. No emoji spam
 - No "link in bio", no CTA. ~14-22 words
-- Also write 1-2 alternate hooks
+- Write the main hook + 2 alternates
 
-## Your workflow:
-1. ANALYZE the product from the name and image URL
-2. WRITE the text hook + 2 alternates
-3. WRITE the Seedance prompt
-4. UPLOAD the image to Magnific using creations_upload_image
-5. GENERATE the video using video_generate with model slug bytedance-seedance-fast-2.0,
-   aspect ratio 9:16, resolution 720p, duration 8
-6. Return JSON
+Return ONLY valid JSON:
+{{"product_name": "...", "prompt": "the full seedance prompt", "char_count": 123, "text_hook": "main hook", "alt_hooks": ["alt1", "alt2"], "caption": "tiktok caption", "hashtags": "#tag1 #tag2..."}}"""
 
-IMPORTANT: Return ONLY valid JSON (no markdown, no backticks):
-{{"product_name": "...", "prompt_used": "the full seedance prompt", "text_hook": "the main hook", "alt_hooks": ["alt1", "alt2"], "caption": "tiktok caption", "hashtags": "#tag1 #tag2...", "creation_id": "magnific creation id", "status": "queued", "error": null}}
-"""
-
-VOICEOVER_SILENT = "## Audio:\nNO voiceover, NO spoken dialogue. Ambient sound only."
+VOICEOVER_SILENT = "## Audio:\nNO voiceover. Ambient sound only."
 VOICEOVER_WITH_SCRIPT = '## Voiceover:\nInclude this voiceover (warm excited woman, casual and friendly):\n"{script}"'
 
 
@@ -158,10 +114,8 @@ VOICEOVER_WITH_SCRIPT = '## Voiceover:\nInclude this voiceover (warm excited wom
 # ═══════════════════════════════════════════════════════════════════
 
 def _name_from_url(url: str) -> str:
-    """Extract a readable product name from a URL slug."""
     parsed = urlparse(url)
-    path = parsed.path.strip("/")
-    parts = path.split("/")
+    parts = parsed.path.strip("/").split("/")
     best = ""
     for part in parts:
         if len(part) < 5 or part.isdigit() or part.lower() in ("us", "pdp", "dp", "ip", "product"):
@@ -169,15 +123,12 @@ def _name_from_url(url: str) -> str:
         if len(part) > len(best):
             best = part
     if best:
-        name = best.replace("-", " ").replace("_", " ")
-        words = name.split()
-        if len(words) > 10:
-            words = words[:10]
+        words = best.replace("-", " ").replace("_", " ").split()[:10]
         return " ".join(words).title()
     return "Unknown Product"
 
 
-def _find_images_in_dict(obj, depth=0, max_depth=8) -> list[str]:
+def _find_images_in_dict(obj, depth=0, max_depth=8):
     if depth > max_depth:
         return []
     images = []
@@ -196,13 +147,12 @@ def _find_images_in_dict(obj, depth=0, max_depth=8) -> list[str]:
 
 
 def scrape_product(url: str) -> dict | None:
-    """Scrape a product page for images and name."""
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15, allow_redirects=True)
         resp.raise_for_status()
         html = resp.text
 
-        # Extract og:image
+        # og:image
         img_match = re.search(
             r'<meta\s+(?:property|name)=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
             html, re.IGNORECASE
@@ -213,7 +163,7 @@ def scrape_product(url: str) -> dict | None:
                 html, re.IGNORECASE
             )
 
-        # Extract og:title
+        # og:title
         title_match = re.search(
             r'<meta\s+(?:property|name)=["\']og:title["\']\s+content=["\']([^"\']+)["\']',
             html, re.IGNORECASE
@@ -259,7 +209,7 @@ def scrape_product(url: str) -> dict | None:
             except json.JSONDecodeError:
                 pass
 
-        # CDN image URLs in raw HTML
+        # CDN image URLs
         cdn_imgs = re.findall(
             r'(https?://[^"\'\s]+(?:\.jpg|\.jpeg|\.png|\.webp)(?:\?[^"\'\s]*)?)',
             html
@@ -269,147 +219,101 @@ def scrape_product(url: str) -> dict | None:
                 images.append(ci)
 
         if not images:
-            # Try Playwright fallback
-            return _scrape_with_playwright(url)
+            return None
 
-        # Deduplicate
+        # Deduplicate and clean
         seen = set()
-        unique_images = []
+        unique = []
         for img in images:
             cleaned = html_unescape(img)
             if cleaned not in seen:
                 seen.add(cleaned)
-                unique_images.append(cleaned)
+                unique.append(cleaned)
 
         name = title_match.group(1).strip() if title_match else ""
         name = re.sub(r'\s*[|\-–—]\s*(TikTok|Shop|Amazon|Walmart).*$', '', name, flags=re.IGNORECASE)
         if not name or name == "Unknown Product":
             name = _name_from_url(url)
 
-        return {
-            "name": name[:100],
-            "images": unique_images[:5],
-            "source_url": url,
-        }
+        return {"name": name[:100], "images": unique[:8], "source_url": url}
 
     except Exception as e:
-        # Try Playwright as fallback
-        return _scrape_with_playwright(url)
-
-
-def _scrape_with_playwright(url: str) -> dict | None:
-    """Fallback scraper using headless browser."""
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        return None
-
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(user_agent=HEADERS["User-Agent"])
-            page = context.new_page()
-
-            def route_handler(route):
-                if route.request.resource_type in ["font", "stylesheet", "media"]:
-                    route.abort()
-                else:
-                    route.fallback()
-            page.route("**/*", route_handler)
-
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(5000)
-
-            images = []
-            name = ""
-
-            og_img = page.query_selector('meta[property="og:image"]')
-            if og_img:
-                img_url = og_img.get_attribute("content")
-                if img_url:
-                    images.append(img_url)
-
-            og_title = page.query_selector('meta[property="og:title"]')
-            if og_title:
-                name = og_title.get_attribute("content") or ""
-            if not name:
-                name = page.title() or ""
-
-            # Large visible images
-            all_imgs = page.query_selector_all("img")
-            for img in all_imgs:
-                src = img.get_attribute("src")
-                if not src or not src.startswith("http"):
-                    continue
-                try:
-                    box = img.bounding_box()
-                    if box and box["width"] > 200 and box["height"] > 200:
-                        images.append(src)
-                except Exception:
-                    pass
-
-            browser.close()
-
-            if not images:
-                return None
-
-            seen = set()
-            unique = []
-            for img in images:
-                cleaned = html_unescape(img)
-                if cleaned not in seen:
-                    seen.add(cleaned)
-                    unique.append(cleaned)
-
-            name = re.sub(r'\s*[|\-–—]\s*(TikTok|Shop|Amazon).*$', '', name, flags=re.IGNORECASE).strip()
-            if not name:
-                name = _name_from_url(url)
-
-            return {"name": name[:100], "images": unique[:5], "source_url": url}
-
-    except Exception:
         return None
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  VIDEO GENERATOR
+#  PROMPT WRITER (Claude only — no MCP, cheap + fast)
 # ═══════════════════════════════════════════════════════════════════
+
+def write_prompt(
+    api_key: str,
+    product_name: str,
+    style: str,
+    duration: int = 15,
+    voice_script: str | None = None,
+) -> dict:
+    """Use Claude to write the Seedance prompt. No MCP, no Magnific."""
+    if style == "shoe_video":
+        vo = VOICEOVER_WITH_SCRIPT.format(script=voice_script) if voice_script else VOICEOVER_SILENT
+        system = SHOE_VIDEO_SYSTEM.format(voiceover_instruction=vo)
+        dur = duration
+    else:
+        system = TEXTHOOK_SYSTEM
+        dur = 8
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=2048,
+            system=system,
+            messages=[{
+                "role": "user",
+                "content": f"Write a {dur}-second Seedance 2.0 prompt for this product: {product_name}"
+            }],
+        )
+
+        text = response.content[0].text
+        cleaned = re.sub(r'```json\s*', '', text)
+        cleaned = re.sub(r'```\s*', '', cleaned)
+        json_start = cleaned.find("{")
+        json_end = cleaned.rfind("}") + 1
+        if json_start >= 0 and json_end > json_start:
+            return json.loads(cleaned[json_start:json_end])
+
+        return {"prompt": text, "product_name": product_name, "error": "Couldn't parse JSON"}
+
+    except Exception as e:
+        return {"error": str(e), "product_name": product_name}
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  VIDEO GENERATOR (Claude + Magnific MCP)
+# ═══════════════════════════════════════════════════════════════════
+
+GENERATE_SYSTEM = """You are a video production assistant. You have access to Magnific tools.
+
+Your job:
+1. Upload the product image to Magnific using creations_upload_image with the provided URL
+2. Generate a video using video_generate with:
+   - The prompt provided
+   - The uploaded creation as image reference
+   - Model slug: bytedance-seedance-fast-2.0
+   - Aspect ratio: 9:16, resolution: 720p
+   - Duration as specified
+
+Return ONLY valid JSON (no markdown):
+{{"creation_id": "the magnific creation identifier", "status": "queued", "error": null}}
+"""
 
 def generate_video(
     api_key: str,
     magnific_token: str,
-    product: dict,
-    style: str,
+    image_url: str,
+    prompt: str,
     duration: int,
-    voice_script: str | None = None,
 ) -> dict:
-    """Call Anthropic API + Magnific MCP to generate a Seedance video."""
-
-    # Pick system prompt based on style
-    if style == "shoe_video":
-        vo_block = VOICEOVER_WITH_SCRIPT.format(script=voice_script) if voice_script else VOICEOVER_SILENT
-        system = SHOE_VIDEO_PROMPT.format(voiceover_instruction=vo_block)
-        vid_duration = duration
-    else:  # texthook_broll
-        system = TEXTHOOK_BROLL_PROMPT
-        vid_duration = 8  # Always 8 for this style
-
-    content = [{
-        "type": "text",
-        "text": (
-            f"Generate a {vid_duration}-second Seedance 2.0 Fast video.\n"
-            f"Product name: {product['name']}\n"
-            f"Product image URL: {product['url']}\n\n"
-            f"Steps:\n"
-            f"1. Upload the image to Magnific using creations_upload_image with the URL\n"
-            f"2. Write the prompt\n"
-            f"3. Call video_generate with the creation identifier, your prompt, "
-            f"model slug bytedance-seedance-fast-2.0, aspect ratio 9:16, "
-            f"resolution 720p, duration {vid_duration}\n"
-            f"4. Return JSON"
-        ),
-    }]
-
+    """Upload image + generate video via Magnific MCP."""
     mcp_servers = [{
         "type": "url",
         "url": MAGNIFIC_MCP_URL,
@@ -422,130 +326,210 @@ def generate_video(
         client = anthropic.Anthropic(api_key=api_key)
         response = client.beta.messages.create(
             model=MODEL,
-            max_tokens=4096,
-            system=system,
-            messages=[{"role": "user", "content": content}],
+            max_tokens=2048,
+            system=GENERATE_SYSTEM,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Upload this image and generate a {duration}s video.\n"
+                    f"Image URL: {image_url}\n"
+                    f"Prompt:\n{prompt}"
+                ),
+            }],
             mcp_servers=mcp_servers,
             tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
             betas=[MCP_BETA],
         )
-        return _parse_response(response, product, style)
+
+        result = {"creation_id": None, "status": "unknown", "error": None}
+
+        # Parse text response
+        for block in response.content:
+            if block.type == "text":
+                try:
+                    cleaned = re.sub(r'```json\s*|```\s*', '', block.text)
+                    j = cleaned.find("{")
+                    k = cleaned.rfind("}") + 1
+                    if j >= 0 and k > j:
+                        parsed = json.loads(cleaned[j:k])
+                        result.update({k2: v for k2, v in parsed.items() if v is not None})
+                except json.JSONDecodeError:
+                    pass
+
+            elif block.type == "mcp_tool_result":
+                if hasattr(block, "content") and block.content:
+                    for sub in block.content:
+                        if hasattr(sub, "text"):
+                            try:
+                                tr = json.loads(sub.text)
+                                if isinstance(tr, dict):
+                                    if "creations" in tr:
+                                        for c in tr["creations"]:
+                                            if "identifier" in c:
+                                                result["creation_id"] = c["identifier"]
+                                                result["status"] = c.get("status", "queued")
+                                    elif "identifier" in tr:
+                                        result["creation_id"] = tr["identifier"]
+                                        result["status"] = tr.get("status", "queued")
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+
+        return result
 
     except Exception as e:
-        return {
-            "product_name": product["name"],
-            "source_url": product.get("source_url", ""),
-            "status": "error",
-            "error": str(e),
-            "creation_id": None,
-            "style": style,
-        }
+        return {"creation_id": None, "status": "error", "error": str(e)}
 
 
-def _parse_response(response, product: dict, style: str) -> dict:
-    """Extract results from the API response."""
-    result = {
-        "product_name": product["name"],
-        "source_url": product.get("source_url", ""),
-        "image_url": product.get("url", ""),
-        "status": "unknown",
-        "error": None,
-        "creation_id": None,
-        "prompt_used": None,
-        "text_hook": None,
-        "alt_hooks": None,
-        "caption": None,
-        "hashtags": None,
-        "style": style,
-    }
+# ═══════════════════════════════════════════════════════════════════
+#  STATUS CHECKER — polls Magnific for finished videos
+# ═══════════════════════════════════════════════════════════════════
 
-    text_parts = []
-    tool_results = []
+CHECK_STATUS_SYSTEM = """You have access to Magnific tools. Check the status of a creation
+and return its details.
 
-    for block in response.content:
-        if block.type == "text":
-            text_parts.append(block.text)
-        elif block.type == "mcp_tool_result":
-            if hasattr(block, "content") and block.content:
-                for sub in block.content:
-                    if hasattr(sub, "text"):
-                        tool_results.append(sub.text)
+Use creations_get with the identifier provided. Return ONLY valid JSON (no markdown):
+{"status": "completed|queued|processing|error", "url": "full-res video URL or null", "preview_url": "preview URL or null"}
 
-    full_text = "\n".join(text_parts)
+If the creation is a video and it's completed, the url field should contain the video URL.
+Extract URLs from the creation data — look for fields like url, videoUrl, previewUrl, etc.
+"""
+
+def check_creation_status(api_key: str, magnific_token: str, creation_id: str) -> dict:
+    """Check a Magnific creation's status via MCP."""
+    mcp_servers = [{
+        "type": "url",
+        "url": MAGNIFIC_MCP_URL,
+        "name": MAGNIFIC_MCP_NAME,
+    }]
+    if magnific_token:
+        mcp_servers[0]["authorization_token"] = magnific_token
+
     try:
-        cleaned = re.sub(r'```json\s*', '', full_text)
-        cleaned = re.sub(r'```\s*', '', cleaned)
-        json_start = cleaned.find("{")
-        json_end = cleaned.rfind("}") + 1
-        if json_start >= 0 and json_end > json_start:
-            parsed = json.loads(cleaned[json_start:json_end])
-            result.update({k: v for k, v in parsed.items() if v is not None})
-    except json.JSONDecodeError:
-        pass
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.beta.messages.create(
+            model=MODEL,
+            max_tokens=2048,
+            system=CHECK_STATUS_SYSTEM,
+            messages=[{
+                "role": "user",
+                "content": f"Check the status of creation: {creation_id}"
+            }],
+            mcp_servers=mcp_servers,
+            tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
+            betas=[MCP_BETA],
+        )
 
-    for tr in tool_results:
-        try:
-            tr_data = json.loads(tr)
-            if isinstance(tr_data, dict):
-                if "creations" in tr_data:
-                    for c in tr_data["creations"]:
-                        if "identifier" in c:
-                            result["creation_id"] = c["identifier"]
-                            result["status"] = c.get("status", "queued")
-                elif "identifier" in tr_data:
-                    result["creation_id"] = tr_data["identifier"]
-                    result["status"] = tr_data.get("status", "queued")
-        except (json.JSONDecodeError, TypeError):
-            pass
+        result = {"status": "unknown", "url": None, "preview_url": None}
 
-    return result
+        for block in response.content:
+            if block.type == "text":
+                try:
+                    cleaned = re.sub(r'```json\s*|```\s*', '', block.text)
+                    j = cleaned.find("{")
+                    k = cleaned.rfind("}") + 1
+                    if j >= 0 and k > j:
+                        parsed = json.loads(cleaned[j:k])
+                        result.update({k2: v for k2, v in parsed.items() if v is not None})
+                except json.JSONDecodeError:
+                    pass
+
+            elif block.type == "mcp_tool_result":
+                if hasattr(block, "content") and block.content:
+                    for sub in block.content:
+                        if hasattr(sub, "text"):
+                            try:
+                                tr = json.loads(sub.text)
+                                if isinstance(tr, dict):
+                                    # Extract video URL from creation data
+                                    for url_key in ["url", "videoUrl", "video_url", "previewUrl", "preview_url"]:
+                                        if url_key in tr and tr[url_key]:
+                                            if "preview" in url_key.lower():
+                                                result["preview_url"] = tr[url_key]
+                                            else:
+                                                result["url"] = tr[url_key]
+                                    if "status" in tr:
+                                        result["status"] = tr["status"]
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+
+        return result
+
+    except Exception as e:
+        return {"status": "error", "url": None, "error": str(e)}
 
 
 # ═══════════════════════════════════════════════════════════════════
 #  STREAMLIT UI
 # ═══════════════════════════════════════════════════════════════════
 
+def get_secret(key: str) -> str:
+    try:
+        return st.secrets[key]
+    except (KeyError, FileNotFoundError):
+        return os.environ.get(key, "")
+
+
 def main():
     # ── Header ──
     st.title("🎬 Seedance Video Generator")
-    st.caption("Paste product links → pick a style → hit Generate")
+    st.caption("Paste product links → pick photos → generate videos (or get prompts)")
 
-    # ── Helper: get secret from st.secrets, env var, or empty ──
-    def get_secret(key: str) -> str:
-        """Check st.secrets first (Streamlit Cloud), then env vars."""
-        try:
-            return st.secrets[key]
-        except (KeyError, FileNotFoundError):
-            return os.environ.get(key, "")
-
-    # ── Sidebar: API keys ──
+    # ── Sidebar ──
     with st.sidebar:
         st.header("⚙️ Settings")
 
-        # If keys are set in secrets/env, auto-use them and hide the inputs
-        default_api_key = get_secret("ANTHROPIC_API_KEY")
-        default_magnific = get_secret("MAGNIFIC_AUTH_TOKEN")
-
-        if default_api_key and default_magnific:
-            st.success("🔑 API keys loaded from secrets")
-            api_key = default_api_key
-            magnific_token = default_magnific
+        # Anthropic key
+        api_key = get_secret("ANTHROPIC_API_KEY")
+        if api_key:
+            st.success("🔑 Anthropic key loaded")
         else:
-            api_key = st.text_input(
-                "Anthropic API Key",
-                type="password",
-                value=default_api_key,
-                help="Get yours at console.anthropic.com/settings/keys",
-            )
-
-            magnific_token = st.text_input(
-                "Magnific Auth Token",
-                type="password",
-                value=default_magnific,
-                help="Get via MCP Inspector → Quick OAuth Flow",
-            )
+            api_key = st.text_input("Anthropic API Key", type="password")
 
         st.divider()
+
+        # Magnific token
+        st.subheader("🔄 Magnific Token")
+        saved_token = get_secret("MAGNIFIC_AUTH_TOKEN")
+        magnific_token = st.text_input(
+            "Paste token here",
+            type="password",
+            value=saved_token,
+        )
+
+        if magnific_token:
+            st.success("✅ Token set — auto-generate enabled")
+        else:
+            st.info("ℹ️ No token — you'll get prompts to generate manually")
+
+        with st.expander("📖 How to get / refresh the token"):
+            st.markdown("""
+**You need:** A computer with Node.js installed.
+
+**Steps:**
+1. Open Terminal and run:
+   ```
+   npx @modelcontextprotocol/inspector
+   ```
+2. A browser page opens. Set:
+   - **Transport Type** → `Streamable HTTP`
+   - **URL** → `https://mcp.magnific.com`
+3. Click **Connect**
+4. Click **"Open Auth Settings"**
+5. Click **"Quick OAuth Flow"**
+6. **Log in** with the Magnific account
+7. Click **Continue** until it says **"Authentication complete"**
+8. **Copy the `access_token`** value
+9. **Paste it above** ⬆️
+
+The token lasts a few hours. When you see auth errors,
+repeat these steps to get a fresh one.
+
+**Don't have Node.js?** Ask Sky to get you a token.
+            """)
+
+        st.divider()
+
+        # Video style
         st.subheader("🎨 Video Style")
         style = st.radio(
             "Choose style:",
@@ -554,119 +538,165 @@ def main():
                 "shoe_video": "👟 Shoe Video (feet-only, 15s)",
                 "texthook_broll": "📱 Text-Hook B-Roll (reveal, 8s)",
             }[x],
-            help="Shoe Video = feet-and-shoes only. Text-Hook = vibey b-roll → product reveal.",
         )
 
         if style == "shoe_video":
-            duration = st.select_slider("Duration (seconds)", options=[5, 10, 15], value=15)
+            duration = st.select_slider("Duration", options=[5, 10, 15], value=15)
             voice_script = st.text_area(
-                "Voiceover script (optional)",
+                "Voiceover (optional)",
                 placeholder="Leave empty for silent video",
                 height=80,
             )
         else:
             duration = 8
             voice_script = None
-            st.info("Text-hook style is always 8s and silent. You'll get the text hook to burn in later.")
+            st.caption("Always 8s, silent. You'll get the text hook to burn in via CapCut.")
 
-        st.divider()
-        st.caption("💡 Tip: Start with 'Scrape Only' to preview what images it finds before generating.")
-
-    # ── Main area: product links ──
-    st.subheader("📦 Product Links")
+    # ════════════════════════════════════════════════════════════════
+    #  STEP 1 — PASTE LINKS
+    # ════════════════════════════════════════════════════════════════
+    st.subheader("① Paste Product Links")
     links_input = st.text_area(
-        "Paste TikTok Shop URLs (one per line)",
+        "One TikTok Shop URL per line",
         placeholder=(
             "https://shop.tiktok.com/us/pdp/womens-leopard-bow-slipper.../123456\n"
-            "https://shop.tiktok.com/us/pdp/suede-clogs-cork-footbed.../789012\n"
-            "https://shop.tiktok.com/us/pdp/platform-comfort-slides.../345678"
+            "https://shop.tiktok.com/us/pdp/suede-clogs-cork-footbed.../789012"
         ),
-        height=150,
+        height=120,
+        label_visibility="collapsed",
     )
 
-    col1, col2 = st.columns(2)
-    scrape_btn = col1.button("🔍 Scrape Only", use_container_width=True)
-    generate_btn = col2.button("🎬 Scrape + Generate", type="primary", use_container_width=True)
+    scrape_btn = st.button("🔍 Scrape Product Photos", use_container_width=True)
 
-    # ── Parse links ──
     links = [
         line.strip() for line in links_input.strip().split("\n")
         if line.strip() and not line.strip().startswith("#")
     ] if links_input.strip() else []
 
-    if not links and (scrape_btn or generate_btn):
-        st.warning("Paste at least one product link above.")
-        return
-
-    # ── Scrape ──
-    if scrape_btn or generate_btn:
-        if generate_btn and (not api_key or not magnific_token):
-            st.error("Set your Anthropic API Key and Magnific Auth Token in the sidebar.")
-            return
+    # ════════════════════════════════════════════════════════════════
+    #  STEP 2 — SCRAPE + SELECT PHOTOS
+    # ════════════════════════════════════════════════════════════════
+    if scrape_btn:
+        if not links:
+            st.warning("Paste at least one product link.")
+            st.stop()
 
         st.divider()
-        st.subheader("📸 Scraping Products")
-        products = []
-        progress = st.progress(0, text="Starting...")
+        st.subheader("② Select the Right Photo for Each Product")
+        st.caption("Some products have multiple colors or angles — pick the one you want in the video.")
+
+        scraped_products = []
+        progress = st.progress(0, text="Scraping...")
 
         for i, url in enumerate(links):
-            progress.progress((i) / len(links), text=f"Scraping {i+1}/{len(links)}...")
-            with st.spinner(f"Scraping: {url[:60]}..."):
-                scraped = scrape_product(url)
+            progress.progress(i / len(links), text=f"Scraping {i+1}/{len(links)}...")
+            scraped = scrape_product(url)
 
             if scraped and scraped["images"]:
-                product = {
-                    "url": scraped["images"][0],
-                    "name": scraped["name"],
-                    "source_url": url,
-                }
-                products.append(product)
-                st.success(f"✅ **{scraped['name']}** — found {len(scraped['images'])} image(s)")
-
-                # Show the first image as a preview
-                try:
-                    st.image(scraped["images"][0], width=200, caption=scraped["name"])
-                except Exception:
-                    st.caption(f"Image URL: {scraped['images'][0][:80]}...")
+                scraped_products.append(scraped)
             else:
-                st.error(f"❌ Couldn't scrape: {url[:60]}...")
+                st.error(f"❌ Couldn't scrape: {url[:70]}...")
 
-        progress.progress(1.0, text="Scraping complete!")
+        progress.progress(1.0, text=f"Found {len(scraped_products)} product(s)")
 
-        if not products:
+        if not scraped_products:
             st.error("No products could be scraped. Check your links.")
-            return
+            st.stop()
 
-        st.info(f"Found **{len(products)}** product(s) ready to go.")
+        # Store in session state so selections persist
+        st.session_state["scraped"] = scraped_products
 
-        # ── Scrape-only: stop here ──
-        if scrape_btn:
-            st.download_button(
-                "📥 Download scraped data (JSON)",
-                data=json.dumps({"products": products}, indent=2),
-                file_name="scraped_products.json",
-                mime="application/json",
+    # ── Show image selection if we have scraped data ──
+    if "scraped" not in st.session_state:
+        st.stop()
+
+    scraped_products = st.session_state["scraped"]
+    selections = {}  # product_index → selected image url
+
+    for idx, product in enumerate(scraped_products):
+        st.markdown(f"---")
+        st.markdown(f"### {product['name']}")
+        st.caption(f"Source: {product['source_url'][:80]}...")
+
+        images = product["images"]
+
+        if len(images) == 1:
+            # Only one image — auto-select, still show it
+            selections[idx] = images[0]
+            try:
+                st.image(images[0], width=200)
+            except Exception:
+                st.caption(f"Image: {images[0][:60]}...")
+        else:
+            # Multiple images — let VA pick
+            cols = st.columns(min(len(images), 4))
+            for img_idx, img_url in enumerate(images[:8]):
+                with cols[img_idx % 4]:
+                    try:
+                        st.image(img_url, width=150, caption=f"Option {img_idx + 1}")
+                    except Exception:
+                        st.caption(f"Option {img_idx + 1}: {img_url[:40]}...")
+
+            selected = st.radio(
+                f"Pick photo for **{product['name'][:40]}**:",
+                options=list(range(len(images[:8]))),
+                format_func=lambda x: f"Option {x + 1}",
+                key=f"select_{idx}",
+                horizontal=True,
             )
-            return
+            selections[idx] = images[selected]
 
-        # ── Generate videos ──
+    # ════════════════════════════════════════════════════════════════
+    #  STEP 3 — GENERATE OR GET PROMPTS
+    # ════════════════════════════════════════════════════════════════
+    st.divider()
+    st.subheader("③ Generate")
+
+    has_token = bool(magnific_token)
+
+    if has_token:
+        col1, col2 = st.columns(2)
+        auto_btn = col1.button("🎬 Auto-Generate Videos", type="primary", use_container_width=True)
+        prompt_btn = col2.button("📝 Just Get Prompts", use_container_width=True)
+    else:
+        auto_btn = False
+        prompt_btn = st.button("📝 Get Prompts + Images (generate manually in Magnific)",
+                               type="primary", use_container_width=True)
+
+    if not auto_btn and not prompt_btn:
+        st.stop()
+
+    if not api_key:
+        st.error("❌ Anthropic API key is missing. Ask Sky to set it up.")
+        st.stop()
+
+    # ── Build final product list with selected images ──
+    final_products = []
+    for idx, product in enumerate(scraped_products):
+        final_products.append({
+            "name": product["name"],
+            "image_url": selections.get(idx, product["images"][0]),
+            "source_url": product["source_url"],
+        })
+
+    # ════════════════════════════════════════════════════════════════
+    #  PROMPT-ONLY MODE
+    # ════════════════════════════════════════════════════════════════
+    if prompt_btn:
         st.divider()
-        st.subheader("🎬 Generating Videos")
+        st.subheader("📝 Prompts & Images")
+        st.caption("Copy each prompt and generate manually in Magnific → magnific.com/ai/video-generator")
 
         results = []
-        gen_progress = st.progress(0, text="Starting generation...")
+        progress = st.progress(0, text="Writing prompts...")
 
-        for i, product in enumerate(products):
-            gen_progress.progress(
-                i / len(products),
-                text=f"Generating {i+1}/{len(products)}: {product['name'][:40]}..."
-            )
+        for i, product in enumerate(final_products):
+            progress.progress(i / len(final_products), text=f"Writing prompt {i+1}/{len(final_products)}...")
 
-            with st.spinner(f"Generating video for **{product['name']}**... (this may take a minute)"):
-                result = generate_video(
+            with st.spinner(f"Writing prompt for {product['name'][:30]}..."):
+                result = write_prompt(
                     api_key=api_key,
-                    magnific_token=magnific_token,
-                    product=product,
+                    product_name=product["name"],
                     style=style,
                     duration=duration,
                     voice_script=voice_script if voice_script else None,
@@ -674,62 +704,316 @@ def main():
 
             results.append(result)
 
-            if result["status"] == "queued" and result.get("creation_id"):
-                st.success(f"✅ **{result['product_name']}** — Creation ID: `{result['creation_id']}`")
-            elif result["status"] == "error":
-                st.error(f"❌ **{result['product_name']}** — {result.get('error', 'Unknown error')}")
-            else:
-                st.warning(f"⚠️ **{result['product_name']}** — Status: {result['status']}")
+            st.markdown(f"---")
+            st.markdown(f"### {product['name']}")
 
-            # Show text-hook details if available
-            if result.get("text_hook"):
-                with st.expander(f"📝 Hook & Caption — {result['product_name']}"):
-                    st.markdown(f"**Main hook:**\n> {result['text_hook']}")
+            # Show selected image
+            col_img, col_prompt = st.columns([1, 2])
+            with col_img:
+                try:
+                    st.image(product["image_url"], width=250)
+                except Exception:
+                    st.caption(f"Image URL:\n{product['image_url'][:80]}")
+
+                st.text_input(
+                    "Image URL (copy this):",
+                    value=product["image_url"],
+                    key=f"imgurl_{i}",
+                )
+
+            with col_prompt:
+                if result.get("prompt"):
+                    st.text_area(
+                        "Seedance Prompt (copy this):",
+                        value=result["prompt"],
+                        height=250,
+                        key=f"prompt_{i}",
+                    )
+                    char_count = result.get("char_count", len(result["prompt"]))
+                    st.caption(f"Characters: {char_count}")
+                elif result.get("error"):
+                    st.error(f"Error: {result['error']}")
+
+                # Text-hook extras
+                if result.get("text_hook"):
+                    st.markdown(f"**Text hook (burn in via CapCut):**")
+                    st.code(result["text_hook"], language=None)
                     if result.get("alt_hooks"):
                         st.markdown("**Alternates:**")
                         for alt in result["alt_hooks"]:
-                            st.markdown(f"> {alt}")
+                            st.code(alt, language=None)
                     if result.get("caption"):
-                        st.markdown(f"**Caption:** {result['caption']}")
+                        st.text_input("Caption:", value=result["caption"], key=f"cap_{i}")
                     if result.get("hashtags"):
-                        st.markdown(f"**Hashtags:** {result['hashtags']}")
-                    st.caption("🔊 Sound tip: Add a trending upbeat TikTok sound — the render is silent.")
+                        st.text_input("Hashtags:", value=result["hashtags"], key=f"hash_{i}")
 
-            # Show prompt if available
-            if result.get("prompt_used"):
-                with st.expander(f"📄 Prompt — {result['product_name']}"):
-                    st.code(result["prompt_used"], language=None)
+            time.sleep(1)  # Rate limit
 
-            # Rate limit delay
-            if i < len(products) - 1:
-                time.sleep(5)
+        progress.progress(1.0, text="Done!")
 
-        gen_progress.progress(1.0, text="All done!")
-
-        # ── Summary ──
+        # Manual generation instructions
         st.divider()
-        queued = sum(1 for r in results if r["status"] == "queued")
-        errors = sum(1 for r in results if r["status"] == "error")
+        st.info("""
+**How to generate manually in Magnific:**
+1. Go to [magnific.com/ai/video-generator](https://www.magnific.com/ai/video-generator)
+2. Select model **Seedance 2.0 Fast**
+3. Upload the product image (copy the URL above, or save the image first)
+4. Paste the prompt
+5. Set aspect ratio to **9:16**, resolution **720p**
+6. Click **Generate**
+        """)
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Total", len(results))
-        col2.metric("Queued", queued)
-        col3.metric("Errors", errors)
-
-        # Download results
+        # Download all prompts
         st.download_button(
-            "📥 Download results (JSON)",
+            "📥 Download All Prompts (JSON)",
             data=json.dumps({
                 "generated_at": datetime.now().isoformat(),
                 "style": style,
-                "total": len(results),
-                "queued": queued,
-                "errors": errors,
-                "results": results,
+                "products": [
+                    {
+                        "name": fp["name"],
+                        "image_url": fp["image_url"],
+                        "source_url": fp["source_url"],
+                        "prompt": r.get("prompt", ""),
+                        "text_hook": r.get("text_hook"),
+                        "alt_hooks": r.get("alt_hooks"),
+                        "caption": r.get("caption"),
+                        "hashtags": r.get("hashtags"),
+                    }
+                    for fp, r in zip(final_products, results)
+                ],
+            }, indent=2),
+            file_name=f"prompts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            mime="application/json",
+        )
+
+    # ════════════════════════════════════════════════════════════════
+    #  AUTO-GENERATE MODE
+    # ════════════════════════════════════════════════════════════════
+    if auto_btn:
+        st.divider()
+        st.subheader("🎬 Generating Videos")
+
+        results = []
+        progress = st.progress(0, text="Starting...")
+        token_expired = False
+
+        for i, product in enumerate(final_products):
+            if token_expired:
+                break
+
+            progress.progress(i / len(final_products),
+                              text=f"Processing {i+1}/{len(final_products)}: {product['name'][:30]}...")
+
+            # Step A: Write the prompt (cheap, no MCP)
+            with st.spinner(f"Writing prompt for {product['name'][:30]}..."):
+                prompt_result = write_prompt(
+                    api_key=api_key,
+                    product_name=product["name"],
+                    style=style,
+                    duration=duration,
+                    voice_script=voice_script if voice_script else None,
+                )
+
+            if prompt_result.get("error") or not prompt_result.get("prompt"):
+                st.error(f"❌ **{product['name']}** — Prompt error: {prompt_result.get('error', 'No prompt')}")
+                results.append({"product_name": product["name"], "status": "error",
+                                "error": prompt_result.get("error"), "creation_id": None})
+                continue
+
+            prompt_text = prompt_result["prompt"]
+
+            # Step B: Generate via Magnific MCP
+            with st.spinner(f"Generating video for {product['name'][:30]}... (may take a minute)"):
+                gen_result = generate_video(
+                    api_key=api_key,
+                    magnific_token=magnific_token,
+                    image_url=product["image_url"],
+                    prompt=prompt_text,
+                    duration=duration if style == "shoe_video" else 8,
+                )
+
+            gen_result["product_name"] = product["name"]
+            gen_result["prompt_used"] = prompt_text
+            results.append(gen_result)
+
+            if gen_result.get("creation_id") and gen_result["status"] == "queued":
+                st.success(f"✅ **{product['name']}** — Creation ID: `{gen_result['creation_id']}`")
+            elif gen_result["status"] == "error":
+                error_msg = gen_result.get("error", "")
+                st.error(f"❌ **{product['name']}** — {error_msg}")
+
+                if any(kw in error_msg.lower() for kw in ['401', 'unauthorized', 'auth', 'token', 'forbidden', '403']):
+                    st.warning("🔄 **Token expired.** Paste a fresh token in the sidebar and re-run.")
+                    token_expired = True
+
+                    # Show the prompt so they can still use it manually
+                    with st.expander(f"📝 Prompt for {product['name']} (use manually)"):
+                        st.code(prompt_text, language=None)
+                        st.text_input("Image URL:", value=product["image_url"], key=f"fallback_img_{i}")
+            else:
+                st.warning(f"⚠️ **{product['name']}** — Status: {gen_result['status']}")
+
+            # Show text-hook extras
+            if prompt_result.get("text_hook"):
+                with st.expander(f"📝 Hook & Caption — {product['name']}"):
+                    st.code(prompt_result["text_hook"], language=None)
+                    if prompt_result.get("alt_hooks"):
+                        for alt in prompt_result["alt_hooks"]:
+                            st.code(alt, language=None)
+                    if prompt_result.get("caption"):
+                        st.caption(f"Caption: {prompt_result['caption']}")
+                    if prompt_result.get("hashtags"):
+                        st.caption(f"Hashtags: {prompt_result['hashtags']}")
+
+            if i < len(final_products) - 1:
+                time.sleep(5)
+
+        progress.progress(1.0, text="Done!")
+
+        # Save results to session state for the dashboard
+        if "video_results" not in st.session_state:
+            st.session_state["video_results"] = []
+
+        for r, fp in zip(results, final_products):
+            r["image_url"] = fp["image_url"]
+            r["source_url"] = fp["source_url"]
+            r["style"] = style
+            r["duration"] = duration if style == "shoe_video" else 8
+            r["generated_at"] = datetime.now().isoformat()
+
+        st.session_state["video_results"].extend(results)
+
+        # Summary
+        st.divider()
+        queued = sum(1 for r in results if r.get("status") == "queued")
+        errors = sum(1 for r in results if r.get("status") == "error")
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Total", len(results))
+        col2.metric("Queued ✅", queued)
+        col3.metric("Errors ❌", errors)
+
+    # ════════════════════════════════════════════════════════════════
+    #  STEP 4 — VIDEO DASHBOARD (persistent across reruns)
+    # ════════════════════════════════════════════════════════════════
+    if "video_results" in st.session_state and st.session_state["video_results"]:
+        st.divider()
+        st.subheader("④ Video Dashboard")
+        st.caption("Check status, watch finished videos, or regenerate.")
+
+        # Bulk status check button
+        if magnific_token and api_key:
+            check_all = st.button("🔄 Check All Statuses", use_container_width=True)
+        else:
+            check_all = False
+
+        for i, result in enumerate(st.session_state["video_results"]):
+            creation_id = result.get("creation_id")
+            product_name = result.get("product_name", "Unknown")
+            status = result.get("status", "unknown")
+
+            st.markdown("---")
+
+            # Status badge
+            status_badges = {
+                "queued": "🟡 Queued",
+                "processing": "🟠 Processing",
+                "completed": "🟢 Completed",
+                "error": "🔴 Error",
+            }
+            badge = status_badges.get(status, f"⚪ {status}")
+
+            col_info, col_actions = st.columns([3, 1])
+
+            with col_info:
+                st.markdown(f"**{product_name}** — {badge}")
+                if creation_id:
+                    st.caption(f"Creation ID: `{creation_id}`")
+
+                # Show video if we have a URL
+                video_url = result.get("url") or result.get("preview_url")
+                if video_url and status == "completed":
+                    try:
+                        st.video(video_url)
+                    except Exception:
+                        st.markdown(f"🎬 [Watch video]({video_url})")
+
+                # Show image thumbnail
+                if result.get("image_url"):
+                    try:
+                        st.image(result["image_url"], width=120)
+                    except Exception:
+                        pass
+
+            with col_actions:
+                # Check status button (per video)
+                if creation_id and status not in ("completed", "error") and magnific_token and api_key:
+                    if st.button("🔄 Check", key=f"check_{i}") or check_all:
+                        with st.spinner("Checking..."):
+                            status_result = check_creation_status(
+                                api_key, magnific_token, creation_id
+                            )
+                        # Update stored result
+                        result["status"] = status_result.get("status", status)
+                        if status_result.get("url"):
+                            result["url"] = status_result["url"]
+                        if status_result.get("preview_url"):
+                            result["preview_url"] = status_result["preview_url"]
+                        st.session_state["video_results"][i] = result
+                        st.rerun()
+
+                # Regenerate button
+                if result.get("prompt_used") and result.get("image_url") and magnific_token and api_key:
+                    if st.button("🔁 Regenerate", key=f"regen_{i}"):
+                        with st.spinner("Regenerating..."):
+                            new_result = generate_video(
+                                api_key=api_key,
+                                magnific_token=magnific_token,
+                                image_url=result["image_url"],
+                                prompt=result["prompt_used"],
+                                duration=result.get("duration", 15),
+                            )
+                        new_result["product_name"] = product_name
+                        new_result["prompt_used"] = result["prompt_used"]
+                        new_result["image_url"] = result["image_url"]
+                        new_result["source_url"] = result.get("source_url", "")
+                        new_result["style"] = result.get("style", "")
+                        new_result["duration"] = result.get("duration", 15)
+                        new_result["generated_at"] = datetime.now().isoformat()
+                        st.session_state["video_results"][i] = new_result
+                        st.rerun()
+
+                # Show prompt (for copying to manual generation)
+                if result.get("prompt_used"):
+                    if st.button("📋 Prompt", key=f"showprompt_{i}"):
+                        st.session_state[f"show_prompt_{i}"] = True
+
+            # Expandable prompt view
+            if st.session_state.get(f"show_prompt_{i}"):
+                st.text_area(
+                    "Seedance prompt:",
+                    value=result["prompt_used"],
+                    height=200,
+                    key=f"prompt_view_{i}",
+                )
+
+        # Download all results
+        st.divider()
+        st.download_button(
+            "📥 Download All Results (JSON)",
+            data=json.dumps({
+                "exported_at": datetime.now().isoformat(),
+                "results": st.session_state["video_results"],
             }, indent=2),
             file_name=f"results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
             mime="application/json",
         )
+
+        # Clear dashboard
+        if st.button("🗑️ Clear Dashboard"):
+            st.session_state["video_results"] = []
+            st.rerun()
 
 
 if __name__ == "__main__":
