@@ -609,11 +609,10 @@ repeat these steps to get a fresh one.
     # ════════════════════════════════════════════════════════════════
     #  STEP 2 — SCRAPE + SELECT PHOTOS
     # ════════════════════════════════════════════════════════════════
-    if scrape_btn:
-        if not links:
-            st.warning("Paste at least one product link.")
-            st.stop()
+    if scrape_btn and not links:
+        st.warning("Paste at least one product link.")
 
+    if scrape_btn and links:
         st.divider()
         st.subheader("② Select the Right Photo for Each Product")
         st.caption("Some products have multiple colors or angles — pick the one you want in the video.")
@@ -632,94 +631,89 @@ repeat these steps to get a fresh one.
 
         progress.progress(1.0, text=f"Found {len(scraped_products)} product(s)")
 
-        if not scraped_products:
-            st.error("No products could be scraped. Check your links.")
-            st.stop()
-
-        # Store in session state so selections persist
-        st.session_state["scraped"] = scraped_products
-
-    # ── Show image selection if we have scraped data ──
-    has_scraped_products = "scraped" in st.session_state
-    scraped_products = st.session_state.get("scraped", [])
-    selections = {}  # product_index → selected image url
-
-    if has_scraped_products:
-        st.subheader("② Select the Right Photo for Each Product")
-        st.caption("Some products have multiple colors or angles — pick the one you want in the video.")
-
-    for idx, product in enumerate(scraped_products):
-        st.markdown(f"---")
-        st.markdown(f"### {product['name']}")
-        st.caption(f"Source: {product['source_url'][:80]}...")
-
-        images = product["images"]
-
-        if len(images) == 1:
-            # Only one image — auto-select, still show it
-            selections[idx] = images[0]
-            try:
-                st.image(images[0], width=200)
-            except Exception:
-                st.caption(f"Image: {images[0][:60]}...")
+        if scraped_products:
+            # Store in session state so selections persist
+            st.session_state["scraped"] = scraped_products
         else:
-            # Multiple images — let VA pick
-            cols = st.columns(min(len(images), 4))
-            for img_idx, img_url in enumerate(images[:8]):
-                with cols[img_idx % 4]:
-                    try:
-                        st.image(img_url, width=150, caption=f"Option {img_idx + 1}")
-                    except Exception:
-                        st.caption(f"Option {img_idx + 1}: {img_url[:40]}...")
+            st.error("No products could be scraped. Check your links.")
 
-            selected = st.radio(
-                f"Pick photo for **{product['name'][:40]}**:",
-                options=list(range(len(images[:8]))),
-                format_func=lambda x: f"Option {x + 1}",
-                key=f"select_{idx}",
-                horizontal=True,
-            )
-            selections[idx] = images[selected]
+    # ── Show image selection if we have scraped data (doesn't block the rest of the page) ──
+    if "scraped" in st.session_state:
+        scraped_products = st.session_state["scraped"]
+        selections = {}  # product_index → selected image url
 
-    # ════════════════════════════════════════════════════════════════
-    #  STEP 3 — GENERATE OR GET PROMPTS
-    # ════════════════════════════════════════════════════════════════
-    if has_scraped_products:
+        for idx, product in enumerate(scraped_products):
+            st.markdown(f"---")
+            st.markdown(f"### {product['name']}")
+            st.caption(f"Source: {product['source_url'][:80]}...")
+
+            images = product["images"]
+
+            if len(images) == 1:
+                # Only one image — auto-select, still show it
+                selections[idx] = images[0]
+                try:
+                    st.image(images[0], width=200)
+                except Exception:
+                    st.caption(f"Image: {images[0][:60]}...")
+            else:
+                # Multiple images — let VA pick
+                cols = st.columns(min(len(images), 4))
+                for img_idx, img_url in enumerate(images[:8]):
+                    with cols[img_idx % 4]:
+                        try:
+                            st.image(img_url, width=150, caption=f"Option {img_idx + 1}")
+                        except Exception:
+                            st.caption(f"Option {img_idx + 1}: {img_url[:40]}...")
+
+                selected = st.radio(
+                    f"Pick photo for **{product['name'][:40]}**:",
+                    options=list(range(len(images[:8]))),
+                    format_func=lambda x: f"Option {x + 1}",
+                    key=f"select_{idx}",
+                    horizontal=True,
+                )
+                selections[idx] = images[selected]
+
+        # ════════════════════════════════════════════════════════════════
+        #  STEP 3 — GENERATE OR GET PROMPTS
+        # ════════════════════════════════════════════════════════════════
         st.divider()
         st.subheader("③ Generate")
 
-    has_token = bool(magnific_token)
+        has_token = bool(magnific_token)
 
-    if has_scraped_products and has_token:
-        col1, col2 = st.columns(2)
-        auto_btn = col1.button("🎬 Auto-Generate Videos", type="primary", use_container_width=True)
-        prompt_btn = col2.button("📝 Just Get Prompts", use_container_width=True)
-    elif has_scraped_products:
-        auto_btn = False
-        prompt_btn = st.button("📝 Get Prompts + Images (generate manually in Magnific)",
-                               type="primary", use_container_width=True)
+        if has_token:
+            col1, col2 = st.columns(2)
+            auto_btn = col1.button("🎬 Auto-Generate Videos", type="primary", use_container_width=True)
+            prompt_btn = col2.button("📝 Just Get Prompts", use_container_width=True)
+        else:
+            auto_btn = False
+            prompt_btn = st.button("📝 Get Prompts + Images (generate manually in Magnific)",
+                                   type="primary", use_container_width=True)
+
+        # ── Build final product list with selected images ──
+        final_products = []
+        for idx, product in enumerate(scraped_products):
+            final_products.append({
+                "name": product["name"],
+                "image_url": selections.get(idx, product["images"][0]),
+                "source_url": product["source_url"],
+            })
+
+        if (auto_btn or prompt_btn) and not api_key:
+            st.error("❌ Anthropic API key is missing. Ask Sky to set it up.")
+            auto_btn = False
+            prompt_btn = False
     else:
         auto_btn = False
         prompt_btn = False
-
-    generation_requested = auto_btn or prompt_btn
-
-    if generation_requested and not api_key:
-        st.error("❌ Anthropic API key is missing. Ask Sky to set it up.")
-
-    # ── Build final product list with selected images ──
-    final_products = []
-    for idx, product in enumerate(scraped_products):
-        final_products.append({
-            "name": product["name"],
-            "image_url": selections.get(idx, product["images"][0]),
-            "source_url": product["source_url"],
-        })
+        final_products = []
 
     # ════════════════════════════════════════════════════════════════
     #  PROMPT-ONLY MODE
     # ════════════════════════════════════════════════════════════════
-    if prompt_btn and api_key:
+    if prompt_btn:
         st.divider()
         st.subheader("📝 Prompts & Images")
         st.caption("Copy each prompt and generate manually in Magnific → magnific.com/ai/video-generator")
@@ -827,7 +821,7 @@ repeat these steps to get a fresh one.
     # ════════════════════════════════════════════════════════════════
     #  AUTO-GENERATE MODE
     # ════════════════════════════════════════════════════════════════
-    if auto_btn and api_key:
+    if auto_btn:
         st.divider()
         st.subheader("🎬 Generating Videos")
 
