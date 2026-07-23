@@ -15,6 +15,7 @@ import requests
 from datetime import datetime
 from urllib.parse import urlparse
 from html import unescape as html_unescape
+from pathlib import Path
 
 
 # ── Page config ─────────────────────────────────────────────────────
@@ -23,6 +24,38 @@ st.set_page_config(
     page_icon="🎬",
     layout="wide",
 )
+
+# ── Persistent storage ─────────────────────────────────────────────
+SAVE_FILE = Path("generations.json")
+
+
+def load_generations() -> list[dict]:
+    """Load saved generations from disk."""
+    if SAVE_FILE.exists():
+        try:
+            with open(SAVE_FILE) as f:
+                data = json.load(f)
+                return data if isinstance(data, list) else []
+        except (json.JSONDecodeError, IOError):
+            return []
+    return []
+
+
+def save_generations(generations: list[dict]):
+    """Save generations to disk."""
+    try:
+        with open(SAVE_FILE, "w") as f:
+            json.dump(generations, f, indent=2, default=str)
+    except IOError:
+        pass
+
+
+def add_generation(result: dict):
+    """Append a single generation result to the saved file."""
+    gens = load_generations()
+    gens.insert(0, result)  # Newest first
+    # Keep last 200 entries
+    save_generations(gens[:200])
 
 # ── Constants ───────────────────────────────────────────────────────
 MAGNIFIC_MCP_URL = "https://mcp.magnific.com"
@@ -871,18 +904,14 @@ repeat these steps to get a fresh one.
 
         progress.progress(1.0, text="Done!")
 
-        # Save results to session state for the dashboard
-        if "video_results" not in st.session_state:
-            st.session_state["video_results"] = []
-
+        # Save each result to persistent file
         for r, fp in zip(results, final_products):
             r["image_url"] = fp["image_url"]
             r["source_url"] = fp["source_url"]
             r["style"] = style
             r["duration"] = duration if style == "shoe_video" else 8
             r["generated_at"] = datetime.now().isoformat()
-
-        st.session_state["video_results"].extend(results)
+            add_generation(r)
 
         # Summary
         st.divider()
@@ -895,27 +924,44 @@ repeat these steps to get a fresh one.
         col3.metric("Errors ❌", errors)
 
     # ════════════════════════════════════════════════════════════════
-    #  STEP 4 — VIDEO DASHBOARD (persistent across reruns)
+    #  STEP 4 — PAST GENERATIONS (persisted to file, survives refresh)
     # ════════════════════════════════════════════════════════════════
-    if "video_results" in st.session_state and st.session_state["video_results"]:
-        st.divider()
-        st.subheader("④ Video Dashboard")
-        st.caption("Check status, watch finished videos, or regenerate.")
+    saved_gens = load_generations()
 
-        # Bulk status check button
+    if saved_gens:
+        st.divider()
+        st.subheader("④ Past Generations")
+        st.caption(f"{len(saved_gens)} saved — survives page refreshes. Check status, watch videos, or regenerate.")
+
+        # Bulk actions
+        action_col1, action_col2, action_col3 = st.columns(3)
         if magnific_token and api_key:
-            check_all = st.button("🔄 Check All Statuses", use_container_width=True)
+            check_all = action_col1.button("🔄 Check All Statuses", use_container_width=True)
         else:
             check_all = False
+        clear_completed = action_col2.button("🧹 Clear Completed", use_container_width=True)
+        clear_all = action_col3.button("🗑️ Clear All", use_container_width=True)
 
-        for i, result in enumerate(st.session_state["video_results"]):
+        if clear_all:
+            save_generations([])
+            st.rerun()
+
+        if clear_completed:
+            remaining = [g for g in saved_gens if g.get("status") != "completed"]
+            save_generations(remaining)
+            st.rerun()
+
+        # Display each generation
+        needs_save = False
+
+        for i, result in enumerate(saved_gens):
             creation_id = result.get("creation_id")
             product_name = result.get("product_name", "Unknown")
             status = result.get("status", "unknown")
+            generated_at = result.get("generated_at", "")
 
             st.markdown("---")
 
-            # Status badge
             status_badges = {
                 "queued": "🟡 Queued",
                 "processing": "🟠 Processing",
@@ -924,14 +970,23 @@ repeat these steps to get a fresh one.
             }
             badge = status_badges.get(status, f"⚪ {status}")
 
+            # Timestamp
+            time_str = ""
+            if generated_at:
+                try:
+                    dt = datetime.fromisoformat(generated_at)
+                    time_str = f" · {dt.strftime('%b %d, %I:%M %p')}"
+                except Exception:
+                    pass
+
             col_info, col_actions = st.columns([3, 1])
 
             with col_info:
-                st.markdown(f"**{product_name}** — {badge}")
+                st.markdown(f"**{product_name}** — {badge}{time_str}")
                 if creation_id:
                     st.caption(f"Creation ID: `{creation_id}`")
 
-                # Show video if we have a URL
+                # Show video if completed and we have a URL
                 video_url = result.get("url") or result.get("preview_url")
                 if video_url and status == "completed":
                     try:
@@ -939,33 +994,31 @@ repeat these steps to get a fresh one.
                     except Exception:
                         st.markdown(f"🎬 [Watch video]({video_url})")
 
-                # Show image thumbnail
-                if result.get("image_url"):
+                # Show product image thumbnail
+                if result.get("image_url") and status != "completed":
                     try:
                         st.image(result["image_url"], width=120)
                     except Exception:
                         pass
 
             with col_actions:
-                # Check status button (per video)
+                # Check status
                 if creation_id and status not in ("completed", "error") and magnific_token and api_key:
-                    if st.button("🔄 Check", key=f"check_{i}") or check_all:
+                    if st.button("🔄 Check", key=f"chk_{i}") or check_all:
                         with st.spinner("Checking..."):
                             status_result = check_creation_status(
                                 api_key, magnific_token, creation_id
                             )
-                        # Update stored result
-                        result["status"] = status_result.get("status", status)
+                        saved_gens[i]["status"] = status_result.get("status", status)
                         if status_result.get("url"):
-                            result["url"] = status_result["url"]
+                            saved_gens[i]["url"] = status_result["url"]
                         if status_result.get("preview_url"):
-                            result["preview_url"] = status_result["preview_url"]
-                        st.session_state["video_results"][i] = result
-                        st.rerun()
+                            saved_gens[i]["preview_url"] = status_result["preview_url"]
+                        needs_save = True
 
-                # Regenerate button
+                # Regenerate
                 if result.get("prompt_used") and result.get("image_url") and magnific_token and api_key:
-                    if st.button("🔁 Regenerate", key=f"regen_{i}"):
+                    if st.button("🔁 Regen", key=f"regen_{i}"):
                         with st.spinner("Regenerating..."):
                             new_result = generate_video(
                                 api_key=api_key,
@@ -981,39 +1034,30 @@ repeat these steps to get a fresh one.
                         new_result["style"] = result.get("style", "")
                         new_result["duration"] = result.get("duration", 15)
                         new_result["generated_at"] = datetime.now().isoformat()
-                        st.session_state["video_results"][i] = new_result
+                        # Add new generation, keep old one
+                        add_generation(new_result)
                         st.rerun()
 
-                # Show prompt (for copying to manual generation)
-                if result.get("prompt_used"):
-                    if st.button("📋 Prompt", key=f"showprompt_{i}"):
-                        st.session_state[f"show_prompt_{i}"] = True
+            # Expandable prompt
+            if result.get("prompt_used"):
+                with st.expander(f"📋 Prompt — {product_name}", expanded=False):
+                    st.code(result["prompt_used"], language=None)
+                    if result.get("image_url"):
+                        st.text_input("Image URL:", value=result["image_url"], key=f"img_{i}")
 
-            # Expandable prompt view
-            if st.session_state.get(f"show_prompt_{i}"):
-                st.text_area(
-                    "Seedance prompt:",
-                    value=result["prompt_used"],
-                    height=200,
-                    key=f"prompt_view_{i}",
-                )
+        # Save any status updates
+        if needs_save:
+            save_generations(saved_gens)
+            st.rerun()
 
-        # Download all results
+        # Download
         st.divider()
         st.download_button(
-            "📥 Download All Results (JSON)",
-            data=json.dumps({
-                "exported_at": datetime.now().isoformat(),
-                "results": st.session_state["video_results"],
-            }, indent=2),
-            file_name=f"results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            "📥 Download All (JSON)",
+            data=json.dumps(saved_gens, indent=2, default=str),
+            file_name=f"generations_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
             mime="application/json",
         )
-
-        # Clear dashboard
-        if st.button("🗑️ Clear Dashboard"):
-            st.session_state["video_results"] = []
-            st.rerun()
 
 
 if __name__ == "__main__":
