@@ -115,42 +115,75 @@ Surface matching:
 Return ONLY valid JSON (no markdown, no backticks):
 {{"product_name": "...", "prompt": "the full seedance prompt under 1900 chars", "char_count": 123}}"""
 
-TEXTHOOK_SYSTEM = """You are a TikTok Shop affiliate content producer. Write a
-"text-hook + vibey b-roll → product reveal" Seedance 2.0 prompt AND a text hook.
+TEXTHOOK_HOOKS_SYSTEM = """You are a TikTok Shop affiliate content producer. Generate 5
+on-screen text hook options for a product video.
+
+Text hook rules (gen-z texting voice):
+- ur, bc, &, lowercase drift, no period
+- Deadpan, self-deprecating money humor
+- Exactly one emoji at the end (😭 😩 💀 — pick one). No emoji spam
+- No "link in bio", no CTA. ~14-22 words
+- Each hook MUST be a completely different angle/joke — NOT minor rewording:
+  1) broke-flex ("I spent rent money on this")
+  2) relatable overspending ("add to cart at 3am type behavior")
+  3) "this fixed my life" ("idk how I lived without this")
+  4) self-roast ("no one asked but here's my 47th order this month")
+  5) unexpected gratitude ("whoever invented this I owe u my life")
+
+Return ONLY valid JSON (no markdown, no backticks):
+{{"product_name": "...", "hook_options": ["hook 1", "hook 2", "hook 3", "hook 4", "hook 5"], "caption": "tiktok caption (NOT the hook — a separate short caption for the post)", "hashtags": "#tag1 #tag2..."}}"""
+
+TEXTHOOK_PROMPT_SYSTEM = """You are a TikTok Shop affiliate content producer. Write a
+Seedance 2.0 video prompt that BURNS IN on-screen text as part of the AI render.
+
+The selected text hook to burn in: {selected_hook}
 
 HARD RULES:
 - SILENT video — NO audio, NO voiceover
-- Zero on-screen text in the AI render (user burns text in later)
-- No face, no person, no character — only a hand in the reveal
-- Two acts: vibey b-roll (~3s) → hard cut to product reveal (~5s)
+- The text hook MUST appear as large bold white text with a subtle dark drop shadow,
+  centered in the upper third of the frame. The text appears at 00:00 and stays on
+  screen for the entire video. It looks like a native TikTok text overlay.
+- No face, no person, no character — only a hand in the reveal shot
+- Two acts: random b-roll (~3s) → hard cut to product reveal (~5s)
 - ~8 seconds total, 9:16 vertical
 - Under 1,900 characters
+
+CRITICAL — B-ROLL RULES:
+The opening b-roll must be a RANDOM mundane real-life scene. It must NOT relate to the
+product in any way. Pick from scenes like:
+- Person's feet walking on a sidewalk
+- Cars driving on a highway at golden hour
+- Coffee being poured into a mug
+- Rain droplets on a window
+- Hand pushing a grocery cart down an aisle
+- Laundry tumbling in a dryer
+- Dog trotting ahead on a leash (shot from behind)
+- Crosswalk signal changing, crowd crossing
+- Leaves blowing across a parking lot
+- Steam rising off pavement after rain
+Pick ONE at random. The more unrelated to the product, the better — that's the style.
 
 Prompt template:
 9:16 vertical, TikTok UGC aesthetic, silent, no audio, no voiceover. Handheld phone-camera
 feel with natural micro-shake. Warm bright daylight, slightly saturated. No face, no person,
 no character — only a hand in the second half.
 
-[00:00-00:03] Establishing b-roll: first-person POV [SCENE]. Mundane real-life vibe, slow
-handheld drift. No product on screen.
+Large bold white text with subtle dark drop shadow centered in the upper third of the frame
+reads: "{selected_hook}" — the text appears immediately and stays on screen the entire video.
 
-[00:03-00:08] Hard cut to outdoors on [SURFACE]. A single hand holds up [PRODUCT + detail]
-toward camera, slowly rotating and tilting so [detail] catches warm light. Hand fills lower
-half. Soft blurred background.
+[00:00-00:03] Establishing b-roll: first-person POV [RANDOM MUNDANE SCENE — NOT related to
+the product]. Casual handheld drift. No product on screen. The white text hook is visible
+in the upper third.
 
-No face. No person above the wrist. No text, captions, subtitles, overlays, logos.
+[00:03-00:08] Hard cut to outdoors on a surface. A single medium-brown-skinned hand holds up
+[PRODUCT + visual detail] toward camera, slowly rotating and tilting so the detail catches
+warm light. Hand fills lower half. Soft blurred background. The white text hook remains
+visible in the upper third.
 
-Text hook rules (gen-z texting voice):
-- ur, bc, &, lowercase drift, no period
-- Deadpan, self-deprecating money humor
-- Exactly one 😭 (or 😩/💀) at the end. No emoji spam
-- No "link in bio", no CTA. ~14-22 words
-- Write 5 DIFFERENT hook options, each a distinct angle (e.g. broke-flex, relatable
-  overspending, "this fixed my life", self-roast, unexpected gratitude) — not just
-  minor wording variations of the same joke
+No face. No person above the wrist.
 
-Return ONLY valid JSON:
-{{"product_name": "...", "prompt": "the full seedance prompt", "char_count": 123, "hook_options": ["hook 1", "hook 2", "hook 3", "hook 4", "hook 5"], "caption": "tiktok caption", "hashtags": "#tag1 #tag2..."}}"""
+Return ONLY valid JSON (no markdown, no backticks):
+{{"product_name": "...", "prompt": "the full seedance prompt under 1900 chars", "char_count": 123}}"""
 
 VOICEOVER_SILENT = "## Audio:\nNO voiceover. Ambient sound only."
 VOICEOVER_WITH_SCRIPT = '## Voiceover:\nInclude this voiceover (warm excited woman, casual and friendly):\n"{script}"'
@@ -292,12 +325,38 @@ def scrape_product(url: str) -> dict | None:
 #  PROMPT WRITER (Claude only — no MCP, cheap + fast)
 # ═══════════════════════════════════════════════════════════════════
 
+def write_hooks(api_key: str, product_name: str) -> dict:
+    """Generate 5 hook options for a product. Cheap/fast — no MCP."""
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=1024,
+            system=TEXTHOOK_HOOKS_SYSTEM,
+            messages=[{
+                "role": "user",
+                "content": f"Write 5 text hook options for this product: {product_name}"
+            }],
+        )
+        text = response.content[0].text
+        cleaned = re.sub(r'```json\s*', '', text)
+        cleaned = re.sub(r'```\s*', '', cleaned)
+        json_start = cleaned.find("{")
+        json_end = cleaned.rfind("}") + 1
+        if json_start >= 0 and json_end > json_start:
+            return json.loads(cleaned[json_start:json_end])
+        return {"error": "Couldn't parse JSON", "product_name": product_name}
+    except Exception as e:
+        return {"error": str(e), "product_name": product_name}
+
+
 def write_prompt(
     api_key: str,
     product_name: str,
     style: str,
     duration: int = 15,
     voice_script: str | None = None,
+    selected_hook: str | None = None,
 ) -> dict:
     """Use Claude to write the Seedance prompt. No MCP, no Magnific."""
     if style == "shoe_video":
@@ -305,7 +364,7 @@ def write_prompt(
         system = SHOE_VIDEO_SYSTEM.format(voiceover_instruction=vo)
         dur = duration
     else:
-        system = TEXTHOOK_SYSTEM
+        system = TEXTHOOK_PROMPT_SYSTEM.format(selected_hook=selected_hook or "")
         dur = 8
 
     try:
@@ -697,15 +756,6 @@ repeat these steps to get a fresh one.
 
         has_token = bool(magnific_token)
 
-        if has_token:
-            col1, col2 = st.columns(2)
-            auto_btn = col1.button("🎬 Auto-Generate Videos", type="primary", use_container_width=True)
-            prompt_btn = col2.button("📝 Just Get Prompts", use_container_width=True)
-        else:
-            auto_btn = False
-            prompt_btn = st.button("📝 Get Prompts + Images (generate manually in Magnific)",
-                                   type="primary", use_container_width=True)
-
         # ── Build final product list with selected images ──
         final_products = []
         for idx, product in enumerate(scraped_products):
@@ -714,6 +764,95 @@ repeat these steps to get a fresh one.
                 "image_url": selections.get(idx, product["images"][0]),
                 "source_url": product["source_url"],
             })
+
+        # ── For texthook_broll: pick hooks FIRST, then generate ──
+        hooks_ready = True  # True for shoe_video (no hooks needed)
+        if style == "texthook_broll":
+            hooks_ready = False
+
+            # ── Step 3a: Generate hook options ──
+            if "product_hooks" not in st.session_state:
+                st.session_state["product_hooks"] = {}
+
+            hooks_btn = st.button("📝 Step 1 — Generate Hook Options",
+                                   type="primary" if not st.session_state["product_hooks"] else "secondary",
+                                   use_container_width=True)
+
+            if hooks_btn and api_key:
+                progress = st.progress(0, text="Generating hook options...")
+                for i, product in enumerate(final_products):
+                    progress.progress(i / len(final_products),
+                                      text=f"Hooks {i+1}/{len(final_products)}: {product['name'][:30]}...")
+                    with st.spinner(f"Writing hooks for {product['name'][:30]}..."):
+                        hook_result = write_hooks(api_key, product["name"])
+                    st.session_state["product_hooks"][i] = {
+                        "product_name": product["name"],
+                        "hook_options": hook_result.get("hook_options", []),
+                        "caption": hook_result.get("caption", ""),
+                        "hashtags": hook_result.get("hashtags", ""),
+                        "accepted_hook": None,
+                    }
+                    if hook_result.get("error"):
+                        st.error(f"❌ {product['name']}: {hook_result['error']}")
+                progress.progress(1.0, text="Done!")
+                st.rerun()
+            elif hooks_btn and not api_key:
+                st.error("❌ Anthropic API key is missing. Ask Sky to set it up.")
+
+            # ── Step 3b: Show hooks + pick/accept ──
+            if st.session_state["product_hooks"]:
+                all_accepted = True
+                for i, product in enumerate(final_products):
+                    hook_data = st.session_state["product_hooks"].get(i)
+                    if not hook_data or not hook_data.get("hook_options"):
+                        all_accepted = False
+                        continue
+
+                    st.markdown(f"---")
+                    st.markdown(f"**{product['name']}** — Pick on-screen text hook:")
+
+                    if hook_data.get("accepted_hook"):
+                        st.success(f"✅ Accepted: {hook_data['accepted_hook']}")
+                        if st.button("Change hook", key=f"changehook_{i}"):
+                            st.session_state["product_hooks"][i]["accepted_hook"] = None
+                            st.rerun()
+                    else:
+                        all_accepted = False
+                        picked = st.radio(
+                            "Options:",
+                            options=list(range(len(hook_data["hook_options"]))),
+                            format_func=lambda x, hd=hook_data: hd["hook_options"][x],
+                            key=f"hookpick_{i}",
+                            label_visibility="collapsed",
+                        )
+                        if st.button("✅ Accept this hook", key=f"accepthook_{i}"):
+                            st.session_state["product_hooks"][i]["accepted_hook"] = hook_data["hook_options"][picked]
+                            st.rerun()
+
+                    if hook_data.get("caption"):
+                        st.caption(f"Caption: {hook_data['caption']}")
+                    if hook_data.get("hashtags"):
+                        st.caption(f"Hashtags: {hook_data['hashtags']}")
+
+                hooks_ready = all_accepted
+                if not hooks_ready:
+                    st.info("👆 Accept a hook for each product, then generate.")
+                else:
+                    st.success("✅ All hooks accepted! Ready to generate.")
+
+        # ── Step 3c: Generate buttons (only appear when hooks are ready) ──
+        auto_btn = False
+        prompt_btn = False
+        if hooks_ready:
+            st.markdown("---")
+            if has_token:
+                col1, col2 = st.columns(2)
+                auto_btn = col1.button("🎬 Step 2 — Auto-Generate Videos" if style == "texthook_broll" else "🎬 Auto-Generate Videos",
+                                        type="primary", use_container_width=True)
+                prompt_btn = col2.button("📝 Just Get Prompts", use_container_width=True)
+            else:
+                prompt_btn = st.button("📝 Get Prompts + Images (generate manually in Magnific)",
+                                       type="primary", use_container_width=True)
 
         if (auto_btn or prompt_btn) and not api_key:
             st.error("❌ Anthropic API key is missing. Ask Sky to set it up.")
@@ -738,6 +877,14 @@ repeat these steps to get a fresh one.
         for i, product in enumerate(final_products):
             progress.progress(i / len(final_products), text=f"Writing prompt {i+1}/{len(final_products)}...")
 
+            # Get the accepted hook for texthook_broll style
+            selected_hook = None
+            hook_data_for_product = None
+            if style == "texthook_broll":
+                hook_data_for_product = st.session_state.get("product_hooks", {}).get(i)
+                if hook_data_for_product:
+                    selected_hook = hook_data_for_product.get("accepted_hook")
+
             with st.spinner(f"Writing prompt for {product['name'][:30]}..."):
                 result = write_prompt(
                     api_key=api_key,
@@ -745,7 +892,15 @@ repeat these steps to get a fresh one.
                     style=style,
                     duration=duration,
                     voice_script=voice_script if voice_script else None,
+                    selected_hook=selected_hook,
                 )
+
+            # Carry over hook data into result for persistence
+            if hook_data_for_product:
+                result["accepted_hook"] = selected_hook
+                result["hook_options"] = hook_data_for_product.get("hook_options", [])
+                result["caption"] = hook_data_for_product.get("caption")
+                result["hashtags"] = hook_data_for_product.get("hashtags")
 
             results.append(result)
 
@@ -779,18 +934,13 @@ repeat these steps to get a fresh one.
                 elif result.get("error"):
                     st.error(f"Error: {result['error']}")
 
-                # Text-hook extras — shown here, but pick/accept happens below in
-                # "Past Generations" (this block resets on every click, so the
-                # picker needs to live somewhere that persists)
-                hook_options = result.get("hook_options", [])
-                if hook_options:
-                    st.markdown("**On-screen text hook options** (pick one in 'Past Text Hooks' below):")
-                    for h in hook_options:
-                        st.code(h, language=None)
-                    if result.get("caption"):
-                        st.text_input("Caption:", value=result["caption"], key=f"cap_{i}")
-                    if result.get("hashtags"):
-                        st.text_input("Hashtags:", value=result["hashtags"], key=f"hash_{i}")
+                # Show which hook was burned in
+                if result.get("accepted_hook"):
+                    st.success(f"🔥 Burned-in hook: {result['accepted_hook']}")
+                if result.get("caption"):
+                    st.text_input("Caption:", value=result["caption"], key=f"cap_{i}")
+                if result.get("hashtags"):
+                    st.text_input("Hashtags:", value=result["hashtags"], key=f"hash_{i}")
 
             time.sleep(1)  # Rate limit
 
@@ -861,6 +1011,13 @@ repeat these steps to get a fresh one.
                               text=f"Processing {i+1}/{len(final_products)}: {product['name'][:30]}...")
 
             # Step A: Write the prompt (cheap, no MCP)
+            selected_hook = None
+            hook_data_for_product = None
+            if style == "texthook_broll":
+                hook_data_for_product = st.session_state.get("product_hooks", {}).get(i)
+                if hook_data_for_product:
+                    selected_hook = hook_data_for_product.get("accepted_hook")
+
             with st.spinner(f"Writing prompt for {product['name'][:30]}..."):
                 prompt_result = write_prompt(
                     api_key=api_key,
@@ -868,6 +1025,7 @@ repeat these steps to get a fresh one.
                     style=style,
                     duration=duration,
                     voice_script=voice_script if voice_script else None,
+                    selected_hook=selected_hook,
                 )
 
             if prompt_result.get("error") or not prompt_result.get("prompt"):
@@ -909,21 +1067,18 @@ repeat these steps to get a fresh one.
             else:
                 st.warning(f"⚠️ **{product['name']}** — Status: {gen_result['status']}")
 
-            # Show text-hook extras — informational here; pick/accept happens
-            # below in "Past Generations" where clicks don't wipe the UI
-            hook_options = prompt_result.get("hook_options", [])
-            if hook_options:
-                gen_result["hook_options"] = hook_options
-                gen_result["caption"] = prompt_result.get("caption")
-                gen_result["hashtags"] = prompt_result.get("hashtags")
-                with st.expander(f"📝 Hook options — {product['name']}"):
-                    st.caption("Pick one in 'Past Generations' below.")
-                    for h in hook_options:
-                        st.code(h, language=None)
-                    if prompt_result.get("caption"):
-                        st.caption(f"Caption: {prompt_result['caption']}")
-                    if prompt_result.get("hashtags"):
-                        st.caption(f"Hashtags: {prompt_result['hashtags']}")
+            # Show which hook was burned into the video
+            if hook_data_for_product:
+                gen_result["accepted_hook"] = selected_hook
+                gen_result["hook_options"] = hook_data_for_product.get("hook_options", [])
+                gen_result["caption"] = hook_data_for_product.get("caption")
+                gen_result["hashtags"] = hook_data_for_product.get("hashtags")
+                if selected_hook:
+                    st.info(f"🔥 Burned-in hook: {selected_hook}")
+                if hook_data_for_product.get("caption"):
+                    st.caption(f"Caption: {hook_data_for_product['caption']}")
+                if hook_data_for_product.get("hashtags"):
+                    st.caption(f"Hashtags: {hook_data_for_product['hashtags']}")
 
             if i < len(final_products) - 1:
                 time.sleep(5)
@@ -1090,32 +1245,24 @@ repeat these steps to get a fresh one.
                     if result.get("image_url"):
                         st.text_input("Image URL:", value=result["image_url"], key=f"img_{i}")
 
-            # Text hook picker — 5 options, VA picks and accepts one.
-            # Lives here (not in the generation loop) so clicking Accept
-            # doesn't wipe the UI on rerun.
-            hook_options = result.get("hook_options", [])
-            if hook_options:
-                with st.expander(f"📝 Text Hook — {product_name}", expanded=not result.get("accepted_hook")):
-                    if result.get("accepted_hook"):
-                        st.success(f"✅ Accepted hook: {result['accepted_hook']}")
-                        if st.button("Change hook", key=f"changehook_{i}"):
-                            saved_gens[i]["accepted_hook"] = None
-                            save_generations(saved_gens)
-                            st.rerun()
-                    else:
-                        st.caption("Pick the on-screen text hook to burn in via CapCut:")
-                        picked = st.radio(
-                            "Options:",
-                            options=list(range(len(hook_options))),
-                            format_func=lambda x: hook_options[x],
-                            key=f"hookpick_{i}",
-                            label_visibility="collapsed",
-                        )
-                        if st.button("✅ Accept this hook", key=f"accepthook_{i}"):
-                            saved_gens[i]["accepted_hook"] = hook_options[picked]
-                            save_generations(saved_gens)
-                            st.rerun()
-
+            # Show which hook was burned into this video
+            if result.get("accepted_hook"):
+                with st.expander(f"📝 Text Hook — {product_name}", expanded=False):
+                    st.success(f"🔥 Burned-in hook: {result['accepted_hook']}")
+                    if result.get("hook_options"):
+                        st.caption("Other options that were available:")
+                        for h in result["hook_options"]:
+                            if h != result["accepted_hook"]:
+                                st.caption(f"  • {h}")
+                    if result.get("caption"):
+                        st.caption(f"Caption: {result['caption']}")
+                    if result.get("hashtags"):
+                        st.caption(f"Hashtags: {result['hashtags']}")
+            elif result.get("hook_options"):
+                # Legacy entries from before hook-first flow
+                with st.expander(f"📝 Hook options — {product_name}"):
+                    for h in result["hook_options"]:
+                        st.code(h, language=None)
                     if result.get("caption"):
                         st.caption(f"Caption: {result['caption']}")
                     if result.get("hashtags"):
