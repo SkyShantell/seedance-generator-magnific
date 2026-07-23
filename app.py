@@ -21,16 +21,50 @@ from urllib.parse import urlparse
 from html import unescape as html_unescape
 from pathlib import Path
 
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    PIL_AVAILABLE = True
+except Exception:
+    Image = None
+    ImageDraw = None
+    ImageFont = None
+    PIL_AVAILABLE = False
+
 
 # ── Page config ─────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Seedance Video Generator",
+    page_title="🎬 Seedance Video Generator",
     page_icon="🎬",
     layout="wide",
 )
 
 # ── Persistent storage ─────────────────────────────────────────────
 SAVE_FILE = Path("generations.json")
+EMOJI_ASSET_DIR = Path("emoji_assets")
+
+# These filenames are intentionally generic. You supply the actual PNG assets.
+EMOJI_ASSET_MAP = {
+    "😭": "loudly_crying_face.png",
+    "😩": "weary_face.png",
+    "💀": "skull.png",
+    "😂": "face_with_tears_of_joy.png",
+    "🤣": "rolling_on_the_floor_laughing.png",
+    "🥺": "pleading_face.png",
+    "🤩": "star_struck.png",
+    "😍": "smiling_face_with_heart_eyes.png",
+    "🥲": "smiling_face_with_tear.png",
+    "😮‍💨": "face_exhaling.png",
+    "🫠": "melting_face.png",
+    "🙃": "upside_down_face.png",
+}
+
+
+FONT_CANDIDATES = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    "C:/Windows/Fonts/arialbd.ttf",
+]
 
 
 def load_generations() -> list[dict]:
@@ -58,7 +92,6 @@ def add_generation(result: dict):
     """Append a single generation result to the saved file."""
     gens = load_generations()
     gens.insert(0, result)  # Newest first
-    # Keep last 200 entries
     save_generations(gens[:200])
 
 
@@ -72,14 +105,6 @@ def fetch_video_bytes(video_url: str) -> bytes | None:
         return resp.content
     except Exception:
         return None
-
-
-FONT_CANDIDATES = [
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
-    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
-    "C:/Windows/Fonts/arialbd.ttf",
-]
 
 
 def get_ffmpeg_executable() -> str | None:
@@ -96,14 +121,14 @@ def get_ffmpeg_executable() -> str | None:
 
 
 def get_overlay_font() -> str | None:
-    """Return a bold font file that FFmpeg drawtext can use."""
+    """Return a bold font file that FFmpeg/Pillow can use."""
     for candidate in FONT_CANDIDATES:
         if Path(candidate).exists():
             return candidate
     return None
 
 
-def wrap_hook_text(hook: str, width: int = 20, max_lines: int = 5) -> str:
+def wrap_hook_text(hook: str, width: int = 30, max_lines: int = 4) -> str:
     """Wrap a TikTok hook into short centered lines without breaking words."""
     cleaned = re.sub(r"\s+", " ", (hook or "").strip())
     lines = textwrap.wrap(
@@ -122,6 +147,140 @@ def wrap_hook_text(hook: str, width: int = 20, max_lines: int = 5) -> str:
 def _escape_filter_path(path: str) -> str:
     """Escape a file path for use inside an FFmpeg filter string."""
     return path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+
+
+def split_hook_and_emoji(hook: str) -> tuple[str, str | None]:
+    """Split trailing supported emoji from the hook text."""
+    cleaned = re.sub(r"\s+", " ", (hook or "").strip())
+    for emoji_char in sorted(EMOJI_ASSET_MAP.keys(), key=len, reverse=True):
+        if cleaned.endswith(emoji_char):
+            return cleaned[:-len(emoji_char)].rstrip(), emoji_char
+    return cleaned, None
+
+
+def get_emoji_asset_path(emoji_char: str | None) -> Path | None:
+    """Return the local PNG path for a supported emoji, if available."""
+    if not emoji_char:
+        return None
+    filename = EMOJI_ASSET_MAP.get(emoji_char)
+    if not filename:
+        return None
+    asset_path = EMOJI_ASSET_DIR / filename
+    return asset_path if asset_path.exists() else None
+
+
+def get_emoji_asset_status() -> tuple[int, int]:
+    """Return (available, total) emoji asset count."""
+    total = len(EMOJI_ASSET_MAP)
+    available = sum(1 for name in EMOJI_ASSET_MAP.values() if (EMOJI_ASSET_DIR / name).exists())
+    return available, total
+
+
+def _measure_text(draw: ImageDraw.ImageDraw, text: str, font, stroke_width: int) -> tuple[int, int]:
+    bbox = draw.textbbox((0, 0), text, font=font, stroke_width=stroke_width)
+    return bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+
+def create_text_overlay_png(hook: str, output_path: Path, canvas_size: tuple[int, int] = (720, 1280)) -> tuple[bool, str | None]:
+    """Create a transparent PNG overlay with wrapped text + Apple-style emoji PNG."""
+    if not PIL_AVAILABLE:
+        return False, "Pillow is not installed. Add Pillow to your requirements.txt."
+
+    text_only, trailing_emoji = split_hook_and_emoji(hook)
+    wrapped_lines = wrap_hook_text(text_only).splitlines() or [text_only]
+
+    canvas_w, canvas_h = canvas_size
+    font_size = int(canvas_h * 0.031)
+    stroke_width = max(2, round(font_size * 0.08))
+    shadow_offset = max(1, round(font_size * 0.04))
+    line_gap = int(font_size * 0.20)
+    top_y = int(canvas_h * 0.20)
+    emoji_gap = int(font_size * 0.18)
+    emoji_box = int(font_size * 1.15)
+
+    font_path = get_overlay_font()
+    try:
+        if font_path:
+            font = ImageFont.truetype(font_path, font_size)
+        else:
+            font = ImageFont.load_default()
+    except Exception:
+        font = ImageFont.load_default()
+
+    img = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    emoji_path = get_emoji_asset_path(trailing_emoji)
+    emoji_img = None
+    emoji_width = 0
+    emoji_height = 0
+
+    if emoji_path:
+        try:
+            emoji_img = Image.open(emoji_path).convert("RGBA")
+            ratio = emoji_box / max(1, emoji_img.height)
+            emoji_width = max(1, int(emoji_img.width * ratio))
+            emoji_height = emoji_box
+            emoji_img = emoji_img.resize((emoji_width, emoji_height), Image.LANCZOS)
+        except Exception:
+            emoji_img = None
+            emoji_width = 0
+            emoji_height = 0
+
+    line_sizes: list[tuple[int, int]] = []
+    for line in wrapped_lines:
+        line_sizes.append(_measure_text(draw, line, font, stroke_width))
+
+    line_height = max(h for _, h in line_sizes) + line_gap if line_sizes else font_size + line_gap
+
+    for line_index, line in enumerate(wrapped_lines):
+        text_w, text_h = line_sizes[line_index]
+        y = top_y + line_index * line_height
+        is_last_line = line_index == len(wrapped_lines) - 1 and emoji_img is not None
+
+        if is_last_line:
+            combo_width = text_w + emoji_gap + emoji_width
+            x = int((canvas_w - combo_width) / 2)
+        else:
+            x = int((canvas_w - text_w) / 2)
+
+        shadow_fill = (0, 0, 0, 130)
+        text_fill = (255, 255, 255, 255)
+        stroke_fill = (0, 0, 0, 225)
+
+        draw.text(
+            (x + shadow_offset, y + shadow_offset),
+            line,
+            font=font,
+            fill=shadow_fill,
+            stroke_width=stroke_width,
+            stroke_fill=stroke_fill,
+        )
+        draw.text(
+            (x, y),
+            line,
+            font=font,
+            fill=text_fill,
+            stroke_width=stroke_width,
+            stroke_fill=stroke_fill,
+        )
+
+        if is_last_line and emoji_img is not None:
+            emoji_x = x + text_w + emoji_gap
+            emoji_y = y + max(0, int((text_h - emoji_height) / 2))
+            shadow = Image.new("RGBA", emoji_img.size, (0, 0, 0, 120))
+            img.alpha_composite(shadow, (emoji_x + shadow_offset, emoji_y + shadow_offset))
+            img.alpha_composite(emoji_img, (emoji_x, emoji_y))
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(output_path, format="PNG")
+
+    if trailing_emoji and emoji_img is None:
+        return True, (
+            f"Emoji asset missing for {trailing_emoji}. Add '{EMOJI_ASSET_MAP.get(trailing_emoji, '')}' "
+            f"to the emoji_assets folder to show Apple-style emojis."
+        )
+    return True, None
 
 
 @st.cache_data(show_spinner=False, ttl=3600, max_entries=100)
@@ -147,42 +306,17 @@ def add_hook_with_ffmpeg(video_url: str, hook: str) -> tuple[bytes | None, str |
     if not source_bytes:
         return None, "The completed video could not be downloaded from Magnific."
 
-    wrapped_lines = wrap_hook_text(hook).splitlines()
-    font_path = get_overlay_font()
-
     try:
         with tempfile.TemporaryDirectory(prefix="seedance_hook_") as temp_dir:
             temp_path = Path(temp_dir)
             input_path = temp_path / "input.mp4"
+            overlay_path = temp_path / "hook_overlay.png"
             output_path = temp_path / "output_with_hook.mp4"
             input_path.write_bytes(source_bytes)
 
-            line_filters = []
-            for line_index, line in enumerate(wrapped_lines):
-                text_path = temp_path / f"hook_{line_index}.txt"
-                text_path.write_text(line, encoding="utf-8")
-
-                drawtext_parts = []
-                if font_path:
-                    drawtext_parts.append(f"fontfile='{_escape_filter_path(font_path)}'")
-                else:
-                    drawtext_parts.append("font='DejaVu Sans:style=Bold'")
-
-                drawtext_parts.extend([
-                    f"textfile='{_escape_filter_path(str(text_path))}'",
-                    "fontcolor=white",
-                    "fontsize=h*0.045",
-                    "borderw=4",
-                    "bordercolor=black@0.88",
-                    "shadowcolor=black@0.55",
-                    "shadowx=2",
-                    "shadowy=2",
-                    "x=(w-text_w)/2",
-                    f"y=h*0.13+{line_index}*h*0.058",
-                ])
-                line_filters.append("drawtext=" + ":".join(drawtext_parts))
-
-            video_filter = ",".join(line_filters)
+            overlay_ok, overlay_msg = create_text_overlay_png(hook, overlay_path)
+            if not overlay_ok:
+                return None, overlay_msg or "Failed to build the hook overlay PNG."
 
             command = [
                 ffmpeg_path,
@@ -190,9 +324,10 @@ def add_hook_with_ffmpeg(video_url: str, hook: str) -> tuple[bytes | None, str |
                 "-loglevel", "error",
                 "-y",
                 "-i", str(input_path),
+                "-i", str(overlay_path),
+                "-filter_complex", "[0:v][1:v]overlay=0:0:format=auto",
                 "-map", "0:v:0",
                 "-map", "0:a?",
-                "-vf", video_filter,
                 "-c:v", "libx264",
                 "-preset", "veryfast",
                 "-crf", "18",
@@ -213,6 +348,11 @@ def add_hook_with_ffmpeg(video_url: str, hook: str) -> tuple[bytes | None, str |
             if completed.returncode != 0 or not output_path.exists():
                 details = (completed.stderr or "Unknown FFmpeg error").strip().splitlines()
                 return None, details[-1] if details else "Unknown FFmpeg error"
+
+            warning = overlay_msg
+            if warning:
+                # The video is still usable; the hook text was added but the Apple emoji asset was missing.
+                return output_path.read_bytes(), warning
 
             return output_path.read_bytes(), None
 
@@ -778,6 +918,34 @@ repeat these steps to get a fresh one.
 
         st.divider()
 
+        available_emoji_assets, total_emoji_assets = get_emoji_asset_status()
+        if available_emoji_assets:
+            st.success(f"🍎 Emoji PNGs loaded: {available_emoji_assets}/{total_emoji_assets}")
+        else:
+            st.warning("🍎 No Apple-style emoji PNGs found yet.")
+
+        with st.expander("🍎 Apple emoji PNG setup"):
+            st.markdown(
+                """
+Create a folder named `emoji_assets` in the same folder as `app.py`.
+Then add your Apple-style emoji PNG files using these exact filenames:
+- `loudly_crying_face.png` for 😭
+- `weary_face.png` for 😩
+- `skull.png` for 💀
+- `face_with_tears_of_joy.png` for 😂
+- `rolling_on_the_floor_laughing.png` for 🤣
+- `pleading_face.png` for 🥺
+- `star_struck.png` for 🤩
+- `smiling_face_with_heart_eyes.png` for 😍
+- `smiling_face_with_tear.png` for 🥲
+- `face_exhaling.png` for 😮‍💨
+- `melting_face.png` for 🫠
+- `upside_down_face.png` for 🙃
+
+If a PNG is missing, the app will still add the text but that emoji will be skipped.
+                """
+            )
+
         # Video style
         st.subheader("🎨 Video Style")
         style = st.radio(
@@ -799,7 +967,7 @@ repeat these steps to get a fresh one.
         else:
             duration = 8
             voice_script = None
-            st.caption("Always 8s and silent. The selected hook is added afterward with FFmpeg.")
+            st.caption("Always 8s and silent. The selected hook is added afterward with FFmpeg using smaller text + Apple-style emoji PNGs.")
 
     # ════════════════════════════════════════════════════════════════
     #  STEP 1 — PASTE LINKS
@@ -1340,6 +1508,8 @@ repeat these steps to get a fresh one.
                                 key=f"dl_{i}",
                                 use_container_width=True,
                             )
+                            if display_error:
+                                st.warning(display_error)
                         else:
                             try:
                                 st.video(video_url)
