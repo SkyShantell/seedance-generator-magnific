@@ -640,11 +640,13 @@ repeat these steps to get a fresh one.
         st.session_state["scraped"] = scraped_products
 
     # ── Show image selection if we have scraped data ──
-    if "scraped" not in st.session_state:
-        st.stop()
-
-    scraped_products = st.session_state["scraped"]
+    has_scraped_products = "scraped" in st.session_state
+    scraped_products = st.session_state.get("scraped", [])
     selections = {}  # product_index → selected image url
+
+    if has_scraped_products:
+        st.subheader("② Select the Right Photo for Each Product")
+        st.caption("Some products have multiple colors or angles — pick the one you want in the video.")
 
     for idx, product in enumerate(scraped_products):
         st.markdown(f"---")
@@ -682,26 +684,28 @@ repeat these steps to get a fresh one.
     # ════════════════════════════════════════════════════════════════
     #  STEP 3 — GENERATE OR GET PROMPTS
     # ════════════════════════════════════════════════════════════════
-    st.divider()
-    st.subheader("③ Generate")
+    if has_scraped_products:
+        st.divider()
+        st.subheader("③ Generate")
 
     has_token = bool(magnific_token)
 
-    if has_token:
+    if has_scraped_products and has_token:
         col1, col2 = st.columns(2)
         auto_btn = col1.button("🎬 Auto-Generate Videos", type="primary", use_container_width=True)
         prompt_btn = col2.button("📝 Just Get Prompts", use_container_width=True)
-    else:
+    elif has_scraped_products:
         auto_btn = False
         prompt_btn = st.button("📝 Get Prompts + Images (generate manually in Magnific)",
                                type="primary", use_container_width=True)
+    else:
+        auto_btn = False
+        prompt_btn = False
 
-    if not auto_btn and not prompt_btn:
-        st.stop()
+    generation_requested = auto_btn or prompt_btn
 
-    if not api_key:
+    if generation_requested and not api_key:
         st.error("❌ Anthropic API key is missing. Ask Sky to set it up.")
-        st.stop()
 
     # ── Build final product list with selected images ──
     final_products = []
@@ -715,7 +719,7 @@ repeat these steps to get a fresh one.
     # ════════════════════════════════════════════════════════════════
     #  PROMPT-ONLY MODE
     # ════════════════════════════════════════════════════════════════
-    if prompt_btn:
+    if prompt_btn and api_key:
         st.divider()
         st.subheader("📝 Prompts & Images")
         st.caption("Copy each prompt and generate manually in Magnific → magnific.com/ai/video-generator")
@@ -823,7 +827,7 @@ repeat these steps to get a fresh one.
     # ════════════════════════════════════════════════════════════════
     #  AUTO-GENERATE MODE
     # ════════════════════════════════════════════════════════════════
-    if auto_btn:
+    if auto_btn and api_key:
         st.divider()
         st.subheader("🎬 Generating Videos")
 
