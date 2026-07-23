@@ -437,19 +437,48 @@ HARD RULES:
 - Under 1,900 characters
 
 CRITICAL — B-ROLL RULES:
-The opening b-roll must be a RANDOM mundane real-life scene. It must NOT relate to the
-product in any way. Pick ONE scene at random, such as:
-- Person's feet walking on a sidewalk
+
+The opening b-roll must be a RANDOM outdoor real-life scene that has absolutely nothing to do with the product.
+
+The b-roll should usually take place on a street, sidewalk, park, beach, boardwalk, parking lot, or other casual public outdoor location.
+
+Pick ONE scene at random from examples like:
+
+- First-person view of someone walking down a sidewalk
+- Feet walking along a park path
+- Cars passing on a city street
 - Cars driving on a highway at golden hour
-- Coffee being poured into a mug
-- Rain droplets on a window
-- Hand pushing a grocery cart down an aisle
-- Laundry tumbling in a dryer
-- Dog trotting ahead on a leash, filmed from behind
-- Crosswalk signal changing while a crowd crosses
+- A quiet neighborhood street filmed while walking
+- People walking through a public park
+- A dog trotting ahead on a leash, filmed from behind
+- Waves rolling onto a beach
+- Someone walking along a beach or boardwalk
+- Palm trees moving slightly in the wind
+- A crosswalk signal changing while people cross
+- A city intersection filmed from the sidewalk
 - Leaves blowing across a parking lot
-- Steam rising from pavement after rain
-The more unrelated to the product, the better.
+- Sunlight moving through trees in a park
+- A distant train passing through an outdoor station
+- Boats moving slowly across the water
+- A casual view from a moving car window
+- People walking through an outdoor shopping area
+- Sneakers walking across pavement
+- A bike rider passing on a park trail
+
+HARD EXCLUSIONS:
+
+- No rain droplets on windows
+- No grocery carts or grocery aisles
+- No laundry, dryers, washing machines, or household chores
+- No coffee pouring or close-up drink shots
+- No kitchens, bedrooms, bathrooms, or indoor home scenes
+- No desk shots or hands using objects
+- No product-related locations
+- No b-roll that visually hints at the product
+- No dramatic cinematic scene
+- No staged or polished commercial footage
+
+The b-roll should feel casual, slightly imperfect, and filmed on a phone by a normal person. The more unrelated it is to the product, the better.
 
 Prompt template:
 9:16 vertical, TikTok UGC aesthetic, silent, no audio, no voiceover. Handheld phone-camera
