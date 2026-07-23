@@ -57,6 +57,18 @@ def add_generation(result: dict):
     # Keep last 200 entries
     save_generations(gens[:200])
 
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_video_bytes(video_url: str) -> bytes | None:
+    """Download video bytes for the download button. Cached so repeated
+    reruns (e.g. clicking other buttons on the page) don't re-fetch."""
+    try:
+        resp = requests.get(video_url, timeout=60)
+        resp.raise_for_status()
+        return resp.content
+    except Exception:
+        return None
+
 # ── Constants ───────────────────────────────────────────────────────
 MAGNIFIC_MCP_URL = "https://mcp.magnific.com"
 MAGNIFIC_MCP_NAME = "magnific"
@@ -131,12 +143,14 @@ No face. No person above the wrist. No text, captions, subtitles, overlays, logo
 Text hook rules (gen-z texting voice):
 - ur, bc, &, lowercase drift, no period
 - Deadpan, self-deprecating money humor
-- Exactly one 😭 at the end. No emoji spam
+- Exactly one 😭 (or 😩/💀) at the end. No emoji spam
 - No "link in bio", no CTA. ~14-22 words
-- Write the main hook + 2 alternates
+- Write 5 DIFFERENT hook options, each a distinct angle (e.g. broke-flex, relatable
+  overspending, "this fixed my life", self-roast, unexpected gratitude) — not just
+  minor wording variations of the same joke
 
 Return ONLY valid JSON:
-{{"product_name": "...", "prompt": "the full seedance prompt", "char_count": 123, "text_hook": "main hook", "alt_hooks": ["alt1", "alt2"], "caption": "tiktok caption", "hashtags": "#tag1 #tag2..."}}"""
+{{"product_name": "...", "prompt": "the full seedance prompt", "char_count": 123, "hook_options": ["hook 1", "hook 2", "hook 3", "hook 4", "hook 5"], "caption": "tiktok caption", "hashtags": "#tag1 #tag2..."}}"""
 
 VOICEOVER_SILENT = "## Audio:\nNO voiceover. Ambient sound only."
 VOICEOVER_WITH_SCRIPT = '## Voiceover:\nInclude this voiceover (warm excited woman, casual and friendly):\n"{script}"'
@@ -765,14 +779,14 @@ repeat these steps to get a fresh one.
                 elif result.get("error"):
                     st.error(f"Error: {result['error']}")
 
-                # Text-hook extras
-                if result.get("text_hook"):
-                    st.markdown(f"**Text hook (burn in via CapCut):**")
-                    st.code(result["text_hook"], language=None)
-                    if result.get("alt_hooks"):
-                        st.markdown("**Alternates:**")
-                        for alt in result["alt_hooks"]:
-                            st.code(alt, language=None)
+                # Text-hook extras — shown here, but pick/accept happens below in
+                # "Past Generations" (this block resets on every click, so the
+                # picker needs to live somewhere that persists)
+                hook_options = result.get("hook_options", [])
+                if hook_options:
+                    st.markdown("**On-screen text hook options** (pick one in 'Past Text Hooks' below):")
+                    for h in hook_options:
+                        st.code(h, language=None)
                     if result.get("caption"):
                         st.text_input("Caption:", value=result["caption"], key=f"cap_{i}")
                     if result.get("hashtags"):
@@ -781,6 +795,17 @@ repeat these steps to get a fresh one.
             time.sleep(1)  # Rate limit
 
         progress.progress(1.0, text="Done!")
+
+        # Persist to file so hooks can be reviewed/accepted below without re-running
+        for r, fp in zip(results, final_products):
+            entry = dict(r)
+            entry["product_name"] = fp["name"]
+            entry["image_url"] = fp["image_url"]
+            entry["source_url"] = fp["source_url"]
+            entry["style"] = style
+            entry["status"] = "prompt_only"
+            entry["generated_at"] = datetime.now().isoformat()
+            add_generation(entry)
 
         # Manual generation instructions
         st.divider()
@@ -806,8 +831,7 @@ repeat these steps to get a fresh one.
                         "image_url": fp["image_url"],
                         "source_url": fp["source_url"],
                         "prompt": r.get("prompt", ""),
-                        "text_hook": r.get("text_hook"),
-                        "alt_hooks": r.get("alt_hooks"),
+                        "hook_options": r.get("hook_options"),
                         "caption": r.get("caption"),
                         "hashtags": r.get("hashtags"),
                     }
@@ -885,13 +909,17 @@ repeat these steps to get a fresh one.
             else:
                 st.warning(f"⚠️ **{product['name']}** — Status: {gen_result['status']}")
 
-            # Show text-hook extras
-            if prompt_result.get("text_hook"):
-                with st.expander(f"📝 Hook & Caption — {product['name']}"):
-                    st.code(prompt_result["text_hook"], language=None)
-                    if prompt_result.get("alt_hooks"):
-                        for alt in prompt_result["alt_hooks"]:
-                            st.code(alt, language=None)
+            # Show text-hook extras — informational here; pick/accept happens
+            # below in "Past Generations" where clicks don't wipe the UI
+            hook_options = prompt_result.get("hook_options", [])
+            if hook_options:
+                gen_result["hook_options"] = hook_options
+                gen_result["caption"] = prompt_result.get("caption")
+                gen_result["hashtags"] = prompt_result.get("hashtags")
+                with st.expander(f"📝 Hook options — {product['name']}"):
+                    st.caption("Pick one in 'Past Generations' below.")
+                    for h in hook_options:
+                        st.code(h, language=None)
                     if prompt_result.get("caption"):
                         st.caption(f"Caption: {prompt_result['caption']}")
                     if prompt_result.get("hashtags"):
@@ -965,6 +993,7 @@ repeat these steps to get a fresh one.
                 "processing": "🟠 Processing",
                 "completed": "🟢 Completed",
                 "error": "🔴 Error",
+                "prompt_only": "📝 Prompt Only (manual generation)",
             }
             badge = status_badges.get(status, f"⚪ {status}")
 
@@ -984,13 +1013,30 @@ repeat these steps to get a fresh one.
                 if creation_id:
                     st.caption(f"Creation ID: `{creation_id}`")
 
-                # Show video if completed and we have a URL
+                # Show video if completed and we have a URL — kept small so
+                # multiple videos fit comfortably on the page
                 video_url = result.get("url") or result.get("preview_url")
                 if video_url and status == "completed":
-                    try:
-                        st.video(video_url)
-                    except Exception:
-                        st.markdown(f"🎬 [Watch video]({video_url})")
+                    video_col, _spacer = st.columns([1, 2])
+                    with video_col:
+                        try:
+                            st.video(video_url)
+                        except Exception:
+                            st.markdown(f"🎬 [Watch video]({video_url})")
+
+                        video_bytes = fetch_video_bytes(video_url)
+                        if video_bytes:
+                            safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', product_name)[:40]
+                            st.download_button(
+                                "⬇️ Download video",
+                                data=video_bytes,
+                                file_name=f"{safe_name}_{creation_id or i}.mp4",
+                                mime="video/mp4",
+                                key=f"dl_{i}",
+                                use_container_width=True,
+                            )
+                        else:
+                            st.caption("⚠️ Couldn't fetch video for download — use the player above or the link.")
 
                 # Show product image thumbnail
                 if result.get("image_url") and status != "completed":
@@ -1036,12 +1082,44 @@ repeat these steps to get a fresh one.
                         add_generation(new_result)
                         st.rerun()
 
-            # Expandable prompt
-            if result.get("prompt_used"):
+            # Expandable prompt (works for both "prompt_used" and "prompt" keys)
+            prompt_text_field = result.get("prompt_used") or result.get("prompt")
+            if prompt_text_field:
                 with st.expander(f"📋 Prompt — {product_name}", expanded=False):
-                    st.code(result["prompt_used"], language=None)
+                    st.code(prompt_text_field, language=None)
                     if result.get("image_url"):
                         st.text_input("Image URL:", value=result["image_url"], key=f"img_{i}")
+
+            # Text hook picker — 5 options, VA picks and accepts one.
+            # Lives here (not in the generation loop) so clicking Accept
+            # doesn't wipe the UI on rerun.
+            hook_options = result.get("hook_options", [])
+            if hook_options:
+                with st.expander(f"📝 Text Hook — {product_name}", expanded=not result.get("accepted_hook")):
+                    if result.get("accepted_hook"):
+                        st.success(f"✅ Accepted hook: {result['accepted_hook']}")
+                        if st.button("Change hook", key=f"changehook_{i}"):
+                            saved_gens[i]["accepted_hook"] = None
+                            save_generations(saved_gens)
+                            st.rerun()
+                    else:
+                        st.caption("Pick the on-screen text hook to burn in via CapCut:")
+                        picked = st.radio(
+                            "Options:",
+                            options=list(range(len(hook_options))),
+                            format_func=lambda x: hook_options[x],
+                            key=f"hookpick_{i}",
+                            label_visibility="collapsed",
+                        )
+                        if st.button("✅ Accept this hook", key=f"accepthook_{i}"):
+                            saved_gens[i]["accepted_hook"] = hook_options[picked]
+                            save_generations(saved_gens)
+                            st.rerun()
+
+                    if result.get("caption"):
+                        st.caption(f"Caption: {result['caption']}")
+                    if result.get("hashtags"):
+                        st.caption(f"Hashtags: {result['hashtags']}")
 
         # Save any status updates
         if needs_save:
