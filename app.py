@@ -1420,6 +1420,58 @@ def _find_images_in_dict(obj, depth=0, max_depth=8):
     return images
 
 
+def _find_product_names_in_dict(obj, depth=0, max_depth=10):
+    """Find likely product titles inside TikTok/commerce JSON payloads."""
+    if depth > max_depth:
+        return []
+    names = []
+    likely_keys = {
+        "product_name", "productname", "product_title", "producttitle",
+        "item_name", "itemname", "item_title", "itemtitle",
+        "display_name", "displayname", "title", "name",
+    }
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+            if normalized in {re.sub(r"[^a-z0-9]", "", k) for k in likely_keys}:
+                if isinstance(value, str):
+                    candidate = html_unescape(value).strip()
+                    # Reject generic page/app labels and IDs.
+                    if (
+                        4 <= len(candidate) <= 180
+                        and not candidate.isdigit()
+                        and candidate.lower() not in {
+                            "tiktok", "tiktok shop", "shop", "product", "for you",
+                            "log in", "sign up", "unknown product"
+                        }
+                        and not candidate.startswith("http")
+                    ):
+                        names.append(candidate)
+            names.extend(_find_product_names_in_dict(value, depth + 1, max_depth))
+    elif isinstance(obj, list):
+        for item in obj:
+            names.extend(_find_product_names_in_dict(item, depth + 1, max_depth))
+    return names
+
+
+def _best_product_name(candidates):
+    """Choose the most product-like title from scraped candidates."""
+    cleaned = []
+    for value in candidates:
+        if not value:
+            continue
+        value = re.sub(r"\s+", " ", html_unescape(str(value))).strip()
+        value = re.sub(r'\s*[|\-–—]\s*(TikTok|Shop|Amazon|Walmart).*$', '', value, flags=re.IGNORECASE)
+        if value and value.lower() not in {"unknown product", "tiktok shop", "tiktok", "shop"}:
+            cleaned.append(value)
+    if not cleaned:
+        return ""
+    # Prefer descriptive titles with several words, without choosing huge page blobs.
+    cleaned = list(dict.fromkeys(cleaned))
+    cleaned.sort(key=lambda x: (2 <= len(x.split()) <= 14, len(x.split()), len(x)), reverse=True)
+    return cleaned[0][:100]
+
+
 def scrape_product(url: str) -> dict | None:
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15, allow_redirects=True)
@@ -1451,6 +1503,9 @@ def scrape_product(url: str) -> dict | None:
             title_match = re.search(r'<title>([^<]+)</title>', html, re.IGNORECASE)
 
         images = []
+        name_candidates = []
+        if title_match:
+            name_candidates.append(title_match.group(1).strip())
         if img_match:
             images.append(img_match.group(1))
 
@@ -1462,6 +1517,7 @@ def scrape_product(url: str) -> dict | None:
         for block in ld_blocks:
             try:
                 ld = json.loads(block)
+                name_candidates.extend(_find_product_names_in_dict(ld))
                 if isinstance(ld, dict) and "image" in ld:
                     img_val = ld["image"]
                     if isinstance(img_val, str):
@@ -1480,6 +1536,7 @@ def scrape_product(url: str) -> dict | None:
             try:
                 nd = json.loads(next_data.group(1))
                 images.extend(_find_images_in_dict(nd))
+                name_candidates.extend(_find_product_names_in_dict(nd))
             except json.JSONDecodeError:
                 pass
 
@@ -1504,12 +1561,11 @@ def scrape_product(url: str) -> dict | None:
                 seen.add(cleaned)
                 unique.append(cleaned)
 
-        name = title_match.group(1).strip() if title_match else ""
-        name = re.sub(r'\s*[|\-–—]\s*(TikTok|Shop|Amazon|Walmart).*$', '', name, flags=re.IGNORECASE)
+        name = _best_product_name(name_candidates)
         if not name or name == "Unknown Product":
             name = _name_from_url(url)
 
-        return {"name": name[:100], "images": unique[:8], "source_url": url}
+        return {"name": name[:100], "images": unique[:12], "source_url": url}
 
     except Exception as e:
         return None
@@ -1595,10 +1651,11 @@ def write_prompt(
 GENERATE_SYSTEM = """You are a video production assistant. You have access to Magnific tools.
 
 Your job:
-1. Upload the product image to Magnific using creations_upload_image with the provided URL
+1. Upload every provided product reference image to Magnific using creations_upload_image.
 2. Generate a video using video_generate with:
    - The prompt provided
-   - The uploaded creation as image reference
+   - The first uploaded creation as the primary image reference
+   - Any additional uploaded creations as supporting reference images when the tool supports multiple references
    - Model slug: bytedance-seedance-fast-2.0
    - Aspect ratio: 9:16, resolution: 720p
    - Duration as specified
@@ -1613,8 +1670,9 @@ def generate_video(
     image_url: str,
     prompt: str,
     duration: int,
+    image_urls: list[str] | None = None,
 ) -> dict:
-    """Upload image + generate video via Magnific MCP."""
+    """Upload one or more reference images + generate video via Magnific MCP."""
     mcp_servers = [{
         "type": "url",
         "url": MAGNIFIC_MCP_URL,
@@ -1625,6 +1683,11 @@ def generate_video(
 
     try:
         client = anthropic.Anthropic(api_key=api_key)
+        refs = [u for u in (image_urls or [image_url]) if u]
+        if not refs:
+            refs = [image_url]
+        refs_text = "\n".join(f"Reference image {i+1}: {url}" for i, url in enumerate(refs))
+
         response = client.beta.messages.create(
             model=MODEL,
             max_tokens=2048,
@@ -1920,40 +1983,52 @@ repeat these steps to get a fresh one.
     # ── Show image selection if we have scraped data (doesn't block the rest of the page) ──
     if "scraped" in st.session_state:
         scraped_products = st.session_state["scraped"]
-        selections = {}  # product_index → selected image url
+        selections = {}  # product_index → selected image URL list
+        edited_names = {}
 
         for idx, product in enumerate(scraped_products):
-            st.markdown(f"---")
-            st.markdown(f"### {product['name']}")
+            st.markdown("---")
+
+            detected_name = product.get("name") or "Unknown Product"
+            edited_name = st.text_input(
+                "Product name",
+                value="" if detected_name == "Unknown Product" else detected_name,
+                placeholder="Type the product name if TikTok did not provide it",
+                key=f"product_name_{idx}",
+                help="You can always correct the detected name before hooks or prompts are generated.",
+            ).strip()
+            if not edited_name:
+                edited_name = detected_name
+            edited_names[idx] = edited_name
+            product["name"] = edited_name
+
+            if edited_name == "Unknown Product":
+                st.warning("TikTok did not expose a product title. Enter the product name above before generating hooks.")
+
             st.caption(f"Source: {product['source_url'][:80]}...")
+            images = product["images"][:12]
 
-            images = product["images"]
+            cols = st.columns(4)
+            for img_idx, img_url in enumerate(images):
+                with cols[img_idx % 4]:
+                    try:
+                        st.image(img_url, use_container_width=True, caption=f"Option {img_idx + 1}")
+                    except Exception:
+                        st.caption(f"Option {img_idx + 1}: {img_url[:40]}...")
 
-            if len(images) == 1:
-                # Only one image — auto-select, still show it
-                selections[idx] = images[0]
-                try:
-                    st.image(images[0], width=200)
-                except Exception:
-                    st.caption(f"Image: {images[0][:60]}...")
-            else:
-                # Multiple images — let VA pick
-                cols = st.columns(min(len(images), 4))
-                for img_idx, img_url in enumerate(images[:8]):
-                    with cols[img_idx % 4]:
-                        try:
-                            st.image(img_url, width=150, caption=f"Option {img_idx + 1}")
-                        except Exception:
-                            st.caption(f"Option {img_idx + 1}: {img_url[:40]}...")
-
-                selected = st.radio(
-                    f"Pick photo for **{product['name'][:40]}**:",
-                    options=list(range(len(images[:8]))),
-                    format_func=lambda x: f"Option {x + 1}",
-                    key=f"select_{idx}",
-                    horizontal=True,
-                )
-                selections[idx] = images[selected]
+            default_refs = [0] if images else []
+            selected_indices = st.multiselect(
+                f"Reference images for **{edited_name[:40]}** (select one or more):",
+                options=list(range(len(images))),
+                default=default_refs,
+                format_func=lambda x: f"Option {x + 1}",
+                key=f"select_multi_{idx}",
+                help="The first selected image is the primary reference. Additional images help preserve packaging, angles, and details.",
+            )
+            if not selected_indices and images:
+                st.info("No references selected, so Option 1 will be used automatically.")
+                selected_indices = [0]
+            selections[idx] = [images[i] for i in selected_indices]
 
         # ════════════════════════════════════════════════════════════════
         #  STEP 3 — GENERATE OR GET PROMPTS
@@ -1966,9 +2041,11 @@ repeat these steps to get a fresh one.
         # ── Build final product list with selected images ──
         final_products = []
         for idx, product in enumerate(scraped_products):
+            selected_refs = selections.get(idx) or [product["images"][0]]
             final_products.append({
                 "name": product["name"],
-                "image_url": selections.get(idx, product["images"][0]),
+                "image_url": selected_refs[0],
+                "image_urls": selected_refs,
                 "source_url": product["source_url"],
             })
 
@@ -2161,6 +2238,7 @@ repeat these steps to get a fresh one.
             entry = dict(r)
             entry["product_name"] = fp["name"]
             entry["image_url"] = fp["image_url"]
+            entry["image_urls"] = fp.get("image_urls", [fp["image_url"]])
             entry["source_url"] = fp["source_url"]
             entry["style"] = style
             entry["status"] = "prompt_only"
@@ -2189,6 +2267,7 @@ repeat these steps to get a fresh one.
                     {
                         "name": fp["name"],
                         "image_url": fp["image_url"],
+                        "image_urls": fp.get("image_urls", [fp["image_url"]]),
                         "source_url": fp["source_url"],
                         "prompt": r.get("prompt", ""),
                         "accepted_hook": r.get("accepted_hook"),
@@ -2253,6 +2332,7 @@ repeat these steps to get a fresh one.
                     api_key=api_key,
                     magnific_token=magnific_token,
                     image_url=product["image_url"],
+                    image_urls=product.get("image_urls"),
                     prompt=prompt_text,
                     duration=duration if style == "shoe_video" else 8,
                 )
@@ -2299,6 +2379,7 @@ repeat these steps to get a fresh one.
         # Save each result to persistent file
         for r, fp in zip(results, final_products):
             r["image_url"] = fp["image_url"]
+            r["image_urls"] = fp.get("image_urls", [fp["image_url"]])
             r["source_url"] = fp["source_url"]
             r["style"] = style
             r["duration"] = duration if style == "shoe_video" else 8
