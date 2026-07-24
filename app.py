@@ -64,7 +64,16 @@ EMOJI_ASSET_MAP = {
     "🙃": "upside_down_face.png",
 }
 
+FONT_FILES = {
+    "TikTok Sans": ["TikTokSans.ttf", "/mnt/data/TikTokSans.ttf"],
+    "DejaVu Sans Bold": ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"],
+    "Liberation Sans Bold": ["/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"],
+    "Arial Bold": ["/System/Library/Fonts/Supplemental/Arial Bold.ttf", "C:/Windows/Fonts/arialbd.ttf"],
+}
+
 FONT_CANDIDATES = [
+    "TikTokSans.ttf",
+    "/mnt/data/TikTokSans.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
     "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
@@ -72,6 +81,7 @@ FONT_CANDIDATES = [
 ]
 
 DEFAULT_TEXT_SETTINGS = {
+    "font_name": "TikTok Sans",
     "font_size": 28,
     "max_width_pct": 78,
     "vertical_position_pct": 22,
@@ -626,6 +636,7 @@ def default_text_settings_from_presets() -> tuple[dict, str]:
 def set_editor_widget_values(index: int, settings: dict):
     """Load preset settings into the Streamlit editor widgets."""
     normalized = normalize_text_settings(settings)
+    st.session_state[f"editor_font_{index}"] = normalized.get("font_name", "TikTok Sans")
     st.session_state[f"editor_size_{index}"] = int(normalized["font_size"])
     st.session_state[f"editor_width_{index}"] = int(normalized["max_width_pct"])
     st.session_state[f"editor_position_{index}"] = int(normalized["vertical_position_pct"])
@@ -699,8 +710,21 @@ def get_ffprobe_executable(ffmpeg_path: str | None = None) -> str | None:
     return None
 
 
-def get_overlay_font() -> str | None:
-    """Return a bold font file that Pillow can use."""
+def available_overlay_fonts() -> list[str]:
+    """Return font choices that are actually available on this machine."""
+    available = []
+    for name, candidates in FONT_FILES.items():
+        if any(Path(candidate).exists() for candidate in candidates):
+            available.append(name)
+    return available or ["System Default"]
+
+
+def get_overlay_font(settings: dict | None = None) -> str | None:
+    """Return the selected font file, falling back safely when unavailable."""
+    selected_name = normalize_text_settings(settings).get("font_name", "TikTok Sans")
+    for candidate in FONT_FILES.get(selected_name, []):
+        if Path(candidate).exists():
+            return candidate
     for candidate in FONT_CANDIDATES:
         if Path(candidate).exists():
             return candidate
@@ -852,7 +876,7 @@ def create_hook_overlay_png(
     line_spacing_pct = int(settings.get("line_spacing_pct", 112))
     emoji_size_px = int(settings.get("emoji_size_px", DEFAULT_TEXT_SETTINGS["emoji_size_px"]))
 
-    font_path = get_overlay_font()
+    font_path = get_overlay_font(settings)
     overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
@@ -1084,6 +1108,101 @@ def generations_csv_bytes(generations: list[dict]) -> bytes:
     writer.writeheader()
     writer.writerows(rows)
     return buffer.getvalue().encode("utf-8-sig")
+
+
+def past_hooks_csv_bytes(generations: list[dict]) -> bytes:
+    """Export every accepted and generated hook so forgotten overlays can be recovered."""
+    buffer = io.StringIO()
+    fieldnames = [
+        "product_name", "product_link", "accepted_hook", "hook_option_1",
+        "hook_option_2", "hook_option_3", "hook_option_4", "hook_option_5",
+        "caption", "hashtags", "style", "status", "generated_at", "video_url",
+    ]
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames)
+    writer.writeheader()
+    for item in generations:
+        options = list(item.get("hook_options") or [])[:5]
+        options += [""] * (5 - len(options))
+        writer.writerow({
+            "product_name": item.get("product_name", ""),
+            "product_link": item.get("source_url", ""),
+            "accepted_hook": item.get("accepted_hook", ""),
+            "hook_option_1": options[0],
+            "hook_option_2": options[1],
+            "hook_option_3": options[2],
+            "hook_option_4": options[3],
+            "hook_option_5": options[4],
+            "caption": item.get("caption", ""),
+            "hashtags": item.get("hashtags", ""),
+            "style": item.get("style", ""),
+            "status": item.get("status", ""),
+            "generated_at": item.get("generated_at", ""),
+            "video_url": item.get("url") or item.get("preview_url") or "",
+        })
+    return buffer.getvalue().encode("utf-8-sig")
+
+
+def apply_text_to_uploaded_video(
+    video_bytes: bytes,
+    original_filename: str,
+    hook: str,
+    settings: dict,
+) -> tuple[Path | None, str | None]:
+    """Apply an overlay to a user-uploaded MP4 using the same renderer as generated videos."""
+    if not video_bytes:
+        return None, "Upload a video first."
+    if not hook.strip():
+        return None, "Enter text before applying the overlay."
+
+    ffmpeg_path = get_ffmpeg_executable()
+    if not ffmpeg_path:
+        return None, "FFmpeg is not installed. Keep `ffmpeg` in packages.txt."
+
+    digest_data = video_bytes[:1048576] + hook.encode("utf-8") + json.dumps(
+        settings, sort_keys=True, ensure_ascii=False
+    ).encode("utf-8")
+    digest = hashlib.sha256(digest_data).hexdigest()[:14]
+    safe_stem = safe_export_filename(Path(original_filename or "uploaded_video").stem, "uploaded_video")
+    final_path = PROCESSED_DIR / f"uploaded_{safe_stem}_{digest}.mp4"
+    if final_path.exists() and final_path.stat().st_size > 0:
+        return final_path, None
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="seedance_upload_editor_") as temp_dir:
+            temp_path = Path(temp_dir)
+            input_path = temp_path / "uploaded.mp4"
+            overlay_path = temp_path / "overlay.png"
+            input_path.write_bytes(video_bytes)
+
+            canvas_size = probe_video_size(input_path, ffmpeg_path)
+            overlay_ok, overlay_warning = create_hook_overlay_png(
+                hook=hook, output_path=overlay_path, canvas_size=canvas_size, settings=settings
+            )
+            if not overlay_ok:
+                return None, overlay_warning or "Could not build the text overlay."
+
+            command = [
+                ffmpeg_path, "-hide_banner", "-loglevel", "error", "-y",
+                "-i", str(input_path), "-loop", "1", "-framerate", "30",
+                "-i", str(overlay_path),
+                "-filter_complex", "[0:v][1:v]overlay=0:0:format=auto:shortest=1[v]",
+                "-map", "[v]", "-map", "0:a?", "-c:v", "libx264",
+                "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
+                "-shortest", str(final_path),
+            ]
+            completed = subprocess.run(command, capture_output=True, text=True, timeout=300, check=False)
+            if completed.returncode != 0 or not final_path.exists():
+                final_path.unlink(missing_ok=True)
+                details = (completed.stderr or "Unknown FFmpeg error").strip().splitlines()
+                return None, details[-1] if details else "Unknown FFmpeg error"
+            return final_path, overlay_warning
+    except subprocess.TimeoutExpired:
+        final_path.unlink(missing_ok=True)
+        return None, "FFmpeg timed out while applying the text."
+    except Exception as exc:
+        final_path.unlink(missing_ok=True)
+        return None, f"Uploaded-video editor failed: {exc}"
 
 
 def safe_export_filename(value: str, fallback: str = "video") -> str:
@@ -2197,13 +2316,112 @@ repeat these steps to get a fresh one.
         col3.metric("Errors ❌", errors)
 
     # ════════════════════════════════════════════════════════════════
+    #  UPLOAD A VIDEO AND ADD TEXT
+    # ════════════════════════════════════════════════════════════════
+    st.divider()
+    st.subheader("④ Upload a Video & Add Text")
+    st.caption("Use this for an original video that was downloaded without its hook. The uploaded file stays unchanged; the app creates a separate text version.")
+
+    uploaded_video = st.file_uploader(
+        "Upload an MP4, MOV, or M4V",
+        type=["mp4", "mov", "m4v"],
+        key="standalone_video_upload",
+    )
+
+    if uploaded_video is not None:
+        uploaded_bytes = uploaded_video.getvalue()
+        st.video(uploaded_bytes)
+
+        upload_presets, _upload_preset_data = all_text_presets()
+        upload_default_settings, upload_default_name = default_text_settings_from_presets()
+        upload_preset_name = st.selectbox(
+            "Text preset",
+            options=list(upload_presets.keys()),
+            index=list(upload_presets.keys()).index(upload_default_name),
+            key="upload_text_preset",
+        )
+        upload_base = normalize_text_settings(upload_presets[upload_preset_name])
+        upload_font_options = available_overlay_fonts()
+        upload_default_font = upload_base.get("font_name", "TikTok Sans")
+        if upload_default_font not in upload_font_options:
+            upload_default_font = upload_font_options[0]
+        upload_font_name = st.selectbox(
+            "Font",
+            options=upload_font_options,
+            index=upload_font_options.index(upload_default_font),
+            key="upload_font_name",
+        )
+        upload_hook = st.text_area(
+            "On-screen text hook",
+            placeholder="Paste a past hook here, or write a new one",
+            height=90,
+            key="upload_hook_text",
+        )
+
+        up_size_col, up_width_col, up_position_col = st.columns(3)
+        with up_size_col:
+            up_font_size = st.slider("Text size", 16, 48, int(upload_base["font_size"]), key="upload_font_size")
+        with up_width_col:
+            up_max_width = st.slider("Text width", 45, 92, int(upload_base["max_width_pct"]), key="upload_max_width")
+        with up_position_col:
+            up_position = st.slider("Vertical position", 8, 60, int(upload_base["vertical_position_pct"]), key="upload_position")
+
+        up_outline_col, up_spacing_col, up_emoji_col = st.columns(3)
+        with up_outline_col:
+            up_outline = st.slider("Outline thickness", 1, 5, int(upload_base["outline_width"]), key="upload_outline")
+        with up_spacing_col:
+            up_spacing = st.slider("Line spacing", 95, 145, int(upload_base["line_spacing_pct"]), key="upload_spacing")
+        with up_emoji_col:
+            up_emoji = st.slider("Emoji size", 18, 90, int(upload_base["emoji_size_px"]), step=2, key="upload_emoji")
+
+        upload_settings = normalize_text_settings({
+            "font_name": upload_font_name,
+            "font_size": up_font_size,
+            "max_width_pct": up_max_width,
+            "vertical_position_pct": up_position,
+            "outline_width": up_outline,
+            "line_spacing_pct": up_spacing,
+            "emoji_size_px": up_emoji,
+        })
+
+        if st.button("🎨 Add Text to Uploaded Video", type="primary", use_container_width=True, key="process_uploaded_video"):
+            with st.spinner("Applying text with FFmpeg..."):
+                upload_output, upload_warning = apply_text_to_uploaded_video(
+                    video_bytes=uploaded_bytes,
+                    original_filename=uploaded_video.name,
+                    hook=upload_hook.strip(),
+                    settings=upload_settings,
+                )
+            if upload_output:
+                st.session_state["uploaded_text_output"] = str(upload_output)
+                if upload_warning:
+                    st.warning(upload_warning)
+            else:
+                st.error(upload_warning or "Could not create the text version.")
+
+        uploaded_output_path = st.session_state.get("uploaded_text_output")
+        uploaded_output_bytes = read_local_video(uploaded_output_path)
+        if uploaded_output_bytes:
+            st.success("Text version created.")
+            st.video(uploaded_output_bytes)
+            output_name = f"{safe_export_filename(Path(uploaded_video.name).stem)}_with_text.mp4"
+            st.download_button(
+                "⬇️ Download Uploaded Video with Text",
+                data=uploaded_output_bytes,
+                file_name=output_name,
+                mime="video/mp4",
+                use_container_width=True,
+                key="download_uploaded_text_video",
+            )
+
+    # ════════════════════════════════════════════════════════════════
     #  STEP 4 — PAST GENERATIONS (persisted to file, survives refresh)
     # ════════════════════════════════════════════════════════════════
     saved_gens = load_generations()
 
     if saved_gens:
         st.divider()
-        st.subheader("④ Past Generations")
+        st.subheader("⑤ Past Generations")
         st.caption(f"{len(saved_gens)} saved — completed videos stay clean until you open the text editor and apply your settings.")
 
         # Bulk actions
@@ -2382,6 +2600,7 @@ repeat these steps to get a fresh one.
                     # Initialize each editor once. Preset buttons update these keys
                     # before the sliders render, so the selected style loads cleanly.
                     widget_keys = [
+                        f"editor_font_{i}",
                         f"editor_size_{i}",
                         f"editor_width_{i}",
                         f"editor_position_{i}",
@@ -2424,6 +2643,17 @@ repeat these steps to get a fresh one.
                             preset_data["default"] = selected_preset
                             save_text_presets_data(preset_data)
                             st.success(f"{selected_preset} is now your default preset.")
+
+                    editor_font_options = available_overlay_fonts()
+                    editor_default_font = stored_settings.get("font_name", "TikTok Sans")
+                    if editor_default_font not in editor_font_options:
+                        editor_default_font = editor_font_options[0]
+                    editor_font_name = st.selectbox(
+                        "Font",
+                        options=editor_font_options,
+                        index=editor_font_options.index(editor_default_font),
+                        key=f"editor_font_{i}",
+                    )
 
                     edited_hook = st.text_area(
                         "Hook text",
@@ -2489,6 +2719,7 @@ repeat these steps to get a fresh one.
                         )
 
                     editor_settings = normalize_text_settings({
+                        "font_name": editor_font_name,
                         "font_size": font_size,
                         "max_width_pct": max_width_pct,
                         "vertical_position_pct": vertical_position_pct,
@@ -2620,7 +2851,7 @@ repeat these steps to get a fresh one.
         export_stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         csv_data = generations_csv_bytes(saved_gens)
 
-        download_col1, download_col2, download_col3 = st.columns(3)
+        download_col1, download_col2, download_col3, download_col4 = st.columns(4)
         download_col1.download_button(
             "📥 Download CSV",
             data=csv_data,
@@ -2640,6 +2871,14 @@ repeat these steps to get a fresh one.
         )
 
         download_col3.download_button(
+            "📝 Download Past Hooks",
+            data=past_hooks_csv_bytes(saved_gens),
+            file_name=f"past_text_hooks_{export_stamp}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+        download_col4.download_button(
             "📥 Download JSON",
             data=json.dumps(saved_gens, indent=2, default=str),
             file_name=f"generations_{export_stamp}.json",
