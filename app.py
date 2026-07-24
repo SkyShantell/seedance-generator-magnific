@@ -2565,16 +2565,16 @@ repeat these steps to get a fresh one.
             save_generations(remaining)
             st.rerun()
 
-        # Display saved generations in a compact four-card row.
-        # Each card keeps its own preview, downloads, prompt, and text editor.
+        # Display saved generations in two wider cards per row.
+        # This keeps previews compact while giving the text editor enough room.
         needs_save = False
         generation_grid_cols = None
 
         for i, result in enumerate(saved_gens):
-            if i % 4 == 0:
-                generation_grid_cols = st.columns(4, gap="medium")
+            if i % 2 == 0:
+                generation_grid_cols = st.columns(2, gap="large")
 
-            with generation_grid_cols[i % 4]:
+            with generation_grid_cols[i % 2]:
                 with st.container(border=True):
                             creation_id = result.get("creation_id")
                             product_name = result.get("product_name", "Unknown")
@@ -2599,7 +2599,7 @@ repeat these steps to get a fresh one.
                                 except Exception:
                                     pass
 
-                            col_info, col_actions = st.columns([3, 1])
+                            col_info, col_actions = st.columns([4, 1.15])
 
                             with col_info:
                                 st.markdown(f"**{product_name}** — {badge}{time_str}")
@@ -2738,7 +2738,7 @@ repeat these steps to get a fresh one.
                                         set_editor_widget_values(i, stored_settings)
 
                                     st.markdown('<span class="preset-pill">TEXT STYLE PRESETS</span>', unsafe_allow_html=True)
-                                    preset_col, load_col, default_col = st.columns([2.2, 1, 1.25])
+                                    preset_col, load_col = st.columns([3, 1.25])
                                     with preset_col:
                                         selected_preset = st.selectbox(
                                             "Preset",
@@ -2758,6 +2758,7 @@ repeat these steps to get a fresh one.
                                             saved_gens[i]["text_preset_name"] = selected_preset
                                             save_generations(saved_gens)
                                             st.rerun()
+                                    default_col = st.container()
                                     with default_col:
                                         st.write("")
                                         if st.button(
@@ -2788,7 +2789,8 @@ repeat these steps to get a fresh one.
                                         height=90,
                                     )
 
-                                    size_col, width_col, position_col = st.columns(3)
+                                    size_col, width_col = st.columns(2)
+                                    position_col = st.container()
                                     with size_col:
                                         font_size = st.slider(
                                             "Text size",
@@ -2817,7 +2819,8 @@ repeat these steps to get a fresh one.
                                             help="Percentage down from the top of the video.",
                                         )
 
-                                    outline_col, spacing_col, emoji_col = st.columns(3)
+                                    outline_col, spacing_col = st.columns(2)
+                                    emoji_col = st.container()
                                     with outline_col:
                                         outline_width = st.slider(
                                             "Outline thickness",
@@ -2855,7 +2858,8 @@ repeat these steps to get a fresh one.
                                     })
 
                                     st.markdown('<span class="preset-pill">SAVE THIS STYLE</span>', unsafe_allow_html=True)
-                                    save_name_col, save_button_col, delete_button_col = st.columns([2.2, 1, 1])
+                                    save_name_col = st.container()
+                                    save_button_col, delete_button_col = st.columns(2)
                                     with save_name_col:
                                         custom_preset_name = st.text_input(
                                             "Preset name",
