@@ -7,6 +7,7 @@ generate videos automatically OR get prompts to generate manually.
 
 import streamlit as st
 import anthropic
+import hashlib
 import json
 import os
 import re
@@ -15,11 +16,19 @@ import requests
 import shutil
 import subprocess
 import tempfile
-import textwrap
 from datetime import datetime
 from urllib.parse import urlparse
 from html import unescape as html_unescape
 from pathlib import Path
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    PIL_AVAILABLE = True
+except Exception:
+    Image = None
+    ImageDraw = None
+    ImageFont = None
+    PIL_AVAILABLE = False
 
 
 # ── Page config ─────────────────────────────────────────────────────
@@ -31,13 +40,48 @@ st.set_page_config(
 
 # ── Persistent storage ─────────────────────────────────────────────
 SAVE_FILE = Path("generations.json")
+PROCESSED_DIR = Path("processed_videos")
+EMOJI_ASSET_DIR = Path("emoji_assets")
+PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+
+# Apple-style transparent PNG files created by MakeAppleEmojis.swift.
+EMOJI_ASSET_MAP = {
+    "😭": "loudly_crying_face.png",
+    "😩": "weary_face.png",
+    "💀": "skull.png",
+    "😂": "face_with_tears_of_joy.png",
+    "🤣": "rolling_on_the_floor_laughing.png",
+    "🥺": "pleading_face.png",
+    "🤩": "star_struck.png",
+    "😍": "smiling_face_with_heart_eyes.png",
+    "🥲": "smiling_face_with_tear.png",
+    "😮‍💨": "face_exhaling.png",
+    "🫠": "melting_face.png",
+    "🙃": "upside_down_face.png",
+}
+
+FONT_CANDIDATES = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    "C:/Windows/Fonts/arialbd.ttf",
+]
+
+DEFAULT_TEXT_SETTINGS = {
+    "font_size": 28,
+    "max_width_pct": 78,
+    "vertical_position_pct": 22,
+    "outline_width": 2,
+    "line_spacing_pct": 112,
+    "emoji_scale_pct": 105,
+}
 
 
 def load_generations() -> list[dict]:
     """Load saved generations from disk."""
     if SAVE_FILE.exists():
         try:
-            with open(SAVE_FILE) as f:
+            with open(SAVE_FILE, encoding="utf-8") as f:
                 data = json.load(f)
                 return data if isinstance(data, list) else []
         except (json.JSONDecodeError, IOError):
@@ -48,8 +92,8 @@ def load_generations() -> list[dict]:
 def save_generations(generations: list[dict]):
     """Save generations to disk."""
     try:
-        with open(SAVE_FILE, "w") as f:
-            json.dump(generations, f, indent=2, default=str)
+        with open(SAVE_FILE, "w", encoding="utf-8") as f:
+            json.dump(generations, f, indent=2, ensure_ascii=False, default=str)
     except IOError:
         pass
 
@@ -57,29 +101,19 @@ def save_generations(generations: list[dict]):
 def add_generation(result: dict):
     """Append a single generation result to the saved file."""
     gens = load_generations()
-    gens.insert(0, result)  # Newest first
-    # Keep last 200 entries
+    gens.insert(0, result)
     save_generations(gens[:200])
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_video_bytes(video_url: str) -> bytes | None:
-    """Download video bytes for the download button. Cached so repeated
-    reruns (e.g. clicking other buttons on the page) don't re-fetch."""
+    """Download video bytes and cache the result for Streamlit reruns."""
     try:
-        resp = requests.get(video_url, timeout=60)
+        resp = requests.get(video_url, timeout=90)
         resp.raise_for_status()
         return resp.content
     except Exception:
         return None
-
-
-FONT_CANDIDATES = [
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
-    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
-    "C:/Windows/Fonts/arialbd.ttf",
-]
 
 
 def get_ffmpeg_executable() -> str | None:
@@ -89,100 +123,298 @@ def get_ffmpeg_executable() -> str | None:
         return ffmpeg_path
 
     try:
-        import imageio_ffmpeg  # Optional fallback.
+        import imageio_ffmpeg
         return imageio_ffmpeg.get_ffmpeg_exe()
     except Exception:
         return None
 
 
+def get_ffprobe_executable(ffmpeg_path: str | None = None) -> str | None:
+    """Find ffprobe, including beside a discovered FFmpeg executable."""
+    probe = shutil.which("ffprobe")
+    if probe:
+        return probe
+
+    if ffmpeg_path:
+        candidate = Path(ffmpeg_path).with_name("ffprobe")
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
 def get_overlay_font() -> str | None:
-    """Return a bold font file that FFmpeg drawtext can use."""
+    """Return a bold font file that Pillow can use."""
     for candidate in FONT_CANDIDATES:
         if Path(candidate).exists():
             return candidate
     return None
 
 
-def wrap_hook_text(hook: str, width: int = 20, max_lines: int = 5) -> str:
-    """Wrap a TikTok hook into short centered lines without breaking words."""
-    cleaned = re.sub(r"\s+", " ", (hook or "").strip())
-    lines = textwrap.wrap(
-        cleaned,
-        width=width,
-        break_long_words=False,
-        break_on_hyphens=False,
-    )
+def probe_video_size(video_path: Path, ffmpeg_path: str | None = None) -> tuple[int, int]:
+    """Read video dimensions with ffprobe; fall back to Seedance's 720p 9:16 size."""
+    ffprobe_path = get_ffprobe_executable(ffmpeg_path)
+    if not ffprobe_path:
+        return 720, 1280
+
+    command = [
+        ffprobe_path,
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "csv=s=x:p=0",
+        str(video_path),
+    ]
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=30, check=False)
+        match = re.search(r"(\d+)x(\d+)", completed.stdout or "")
+        if match:
+            return int(match.group(1)), int(match.group(2))
+    except Exception:
+        pass
+    return 720, 1280
+
+
+def split_trailing_emojis(text: str) -> tuple[str, list[str]]:
+    """Remove supported trailing emojis so they can be rendered from PNG assets."""
+    remaining = re.sub(r"\s+", " ", (text or "").strip())
+    trailing: list[str] = []
+
+    while remaining:
+        found = None
+        for emoji_char in sorted(EMOJI_ASSET_MAP.keys(), key=len, reverse=True):
+            if remaining.endswith(emoji_char):
+                found = emoji_char
+                break
+        if not found:
+            break
+        trailing.insert(0, found)
+        remaining = remaining[:-len(found)].rstrip()
+
+    return remaining, trailing
+
+
+def load_emoji_png(emoji_char: str, target_height: int) -> Image.Image | None:
+    """Load and resize one Apple-style emoji PNG."""
+    if not PIL_AVAILABLE:
+        return None
+    filename = EMOJI_ASSET_MAP.get(emoji_char)
+    if not filename:
+        return None
+    path = EMOJI_ASSET_DIR / filename
+    if not path.exists():
+        return None
+
+    try:
+        image = Image.open(path).convert("RGBA")
+        ratio = target_height / max(1, image.height)
+        target_width = max(1, round(image.width * ratio))
+        return image.resize((target_width, target_height), Image.Resampling.LANCZOS)
+    except Exception:
+        return None
+
+
+def text_size(draw: ImageDraw.ImageDraw, text: str, font, stroke_width: int = 0) -> tuple[int, int]:
+    """Measure text accurately with Pillow."""
+    bbox = draw.textbbox((0, 0), text, font=font, stroke_width=stroke_width)
+    return max(1, bbox[2] - bbox[0]), max(1, bbox[3] - bbox[1])
+
+
+def wrap_text_pixels(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font,
+    max_width: int,
+    stroke_width: int,
+    max_lines: int = 4,
+) -> list[str]:
+    """Wrap text according to actual rendered width rather than character count."""
+    words = text.split()
+    if not words:
+        return [""]
+
+    lines: list[str] = []
+    current = words[0]
+
+    for word in words[1:]:
+        candidate = f"{current} {word}"
+        width, _ = text_size(draw, candidate, font, stroke_width)
+        if width <= max_width:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+
     if len(lines) > max_lines:
-        lines = lines[:max_lines]
-        if len(" ".join(lines)) < len(cleaned):
-            lines[-1] = lines[-1].rstrip(" .") + "…"
-    return "\n".join(lines)
+        kept = lines[:max_lines]
+        overflow_words = " ".join(lines[max_lines - 1:]).split()
+        last_line = ""
+        for word in overflow_words:
+            candidate = f"{last_line} {word}".strip()
+            display_candidate = candidate + "…"
+            width, _ = text_size(draw, display_candidate, font, stroke_width)
+            if width <= max_width:
+                last_line = candidate
+            else:
+                break
+        kept[-1] = (last_line or kept[-1]).rstrip(" .") + "…"
+        lines = kept
+
+    return lines
 
 
-def _escape_filter_path(path: str) -> str:
-    """Escape a file path for use inside an FFmpeg filter string."""
-    return path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+def create_hook_overlay_png(
+    hook: str,
+    output_path: Path,
+    canvas_size: tuple[int, int],
+    settings: dict,
+) -> tuple[bool, str | None]:
+    """Create a transparent, editable text overlay PNG for FFmpeg."""
+    if not PIL_AVAILABLE:
+        return False, "Pillow is missing. Add Pillow to requirements.txt."
+
+    width, height = canvas_size
+    text_only, emojis = split_trailing_emojis(hook)
+
+    requested_size = int(settings.get("font_size", DEFAULT_TEXT_SETTINGS["font_size"]))
+    max_width = int(width * int(settings.get("max_width_pct", 78)) / 100)
+    top_y = int(height * int(settings.get("vertical_position_pct", 22)) / 100)
+    stroke_width = int(settings.get("outline_width", 2))
+    line_spacing_pct = int(settings.get("line_spacing_pct", 112))
+    emoji_scale_pct = int(settings.get("emoji_scale_pct", 105))
+
+    font_path = get_overlay_font()
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    chosen_font = None
+    chosen_lines: list[str] = []
+    actual_size = requested_size
+
+    # Keep the user's selected size when possible, but shrink slightly if needed
+    # so long hooks never explode into five oversized lines.
+    for size in range(requested_size, 15, -1):
+        try:
+            font = ImageFont.truetype(font_path, size) if font_path else ImageFont.load_default()
+        except Exception:
+            font = ImageFont.load_default()
+
+        lines = wrap_text_pixels(draw, text_only, font, max_width, stroke_width, max_lines=4)
+        widest = max(text_size(draw, line, font, stroke_width)[0] for line in lines)
+        if len(lines) <= 4 and widest <= max_width:
+            chosen_font = font
+            chosen_lines = lines
+            actual_size = size
+            break
+
+    if chosen_font is None:
+        chosen_font = ImageFont.load_default()
+        chosen_lines = wrap_text_pixels(draw, text_only, chosen_font, max_width, stroke_width, max_lines=4)
+
+    line_metrics = [text_size(draw, line, chosen_font, stroke_width) for line in chosen_lines]
+    base_line_height = max(h for _, h in line_metrics)
+    line_step = max(base_line_height + 2, round(base_line_height * line_spacing_pct / 100))
+
+    emoji_height = max(18, round(actual_size * emoji_scale_pct / 100))
+    emoji_images = [load_emoji_png(e, emoji_height) for e in emojis]
+    missing_emojis = [e for e, img in zip(emojis, emoji_images) if img is None]
+    emoji_images = [img for img in emoji_images if img is not None]
+    emoji_gap = max(3, round(actual_size * 0.16))
+
+    for line_index, line in enumerate(chosen_lines):
+        text_w, text_h = line_metrics[line_index]
+        y = top_y + line_index * line_step
+        is_last = line_index == len(chosen_lines) - 1
+
+        emoji_total_width = 0
+        if is_last and emoji_images:
+            emoji_total_width = sum(img.width for img in emoji_images) + emoji_gap * len(emoji_images)
+
+        combined_width = text_w + emoji_total_width
+        x = round((width - combined_width) / 2)
+
+        # Small TikTok-style shadow, white text, thin black outline.
+        draw.text(
+            (x + 1, y + 1),
+            line,
+            font=chosen_font,
+            fill=(0, 0, 0, 115),
+            stroke_width=stroke_width,
+            stroke_fill=(0, 0, 0, 210),
+        )
+        draw.text(
+            (x, y),
+            line,
+            font=chosen_font,
+            fill=(255, 255, 255, 255),
+            stroke_width=stroke_width,
+            stroke_fill=(0, 0, 0, 235),
+        )
+
+        if is_last and emoji_images:
+            emoji_x = x + text_w + emoji_gap
+            for emoji_img in emoji_images:
+                emoji_y = y + max(0, round((text_h - emoji_img.height) / 2))
+                overlay.alpha_composite(emoji_img, (emoji_x, emoji_y))
+                emoji_x += emoji_img.width + emoji_gap
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    overlay.save(output_path, "PNG")
+
+    warning = None
+    if missing_emojis:
+        warning = "Missing emoji PNG asset(s): " + " ".join(missing_emojis)
+    return True, warning
 
 
-@st.cache_data(show_spinner=False, ttl=3600, max_entries=100)
-def add_hook_with_ffmpeg(video_url: str, hook: str) -> tuple[bytes | None, str | None]:
-    """Download a completed video and add the selected hook with FFmpeg.
+def processed_video_path(creation_id: str | None, hook: str, settings: dict) -> Path:
+    """Create a stable output filename based on the video and editor settings."""
+    key_data = json.dumps({"hook": hook, "settings": settings}, sort_keys=True, ensure_ascii=False)
+    digest = hashlib.sha256(key_data.encode("utf-8")).hexdigest()[:12]
+    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", creation_id or "video")[:60]
+    return PROCESSED_DIR / f"{safe_id}_{digest}.mp4"
 
-    Returns (processed_mp4_bytes, error_message). Results are cached by URL and
-    hook, so Streamlit reruns do not repeatedly encode the same video.
-    """
+
+def apply_text_with_ffmpeg(
+    video_url: str,
+    creation_id: str | None,
+    hook: str,
+    settings: dict,
+) -> tuple[Path | None, str | None]:
+    """Apply the user-configured text only after they click the editor button."""
     if not video_url:
-        return None, "No completed video URL was provided."
-    if not hook or not hook.strip():
-        return fetch_video_bytes(video_url), None
+        return None, "No completed video URL is available."
+    if not hook.strip():
+        return None, "Enter text before applying the overlay."
 
     ffmpeg_path = get_ffmpeg_executable()
     if not ffmpeg_path:
-        return None, (
-            "FFmpeg is not installed on the app server. Add a packages.txt file "
-            "containing ffmpeg."
-        )
+        return None, "FFmpeg is not installed. Keep `ffmpeg` in packages.txt."
 
     source_bytes = fetch_video_bytes(video_url)
     if not source_bytes:
-        return None, "The completed video could not be downloaded from Magnific."
+        return None, "The original video could not be downloaded from Magnific."
 
-    wrapped_lines = wrap_hook_text(hook).splitlines()
-    font_path = get_overlay_font()
+    final_path = processed_video_path(creation_id, hook, settings)
+    if final_path.exists() and final_path.stat().st_size > 0:
+        return final_path, None
 
     try:
-        with tempfile.TemporaryDirectory(prefix="seedance_hook_") as temp_dir:
+        with tempfile.TemporaryDirectory(prefix="seedance_editor_") as temp_dir:
             temp_path = Path(temp_dir)
-            input_path = temp_path / "input.mp4"
-            output_path = temp_path / "output_with_hook.mp4"
+            input_path = temp_path / "original.mp4"
+            overlay_path = temp_path / "overlay.png"
             input_path.write_bytes(source_bytes)
 
-            line_filters = []
-            for line_index, line in enumerate(wrapped_lines):
-                text_path = temp_path / f"hook_{line_index}.txt"
-                text_path.write_text(line, encoding="utf-8")
-
-                drawtext_parts = []
-                if font_path:
-                    drawtext_parts.append(f"fontfile='{_escape_filter_path(font_path)}'")
-                else:
-                    drawtext_parts.append("font='DejaVu Sans:style=Bold'")
-
-                drawtext_parts.extend([
-                    f"textfile='{_escape_filter_path(str(text_path))}'",
-                    "fontcolor=white",
-                    "fontsize=h*0.045",
-                    "borderw=4",
-                    "bordercolor=black@0.88",
-                    "shadowcolor=black@0.55",
-                    "shadowx=2",
-                    "shadowy=2",
-                    "x=(w-text_w)/2",
-                    f"y=h*0.13+{line_index}*h*0.058",
-                ])
-                line_filters.append("drawtext=" + ":".join(drawtext_parts))
-
-            video_filter = ",".join(line_filters)
+            canvas_size = probe_video_size(input_path, ffmpeg_path)
+            overlay_ok, overlay_warning = create_hook_overlay_png(
+                hook=hook,
+                output_path=overlay_path,
+                canvas_size=canvas_size,
+                settings=settings,
+            )
+            if not overlay_ok:
+                return None, overlay_warning or "Could not build the text overlay."
 
             command = [
                 ffmpeg_path,
@@ -190,36 +422,58 @@ def add_hook_with_ffmpeg(video_url: str, hook: str) -> tuple[bytes | None, str |
                 "-loglevel", "error",
                 "-y",
                 "-i", str(input_path),
-                "-map", "0:v:0",
+                "-loop", "1",
+                "-framerate", "30",
+                "-i", str(overlay_path),
+                "-filter_complex", "[0:v][1:v]overlay=0:0:format=auto:shortest=1[v]",
+                "-map", "[v]",
                 "-map", "0:a?",
-                "-vf", video_filter,
                 "-c:v", "libx264",
                 "-preset", "veryfast",
                 "-crf", "18",
+                "-pix_fmt", "yuv420p",
                 "-c:a", "aac",
                 "-b:a", "192k",
                 "-movflags", "+faststart",
-                str(output_path),
+                "-shortest",
+                str(final_path),
             ]
 
             completed = subprocess.run(
                 command,
                 capture_output=True,
                 text=True,
-                timeout=240,
+                timeout=300,
                 check=False,
             )
 
-            if completed.returncode != 0 or not output_path.exists():
+            if completed.returncode != 0 or not final_path.exists():
+                final_path.unlink(missing_ok=True)
                 details = (completed.stderr or "Unknown FFmpeg error").strip().splitlines()
                 return None, details[-1] if details else "Unknown FFmpeg error"
 
-            return output_path.read_bytes(), None
+            return final_path, overlay_warning
 
     except subprocess.TimeoutExpired:
-        return None, "FFmpeg timed out while adding the hook."
+        final_path.unlink(missing_ok=True)
+        return None, "FFmpeg timed out while applying the text."
     except Exception as exc:
-        return None, f"FFmpeg overlay failed: {exc}"
+        final_path.unlink(missing_ok=True)
+        return None, f"FFmpeg editor failed: {exc}"
+
+
+def read_local_video(path_value: str | None) -> bytes | None:
+    """Read a previously processed local MP4 safely."""
+    if not path_value:
+        return None
+    path = Path(path_value)
+    try:
+        if path.exists() and path.is_file():
+            return path.read_bytes()
+    except Exception:
+        pass
+    return None
+
 
 # ── Constants ───────────────────────────────────────────────────────
 MAGNIFIC_MCP_URL = "https://mcp.magnific.com"
@@ -297,19 +551,46 @@ HARD RULES:
 - Under 1,900 characters
 
 CRITICAL — B-ROLL RULES:
-The opening b-roll must be a RANDOM mundane real-life scene. It must NOT relate to the
-product in any way. Pick ONE scene at random, such as:
-- Person's feet walking on a sidewalk
+The opening b-roll must be a RANDOM outdoor real-life scene that has absolutely nothing
+to do with the product. The scene should usually take place on a street, sidewalk, park,
+beach, boardwalk, parking lot, or another casual public outdoor location.
+
+Pick ONE scene at random from examples like:
+- First-person view of someone walking down a sidewalk
+- Feet walking along a park path
+- Cars passing on a city street
 - Cars driving on a highway at golden hour
-- Coffee being poured into a mug
-- Rain droplets on a window
-- Hand pushing a grocery cart down an aisle
-- Laundry tumbling in a dryer
-- Dog trotting ahead on a leash, filmed from behind
-- Crosswalk signal changing while a crowd crosses
+- A quiet neighborhood street filmed while walking
+- People walking through a public park
+- A dog trotting ahead on a leash, filmed from behind
+- Waves rolling onto a beach
+- Someone walking along a beach or boardwalk
+- Palm trees moving slightly in the wind
+- A crosswalk signal changing while people cross
+- A city intersection filmed from the sidewalk
 - Leaves blowing across a parking lot
-- Steam rising from pavement after rain
-The more unrelated to the product, the better.
+- Sunlight moving through trees in a park
+- A distant train passing through an outdoor station
+- Boats moving slowly across the water
+- A casual view from a moving car window
+- People walking through an outdoor shopping area
+- Sneakers walking across pavement
+- A bike rider passing on a park trail
+
+HARD EXCLUSIONS:
+- No rain droplets on windows
+- No grocery carts or grocery aisles
+- No laundry, dryers, washing machines, or household chores
+- No coffee pouring or close-up drink shots
+- No kitchens, bedrooms, bathrooms, or indoor home scenes
+- No desk shots or hands using unrelated objects
+- No product-related locations
+- No b-roll that visually hints at the product
+- No dramatic cinematic scene
+- No staged or polished commercial footage
+
+The b-roll should feel casual, slightly imperfect, and filmed on a phone by a normal
+person. The more unrelated it is to the product, the better.
 
 Prompt template:
 9:16 vertical, TikTok UGC aesthetic, silent, no audio, no voiceover. Handheld phone-camera
@@ -799,7 +1080,7 @@ repeat these steps to get a fresh one.
         else:
             duration = 8
             voice_script = None
-            st.caption("Always 8s and silent. The selected hook is added afterward with FFmpeg.")
+            st.caption("Always 8s and silent. The clean video is generated first; add or modify text afterward in Past Generations.")
 
     # ════════════════════════════════════════════════════════════════
     #  STEP 1 — PASTE LINKS
@@ -1077,7 +1358,7 @@ repeat these steps to get a fresh one.
                 elif result.get("error"):
                     st.error(f"Error: {result['error']}")
 
-                # Show the selected hook. Manual videos still need the FFmpeg step afterward.
+                # Show the selected hook. The text can be added later in the completed-video editor.
                 if result.get("accepted_hook"):
                     st.success(f"📝 Selected hook: {result['accepted_hook']}")
                 if result.get("caption"):
@@ -1211,14 +1492,14 @@ repeat these steps to get a fresh one.
             else:
                 st.warning(f"⚠️ **{product['name']}** — Status: {gen_result['status']}")
 
-            # Save the hook so FFmpeg can add it after the video completes
+            # Save the hook as the starting text for the completed-video editor
             if hook_data_for_product:
                 gen_result["accepted_hook"] = selected_hook
                 gen_result["hook_options"] = hook_data_for_product.get("hook_options", [])
                 gen_result["caption"] = hook_data_for_product.get("caption")
                 gen_result["hashtags"] = hook_data_for_product.get("hashtags")
                 if selected_hook:
-                    st.info(f"📝 Hook queued for FFmpeg: {selected_hook}")
+                    st.info(f"📝 Hook saved for the text editor: {selected_hook}")
                 if hook_data_for_product.get("caption"):
                     st.caption(f"Caption: {hook_data_for_product['caption']}")
                 if hook_data_for_product.get("hashtags"):
@@ -1256,7 +1537,7 @@ repeat these steps to get a fresh one.
     if saved_gens:
         st.divider()
         st.subheader("④ Past Generations")
-        st.caption(f"{len(saved_gens)} saved — refresh statuses to show finished videos, add hooks with FFmpeg, download, or regenerate.")
+        st.caption(f"{len(saved_gens)} saved — completed videos stay clean until you open the text editor and apply your settings.")
 
         # Bulk actions
         action_col1, action_col2, action_col3 = st.columns(3)
@@ -1312,49 +1593,43 @@ repeat these steps to get a fresh one.
                 if creation_id:
                     st.caption(f"Creation ID: `{creation_id}`")
 
-                # Show a completed video directly on the site. For text-hook videos,
-                # FFmpeg adds the selected hook before preview and download.
+                # Completed videos are shown clean first. FFmpeg does nothing until
+                # the user opens the editor and clicks Apply / Update Text.
                 video_url = result.get("url") or result.get("preview_url")
                 if video_url and status == "completed":
                     video_col, _spacer = st.columns([1, 2])
                     with video_col:
-                        display_bytes = None
-                        display_error = None
-                        hook_text = result.get("accepted_hook", "")
+                        st.caption("Original clean video")
+                        try:
+                            st.video(video_url)
+                        except Exception:
+                            st.markdown(f"🎬 [Watch original video]({video_url})")
 
-                        if hook_text:
-                            with st.spinner("Adding the hook with FFmpeg..."):
-                                display_bytes, display_error = add_hook_with_ffmpeg(video_url, hook_text)
-                        else:
-                            display_bytes = fetch_video_bytes(video_url)
-
-                        if display_bytes:
-                            st.video(display_bytes)
-                            safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', product_name)[:40]
-                            suffix = "_with_hook" if hook_text else ""
+                        original_bytes = fetch_video_bytes(video_url)
+                        safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", product_name)[:40]
+                        if original_bytes:
                             st.download_button(
-                                "⬇️ Download finished video",
-                                data=display_bytes,
-                                file_name=f"{safe_name}_{creation_id or i}{suffix}.mp4",
+                                "⬇️ Download original",
+                                data=original_bytes,
+                                file_name=f"{safe_name}_{creation_id or i}_original.mp4",
                                 mime="video/mp4",
-                                key=f"dl_{i}",
+                                key=f"dl_original_{i}",
                                 use_container_width=True,
                             )
-                        else:
-                            try:
-                                st.video(video_url)
-                            except Exception:
-                                st.markdown(f"🎬 [Watch original video]({video_url})")
-                            if display_error:
-                                st.error(f"Hook overlay error: {display_error}")
-                            else:
-                                st.caption("⚠️ Couldn't fetch the video for download.")
 
-                        with st.expander("Original video", expanded=False):
-                            try:
-                                st.video(video_url)
-                            except Exception:
-                                st.markdown(f"🎬 [Watch original video]({video_url})")
+                        processed_bytes = read_local_video(result.get("processed_path"))
+                        if processed_bytes:
+                            st.divider()
+                            st.caption("Edited text version")
+                            st.video(processed_bytes)
+                            st.download_button(
+                                "⬇️ Download text version",
+                                data=processed_bytes,
+                                file_name=f"{safe_name}_{creation_id or i}_with_text.mp4",
+                                mime="video/mp4",
+                                key=f"dl_processed_{i}",
+                                use_container_width=True,
+                            )
 
                 # Show product image thumbnail
                 if result.get("image_url") and status != "completed":
@@ -1412,39 +1687,164 @@ repeat these steps to get a fresh one.
                     if result.get("image_url"):
                         st.text_input("Image URL:", value=result["image_url"], key=f"img_{i}")
 
-            # The hook is editable because FFmpeg adds it after generation.
-            if result.get("accepted_hook"):
-                with st.expander(f"📝 FFmpeg Text Hook — {product_name}", expanded=False):
-                    st.info(f"Current hook: {result['accepted_hook']}")
+            # Text is applied only here, after the video has finished. Every setting
+            # can be changed and applied again without regenerating the AI video.
+            video_url = result.get("url") or result.get("preview_url")
+            if video_url and status == "completed":
+                has_processed_version = bool(read_local_video(result.get("processed_path")))
+                editor_title = "✍️ Modify on-screen text" if has_processed_version else "✍️ Add on-screen text"
+
+                with st.expander(editor_title, expanded=False):
+                    st.caption(
+                        "The original video stays untouched. Change the settings below, "
+                        "then click Apply / Update Text to create a separate version."
+                    )
+
+                    stored_settings = dict(DEFAULT_TEXT_SETTINGS)
+                    stored_settings.update(result.get("text_settings") or {})
+
                     edited_hook = st.text_area(
-                        "Edit the hook without regenerating the AI video:",
-                        value=result["accepted_hook"],
-                        key=f"edit_hook_{i}",
+                        "Hook text",
+                        value=result.get("accepted_hook", ""),
+                        key=f"editor_hook_{i}",
                         height=90,
                     )
-                    if st.button("✅ Save hook & rebuild preview", key=f"save_hook_{i}"):
-                        saved_gens[i]["accepted_hook"] = edited_hook.strip()
+
+                    size_col, width_col, position_col = st.columns(3)
+                    with size_col:
+                        font_size = st.slider(
+                            "Text size",
+                            min_value=16,
+                            max_value=48,
+                            value=int(stored_settings["font_size"]),
+                            step=1,
+                            key=f"editor_size_{i}",
+                            help="28 is the smaller default. Move left for even smaller text.",
+                        )
+                    with width_col:
+                        max_width_pct = st.slider(
+                            "Text width",
+                            min_value=45,
+                            max_value=92,
+                            value=int(stored_settings["max_width_pct"]),
+                            step=1,
+                            key=f"editor_width_{i}",
+                            help="A wider text box creates fewer lines.",
+                        )
+                    with position_col:
+                        vertical_position_pct = st.slider(
+                            "Vertical position",
+                            min_value=8,
+                            max_value=60,
+                            value=int(stored_settings["vertical_position_pct"]),
+                            step=1,
+                            key=f"editor_position_{i}",
+                            help="Percentage down from the top of the video.",
+                        )
+
+                    outline_col, spacing_col, emoji_col = st.columns(3)
+                    with outline_col:
+                        outline_width = st.slider(
+                            "Outline thickness",
+                            min_value=1,
+                            max_value=5,
+                            value=int(stored_settings["outline_width"]),
+                            step=1,
+                            key=f"editor_outline_{i}",
+                        )
+                    with spacing_col:
+                        line_spacing_pct = st.slider(
+                            "Line spacing",
+                            min_value=95,
+                            max_value=145,
+                            value=int(stored_settings["line_spacing_pct"]),
+                            step=1,
+                            key=f"editor_spacing_{i}",
+                        )
+                    with emoji_col:
+                        emoji_scale_pct = st.slider(
+                            "Emoji size",
+                            min_value=70,
+                            max_value=145,
+                            value=int(stored_settings["emoji_scale_pct"]),
+                            step=5,
+                            key=f"editor_emoji_{i}",
+                        )
+
+                    editor_settings = {
+                        "font_size": font_size,
+                        "max_width_pct": max_width_pct,
+                        "vertical_position_pct": vertical_position_pct,
+                        "outline_width": outline_width,
+                        "line_spacing_pct": line_spacing_pct,
+                        "emoji_scale_pct": emoji_scale_pct,
+                    }
+
+                    available_assets = sum(
+                        1 for filename in EMOJI_ASSET_MAP.values()
+                        if (EMOJI_ASSET_DIR / filename).exists()
+                    )
+                    st.caption(
+                        f"Apple-style emoji PNGs found: {available_assets}/{len(EMOJI_ASSET_MAP)}. "
+                        "The editor uses a PNG when the hook ends with a supported emoji."
+                    )
+
+                    apply_col, remove_col = st.columns(2)
+                    apply_label = "🎨 Update text version" if has_processed_version else "🎨 Apply text"
+
+                    if apply_col.button(apply_label, key=f"apply_text_{i}", type="primary", use_container_width=True):
+                        with st.spinner("Applying your text settings with FFmpeg..."):
+                            output_path, editor_warning = apply_text_with_ffmpeg(
+                                video_url=video_url,
+                                creation_id=creation_id,
+                                hook=edited_hook.strip(),
+                                settings=editor_settings,
+                            )
+
+                        if output_path:
+                            old_path = result.get("processed_path")
+                            if old_path and old_path != str(output_path):
+                                try:
+                                    Path(old_path).unlink(missing_ok=True)
+                                except Exception:
+                                    pass
+
+                            saved_gens[i]["accepted_hook"] = edited_hook.strip()
+                            saved_gens[i]["text_settings"] = editor_settings
+                            saved_gens[i]["processed_path"] = str(output_path)
+                            saved_gens[i]["processed_at"] = datetime.now().isoformat()
+                            save_generations(saved_gens)
+                            if editor_warning:
+                                st.warning(editor_warning)
+                            st.rerun()
+                        else:
+                            st.error(f"Text editor error: {editor_warning or 'Unknown error'}")
+
+                    if has_processed_version and remove_col.button(
+                        "🗑️ Remove text version",
+                        key=f"remove_text_{i}",
+                        use_container_width=True,
+                    ):
+                        old_path = result.get("processed_path")
+                        if old_path:
+                            try:
+                                Path(old_path).unlink(missing_ok=True)
+                            except Exception:
+                                pass
+                        saved_gens[i].pop("processed_path", None)
+                        saved_gens[i].pop("processed_at", None)
                         save_generations(saved_gens)
                         st.rerun()
 
                     if result.get("hook_options"):
-                        st.caption("Other options that were available:")
-                        for h in result["hook_options"]:
-                            if h != result["accepted_hook"]:
-                                st.caption(f"  • {h}")
+                        st.caption("Other generated hook options:")
+                        for hook_option in result["hook_options"]:
+                            st.caption(f"• {hook_option}")
                     if result.get("caption"):
                         st.caption(f"Caption: {result['caption']}")
                     if result.get("hashtags"):
                         st.caption(f"Hashtags: {result['hashtags']}")
-            elif result.get("hook_options"):
-                # Legacy entries from before hook-first flow
-                with st.expander(f"📝 Hook options — {product_name}"):
-                    for h in result["hook_options"]:
-                        st.code(h, language=None)
-                    if result.get("caption"):
-                        st.caption(f"Caption: {result['caption']}")
-                    if result.get("hashtags"):
-                        st.caption(f"Hashtags: {result['hashtags']}")
+
 
         # Save any status updates
         if needs_save:
