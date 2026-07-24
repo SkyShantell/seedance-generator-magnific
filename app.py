@@ -7,7 +7,10 @@ generate videos automatically OR get prompts to generate manually.
 
 import streamlit as st
 import anthropic
+import csv
 import hashlib
+import io
+import zipfile
 import json
 import os
 import re
@@ -1043,6 +1046,87 @@ def read_local_video(path_value: str | None) -> bytes | None:
     return None
 
 
+def generation_export_rows(generations: list[dict]) -> list[dict]:
+    """Flatten saved generations into VA-friendly CSV rows."""
+    rows = []
+    for item in generations:
+        video_url = item.get("url") or item.get("preview_url") or ""
+        caption = (item.get("caption") or "").strip()
+        hashtags = (item.get("hashtags") or "").strip()
+        full_caption = " ".join(part for part in [caption, hashtags] if part).strip()
+        rows.append({
+            "product_name": item.get("product_name", ""),
+            "product_link": item.get("source_url", ""),
+            "caption": caption,
+            "hashtags": hashtags,
+            "full_caption": full_caption,
+            "on_screen_text": item.get("accepted_hook", ""),
+            "video_url": video_url,
+            "processed_video_file": item.get("processed_path", ""),
+            "style": item.get("style", ""),
+            "status": item.get("status", ""),
+            "creation_id": item.get("creation_id", ""),
+            "generated_at": item.get("generated_at", ""),
+        })
+    return rows
+
+
+def generations_csv_bytes(generations: list[dict]) -> bytes:
+    """Create a UTF-8 CSV containing product links, captions, hooks, and video links."""
+    rows = generation_export_rows(generations)
+    buffer = io.StringIO()
+    fieldnames = [
+        "product_name", "product_link", "caption", "hashtags", "full_caption",
+        "on_screen_text", "video_url", "processed_video_file", "style",
+        "status", "creation_id", "generated_at",
+    ]
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(rows)
+    return buffer.getvalue().encode("utf-8-sig")
+
+
+def safe_export_filename(value: str, fallback: str = "video") -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "_", value or "").strip("_")
+    return (cleaned[:70] or fallback)
+
+
+def generations_zip_bytes(generations: list[dict]) -> tuple[bytes | None, int, list[str]]:
+    """Build one ZIP with available edited/original videos and captions.csv."""
+    csv_bytes = generations_csv_bytes(generations)
+    output = io.BytesIO()
+    added = 0
+    skipped = []
+
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("captions.csv", csv_bytes)
+
+        used_names = set()
+        for index, item in enumerate(generations, start=1):
+            product_name = item.get("product_name", f"video_{index}")
+            base = safe_export_filename(product_name, f"video_{index}")
+            filename = f"{index:03d}_{base}.mp4"
+            counter = 2
+            while filename in used_names:
+                filename = f"{index:03d}_{base}_{counter}.mp4"
+                counter += 1
+            used_names.add(filename)
+
+            video_bytes = read_local_video(item.get("processed_path"))
+            if not video_bytes:
+                video_url = item.get("url") or item.get("preview_url")
+                if video_url and item.get("status") == "completed":
+                    video_bytes = fetch_video_bytes(video_url)
+
+            if video_bytes:
+                archive.writestr(f"videos/{filename}", video_bytes)
+                added += 1
+            else:
+                skipped.append(product_name)
+
+    return output.getvalue(), added, skipped
+
+
 # ── Constants ───────────────────────────────────────────────────────
 MAGNIFIC_MCP_URL = "https://mcp.magnific.com"
 MAGNIFIC_MCP_NAME = "magnific"
@@ -1067,7 +1151,7 @@ SHOE_VIDEO_SYSTEM = """You are a TikTok Shop affiliate content producer. Write a
 video prompt for the product described. Follow these HARD RULES:
 - 9:16 vertical, TikTok UGC aesthetic
 - NO person above the ankle — EVER
-- NO on-screen text, captions, subtitles, overlays, signs, logos
+- Generate a CLEAN source video with NO baked-in on-screen text, captions, subtitles, overlays, signs, or logos
 - Feet-and-shoes ONLY — the shoe IS the star
 - Warm natural lighting, phone-camera handheld feel
 - 3 timecoded shots (looking-down POV → low side-angle → back to overhead)
@@ -1660,6 +1744,8 @@ repeat these steps to get a fresh one.
             voice_script = None
             st.caption("Always 8s and silent. The clean video is generated first; add or modify text afterward in Past Generations.")
 
+        st.caption("Both styles support generated or custom on-screen text after the video finishes.")
+
     # ════════════════════════════════════════════════════════════════
     #  STEP 1 — PASTE LINKS
     # ════════════════════════════════════════════════════════════════
@@ -1767,9 +1853,12 @@ repeat these steps to get a fresh one.
                 "source_url": product["source_url"],
             })
 
-        # ── For texthook_broll: pick hooks FIRST, then generate ──
-        hooks_ready = True  # True for shoe_video (no hooks needed)
-        if style == "texthook_broll":
+        # ── For both styles: pick hooks FIRST, then generate ──
+        hooks_ready = False
+
+        # Both video styles can use generated on-screen text hooks.
+        # The selected hook is stored now and burned onto the finished video later with FFmpeg.
+        if style in ("texthook_broll", "shoe_video"):
             hooks_ready = False
 
             # ── Step 3a: Generate hook options ──
@@ -1849,7 +1938,7 @@ repeat these steps to get a fresh one.
             st.markdown("---")
             if has_token:
                 col1, col2 = st.columns(2)
-                auto_btn = col1.button("🎬 Step 2 — Auto-Generate Videos" if style == "texthook_broll" else "🎬 Auto-Generate Videos",
+                auto_btn = col1.button("🎬 Step 2 — Auto-Generate Videos",
                                         type="primary", use_container_width=True)
                 prompt_btn = col2.button("📝 Just Get Prompts", use_container_width=True)
             else:
@@ -1882,7 +1971,7 @@ repeat these steps to get a fresh one.
             # Get the accepted hook for texthook_broll style
             selected_hook = None
             hook_data_for_product = None
-            if style == "texthook_broll":
+            if style in ("texthook_broll", "shoe_video"):
                 hook_data_for_product = st.session_state.get("product_hooks", {}).get(i)
                 if hook_data_for_product:
                     selected_hook = hook_data_for_product.get("accepted_hook")
@@ -2016,7 +2105,7 @@ repeat these steps to get a fresh one.
             # Step A: Write the prompt (cheap, no MCP)
             selected_hook = None
             hook_data_for_product = None
-            if style == "texthook_broll":
+            if style in ("texthook_broll", "shoe_video"):
                 hook_data_for_product = st.session_state.get("product_hooks", {}).get(i)
                 if hook_data_for_product:
                     selected_hook = hook_data_for_product.get("accepted_hook")
@@ -2525,14 +2614,45 @@ repeat these steps to get a fresh one.
             save_generations(saved_gens)
             st.rerun()
 
-        # Download
+        # Bulk downloads
         st.divider()
-        st.download_button(
-            "📥 Download All (JSON)",
-            data=json.dumps(saved_gens, indent=2, default=str),
-            file_name=f"generations_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-            mime="application/json",
+        st.subheader("📦 Bulk Downloads")
+        export_stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        csv_data = generations_csv_bytes(saved_gens)
+
+        download_col1, download_col2, download_col3 = st.columns(3)
+        download_col1.download_button(
+            "📥 Download CSV",
+            data=csv_data,
+            file_name=f"captions_{export_stamp}.csv",
+            mime="text/csv",
+            use_container_width=True,
         )
+
+        zip_data, zip_video_count, zip_skipped = generations_zip_bytes(saved_gens)
+        download_col2.download_button(
+            f"⬇️ Download Videos ZIP ({zip_video_count})",
+            data=zip_data,
+            file_name=f"seedance_videos_{export_stamp}.zip",
+            mime="application/zip",
+            use_container_width=True,
+            disabled=zip_video_count == 0,
+        )
+
+        download_col3.download_button(
+            "📥 Download JSON",
+            data=json.dumps(saved_gens, indent=2, default=str),
+            file_name=f"generations_{export_stamp}.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
+        st.caption(
+            f"The ZIP contains {zip_video_count} available video(s) plus captions.csv. "
+            "Edited text versions are used first; otherwise the original completed video is included."
+        )
+        if zip_skipped:
+            st.caption(f"Skipped {len(zip_skipped)} item(s) that do not have an available finished video yet.")
 
 
 if __name__ == "__main__":
