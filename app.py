@@ -39,6 +39,7 @@ st.set_page_config(
     page_title="Seedance Video Generator",
     page_icon="🎬",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
 # ── Persistent storage ─────────────────────────────────────────────
@@ -270,6 +271,41 @@ def inject_apple_glass_css():
         }
 
         /* Sidebar */
+        /* Keep the sidebar opener visible when the sidebar is collapsed. */
+        [data-testid="stSidebarCollapsedControl"],
+        [data-testid="stSidebarCollapseButton"],
+        button[kind="headerNoPadding"] {
+            visibility: visible !important;
+            display: flex !important;
+            opacity: 1 !important;
+            z-index: 1000000 !important;
+        }
+
+        [data-testid="stSidebarCollapsedControl"] {
+            position: fixed !important;
+            top: 14px !important;
+            left: 14px !important;
+            width: 44px !important;
+            height: 44px !important;
+            align-items: center !important;
+            justify-content: center !important;
+            border-radius: 14px !important;
+            background: rgba(24, 30, 43, .96) !important;
+            border: 1px solid rgba(255,255,255,.18) !important;
+            box-shadow: 0 12px 28px rgba(0,0,0,.38) !important;
+            backdrop-filter: blur(18px) !important;
+            -webkit-backdrop-filter: blur(18px) !important;
+        }
+
+        [data-testid="stSidebarCollapsedControl"] button,
+        [data-testid="stSidebarCollapsedControl"] svg,
+        [data-testid="stSidebarCollapseButton"] button,
+        [data-testid="stSidebarCollapseButton"] svg {
+            color: #ffffff !important;
+            fill: #ffffff !important;
+            stroke: #ffffff !important;
+        }
+
         [data-testid="stSidebar"] {
             background:
                 linear-gradient(180deg, rgba(13, 17, 25, .98), rgba(7, 10, 16, .98)) !important;
