@@ -2330,7 +2330,10 @@ repeat these steps to get a fresh one.
 
     if uploaded_video is not None:
         uploaded_bytes = uploaded_video.getvalue()
-        st.video(uploaded_bytes)
+        upload_preview_col, _upload_preview_space = st.columns([1, 3])
+        with upload_preview_col:
+            st.caption("Original uploaded video")
+            st.video(uploaded_bytes)
 
         upload_presets, _upload_preset_data = all_text_presets()
         upload_default_settings, upload_default_name = default_text_settings_from_presets()
@@ -2403,7 +2406,10 @@ repeat these steps to get a fresh one.
         uploaded_output_bytes = read_local_video(uploaded_output_path)
         if uploaded_output_bytes:
             st.success("Text version created.")
-            st.video(uploaded_output_bytes)
+            upload_result_col, _upload_result_space = st.columns([1, 3])
+            with upload_result_col:
+                st.caption("Finished text version")
+                st.video(uploaded_output_bytes)
             output_name = f"{safe_export_filename(Path(uploaded_video.name).stem)}_with_text.mp4"
             st.download_button(
                 "⬇️ Download Uploaded Video with Text",
@@ -2442,402 +2448,405 @@ repeat these steps to get a fresh one.
             save_generations(remaining)
             st.rerun()
 
-        # Display each generation
+        # Display saved generations in a compact four-card row.
+        # Each card keeps its own preview, downloads, prompt, and text editor.
         needs_save = False
+        generation_grid_cols = None
 
         for i, result in enumerate(saved_gens):
-            creation_id = result.get("creation_id")
-            product_name = result.get("product_name", "Unknown")
-            status = result.get("status", "unknown")
-            generated_at = result.get("generated_at", "")
+            if i % 4 == 0:
+                generation_grid_cols = st.columns(4, gap="medium")
 
-            st.markdown("---")
+            with generation_grid_cols[i % 4]:
+                with st.container(border=True):
+                            creation_id = result.get("creation_id")
+                            product_name = result.get("product_name", "Unknown")
+                            status = result.get("status", "unknown")
+                            generated_at = result.get("generated_at", "")
 
-            status_badges = {
-                "queued": "🟡 Queued",
-                "processing": "🟠 Processing",
-                "completed": "🟢 Completed",
-                "error": "🔴 Error",
-                "prompt_only": "📝 Prompt Only (manual generation)",
-            }
-            badge = status_badges.get(status, f"⚪ {status}")
+                            status_badges = {
+                                "queued": "🟡 Queued",
+                                "processing": "🟠 Processing",
+                                "completed": "🟢 Completed",
+                                "error": "🔴 Error",
+                                "prompt_only": "📝 Prompt Only (manual generation)",
+                            }
+                            badge = status_badges.get(status, f"⚪ {status}")
 
-            # Timestamp
-            time_str = ""
-            if generated_at:
-                try:
-                    dt = datetime.fromisoformat(generated_at)
-                    time_str = f" · {dt.strftime('%b %d, %I:%M %p')}"
-                except Exception:
-                    pass
-
-            col_info, col_actions = st.columns([3, 1])
-
-            with col_info:
-                st.markdown(f"**{product_name}** — {badge}{time_str}")
-                if creation_id:
-                    st.caption(f"Creation ID: `{creation_id}`")
-
-                # Completed videos are shown clean first. FFmpeg does nothing until
-                # the user opens the editor and clicks Apply / Update Text.
-                video_url = result.get("url") or result.get("preview_url")
-                if video_url and status == "completed":
-                    video_col, _spacer = st.columns([1, 2])
-                    with video_col:
-                        st.caption("Original clean video")
-                        try:
-                            st.video(video_url)
-                        except Exception:
-                            st.markdown(f"🎬 [Watch original video]({video_url})")
-
-                        original_bytes = fetch_video_bytes(video_url)
-                        safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", product_name)[:40]
-                        if original_bytes:
-                            st.download_button(
-                                "⬇️ Download original",
-                                data=original_bytes,
-                                file_name=f"{safe_name}_{creation_id or i}_original.mp4",
-                                mime="video/mp4",
-                                key=f"dl_original_{i}",
-                                use_container_width=True,
-                            )
-
-                        processed_bytes = read_local_video(result.get("processed_path"))
-                        if processed_bytes:
-                            st.divider()
-                            st.caption("Edited text version")
-                            st.video(processed_bytes)
-                            st.download_button(
-                                "⬇️ Download text version",
-                                data=processed_bytes,
-                                file_name=f"{safe_name}_{creation_id or i}_with_text.mp4",
-                                mime="video/mp4",
-                                key=f"dl_processed_{i}",
-                                use_container_width=True,
-                            )
-
-                # Show product image thumbnail
-                if result.get("image_url") and status != "completed":
-                    try:
-                        st.image(result["image_url"], width=120)
-                    except Exception:
-                        pass
-
-            with col_actions:
-                # Check status
-                if creation_id and status not in ("completed", "error") and magnific_token and api_key:
-                    if st.button("🔄 Check", key=f"chk_{i}") or check_all:
-                        with st.spinner("Checking..."):
-                            status_result = check_creation_status(
-                                api_key, magnific_token, creation_id
-                            )
-                        saved_gens[i]["status"] = status_result.get("status", status)
-                        if status_result.get("url"):
-                            saved_gens[i]["url"] = status_result["url"]
-                        if status_result.get("preview_url"):
-                            saved_gens[i]["preview_url"] = status_result["preview_url"]
-                        needs_save = True
-
-                # Regenerate
-                if result.get("prompt_used") and result.get("image_url") and magnific_token and api_key:
-                    if st.button("🔁 Regen", key=f"regen_{i}"):
-                        with st.spinner("Regenerating..."):
-                            new_result = generate_video(
-                                api_key=api_key,
-                                magnific_token=magnific_token,
-                                image_url=result["image_url"],
-                                prompt=result["prompt_used"],
-                                duration=result.get("duration", 15),
-                            )
-                        new_result["product_name"] = product_name
-                        new_result["prompt_used"] = result["prompt_used"]
-                        new_result["image_url"] = result["image_url"]
-                        new_result["source_url"] = result.get("source_url", "")
-                        new_result["style"] = result.get("style", "")
-                        new_result["duration"] = result.get("duration", 15)
-                        new_result["accepted_hook"] = result.get("accepted_hook")
-                        new_result["hook_options"] = result.get("hook_options", [])
-                        new_result["caption"] = result.get("caption")
-                        new_result["hashtags"] = result.get("hashtags")
-                        new_result["generated_at"] = datetime.now().isoformat()
-                        # Add new generation, keep old one
-                        add_generation(new_result)
-                        st.rerun()
-
-            # Expandable prompt (works for both "prompt_used" and "prompt" keys)
-            prompt_text_field = result.get("prompt_used") or result.get("prompt")
-            if prompt_text_field:
-                with st.expander(f"📋 Prompt — {product_name}", expanded=False):
-                    st.code(prompt_text_field, language=None)
-                    if result.get("image_url"):
-                        st.text_input("Image URL:", value=result["image_url"], key=f"img_{i}")
-
-            # Text is applied only here, after the video has finished. Every setting
-            # can be changed and applied again without regenerating the AI video.
-            video_url = result.get("url") or result.get("preview_url")
-            if video_url and status == "completed":
-                has_processed_version = bool(read_local_video(result.get("processed_path")))
-                editor_title = "✍️ Modify on-screen text" if has_processed_version else "✍️ Add on-screen text"
-
-                with st.expander(editor_title, expanded=False):
-                    st.caption(
-                        "The original video stays untouched. Change the settings below, "
-                        "then click Apply / Update Text to create a separate version."
-                    )
-
-                    presets, preset_data = all_text_presets()
-                    default_preset_settings, default_preset_name = default_text_settings_from_presets()
-
-                    if result.get("text_settings"):
-                        stored_settings = normalize_text_settings(result.get("text_settings"))
-                    else:
-                        stored_settings = dict(default_preset_settings)
-
-                    active_preset_name = result.get("text_preset_name") or default_preset_name
-                    if active_preset_name not in presets:
-                        active_preset_name = default_preset_name
-
-                    # Initialize each editor once. Preset buttons update these keys
-                    # before the sliders render, so the selected style loads cleanly.
-                    widget_keys = [
-                        f"editor_font_{i}",
-                        f"editor_size_{i}",
-                        f"editor_width_{i}",
-                        f"editor_position_{i}",
-                        f"editor_outline_{i}",
-                        f"editor_spacing_{i}",
-                        f"editor_emoji_{i}",
-                    ]
-                    if not any(key in st.session_state for key in widget_keys):
-                        set_editor_widget_values(i, stored_settings)
-
-                    st.markdown('<span class="preset-pill">TEXT STYLE PRESETS</span>', unsafe_allow_html=True)
-                    preset_col, load_col, default_col = st.columns([2.2, 1, 1.25])
-                    with preset_col:
-                        selected_preset = st.selectbox(
-                            "Preset",
-                            options=list(presets.keys()),
-                            index=list(presets.keys()).index(active_preset_name),
-                            key=f"preset_select_{i}",
-                            help="Load a saved style across any completed video.",
-                        )
-                    with load_col:
-                        st.write("")
-                        if st.button(
-                            "Load",
-                            key=f"load_preset_{i}",
-                            use_container_width=True,
-                        ):
-                            set_editor_widget_values(i, presets[selected_preset])
-                            saved_gens[i]["text_preset_name"] = selected_preset
-                            save_generations(saved_gens)
-                            st.rerun()
-                    with default_col:
-                        st.write("")
-                        if st.button(
-                            "Use by default",
-                            key=f"default_preset_{i}",
-                            use_container_width=True,
-                            help="New text editors will start with this preset.",
-                        ):
-                            preset_data["default"] = selected_preset
-                            save_text_presets_data(preset_data)
-                            st.success(f"{selected_preset} is now your default preset.")
-
-                    editor_font_options = available_overlay_fonts()
-                    editor_default_font = stored_settings.get("font_name", "TikTok Sans")
-                    if editor_default_font not in editor_font_options:
-                        editor_default_font = editor_font_options[0]
-                    editor_font_name = st.selectbox(
-                        "Font",
-                        options=editor_font_options,
-                        index=editor_font_options.index(editor_default_font),
-                        key=f"editor_font_{i}",
-                    )
-
-                    edited_hook = st.text_area(
-                        "Hook text",
-                        value=result.get("accepted_hook", ""),
-                        key=f"editor_hook_{i}",
-                        height=90,
-                    )
-
-                    size_col, width_col, position_col = st.columns(3)
-                    with size_col:
-                        font_size = st.slider(
-                            "Text size",
-                            min_value=16,
-                            max_value=48,
-                            step=1,
-                            key=f"editor_size_{i}",
-                            help="Font height in pixels. 24–30 usually matches compact TikTok text.",
-                        )
-                    with width_col:
-                        max_width_pct = st.slider(
-                            "Text width",
-                            min_value=45,
-                            max_value=92,
-                            step=1,
-                            key=f"editor_width_{i}",
-                            help="A wider text box creates fewer lines.",
-                        )
-                    with position_col:
-                        vertical_position_pct = st.slider(
-                            "Vertical position",
-                            min_value=8,
-                            max_value=60,
-                            step=1,
-                            key=f"editor_position_{i}",
-                            help="Percentage down from the top of the video.",
-                        )
-
-                    outline_col, spacing_col, emoji_col = st.columns(3)
-                    with outline_col:
-                        outline_width = st.slider(
-                            "Outline thickness",
-                            min_value=1,
-                            max_value=5,
-                            step=1,
-                            key=f"editor_outline_{i}",
-                        )
-                    with spacing_col:
-                        line_spacing_pct = st.slider(
-                            "Line spacing",
-                            min_value=95,
-                            max_value=145,
-                            step=1,
-                            key=f"editor_spacing_{i}",
-                        )
-                    with emoji_col:
-                        emoji_size_px = st.slider(
-                            "Emoji size",
-                            min_value=18,
-                            max_value=90,
-                            step=2,
-                            key=f"editor_emoji_{i}",
-                            help="Exact visible emoji height in pixels. Transparent padding is removed before resizing.",
-                        )
-
-                    editor_settings = normalize_text_settings({
-                        "font_name": editor_font_name,
-                        "font_size": font_size,
-                        "max_width_pct": max_width_pct,
-                        "vertical_position_pct": vertical_position_pct,
-                        "outline_width": outline_width,
-                        "line_spacing_pct": line_spacing_pct,
-                        "emoji_size_px": emoji_size_px,
-                    })
-
-                    st.markdown('<span class="preset-pill">SAVE THIS STYLE</span>', unsafe_allow_html=True)
-                    save_name_col, save_button_col, delete_button_col = st.columns([2.2, 1, 1])
-                    with save_name_col:
-                        custom_preset_name = st.text_input(
-                            "Preset name",
-                            placeholder="My favorite style",
-                            key=f"custom_preset_name_{i}",
-                            label_visibility="collapsed",
-                        )
-                    with save_button_col:
-                        if st.button(
-                            "Save preset",
-                            key=f"save_preset_{i}",
-                            type="primary",
-                            use_container_width=True,
-                        ):
-                            cleaned_name = custom_preset_name.strip()
-                            if not cleaned_name:
-                                st.error("Enter a preset name first.")
-                            elif cleaned_name in BUILT_IN_TEXT_PRESETS:
-                                st.error("Choose a different name; built-in presets cannot be overwritten.")
-                            else:
-                                preset_data.setdefault("presets", {})[cleaned_name] = editor_settings
-                                save_text_presets_data(preset_data)
-                                saved_gens[i]["text_preset_name"] = cleaned_name
-                                save_generations(saved_gens)
-                                st.success(f"Saved preset: {cleaned_name}")
-                                st.rerun()
-                    with delete_button_col:
-                        can_delete_preset = selected_preset not in BUILT_IN_TEXT_PRESETS
-                        if st.button(
-                            "Delete",
-                            key=f"delete_preset_{i}",
-                            disabled=not can_delete_preset,
-                            use_container_width=True,
-                            help="Only custom presets can be deleted.",
-                        ):
-                            preset_data.get("presets", {}).pop(selected_preset, None)
-                            if preset_data.get("default") == selected_preset:
-                                preset_data["default"] = "Apple Compact"
-                            save_text_presets_data(preset_data)
-                            saved_gens[i]["text_preset_name"] = "Apple Compact"
-                            save_generations(saved_gens)
-                            st.rerun()
-
-                    available_assets = sum(
-                        1 for filename in EMOJI_ASSET_MAP.values()
-                        if (EMOJI_ASSET_DIR / filename).exists()
-                    )
-                    st.caption(
-                        f"Apple-style emoji PNGs found: {available_assets}/{len(EMOJI_ASSET_MAP)}. "
-                        "The editor uses a PNG when the hook ends with a supported emoji."
-                    )
-
-                    apply_col, remove_col = st.columns(2)
-                    apply_label = "🎨 Update text version" if has_processed_version else "🎨 Apply text"
-
-                    if apply_col.button(apply_label, key=f"apply_text_{i}", type="primary", use_container_width=True):
-                        with st.spinner("Applying your text settings with FFmpeg..."):
-                            output_path, editor_warning = apply_text_with_ffmpeg(
-                                video_url=video_url,
-                                creation_id=creation_id,
-                                hook=edited_hook.strip(),
-                                settings=editor_settings,
-                            )
-
-                        if output_path:
-                            old_path = result.get("processed_path")
-                            if old_path and old_path != str(output_path):
+                            # Timestamp
+                            time_str = ""
+                            if generated_at:
                                 try:
-                                    Path(old_path).unlink(missing_ok=True)
+                                    dt = datetime.fromisoformat(generated_at)
+                                    time_str = f" · {dt.strftime('%b %d, %I:%M %p')}"
                                 except Exception:
                                     pass
 
-                            saved_gens[i]["accepted_hook"] = edited_hook.strip()
-                            saved_gens[i]["text_settings"] = editor_settings
-                            saved_gens[i]["text_preset_name"] = selected_preset
-                            saved_gens[i]["processed_path"] = str(output_path)
-                            saved_gens[i]["processed_at"] = datetime.now().isoformat()
-                            save_generations(saved_gens)
-                            if editor_warning:
-                                st.warning(editor_warning)
-                            st.rerun()
-                        else:
-                            st.error(f"Text editor error: {editor_warning or 'Unknown error'}")
+                            col_info, col_actions = st.columns([3, 1])
 
-                    if has_processed_version and remove_col.button(
-                        "🗑️ Remove text version",
-                        key=f"remove_text_{i}",
-                        use_container_width=True,
-                    ):
-                        old_path = result.get("processed_path")
-                        if old_path:
-                            try:
-                                Path(old_path).unlink(missing_ok=True)
-                            except Exception:
-                                pass
-                        saved_gens[i].pop("processed_path", None)
-                        saved_gens[i].pop("processed_at", None)
-                        save_generations(saved_gens)
-                        st.rerun()
+                            with col_info:
+                                st.markdown(f"**{product_name}** — {badge}{time_str}")
+                                if creation_id:
+                                    st.caption(f"Creation ID: `{creation_id}`")
 
-                    if result.get("hook_options"):
-                        st.caption("Other generated hook options:")
-                        for hook_option in result["hook_options"]:
-                            st.caption(f"• {hook_option}")
-                    if result.get("caption"):
-                        st.caption(f"Caption: {result['caption']}")
-                    if result.get("hashtags"):
-                        st.caption(f"Hashtags: {result['hashtags']}")
+                                # Completed videos are shown clean first. FFmpeg does nothing until
+                                # the user opens the editor and clicks Apply / Update Text.
+                                video_url = result.get("url") or result.get("preview_url")
+                                if video_url and status == "completed":
+                                    st.caption("Original clean video")
+                                    try:
+                                        st.video(video_url)
+                                    except Exception:
+                                        st.markdown(f"🎬 [Watch original video]({video_url})")
+
+                                    original_bytes = fetch_video_bytes(video_url)
+                                    safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", product_name)[:40]
+                                    if original_bytes:
+                                        st.download_button(
+                                            "⬇️ Download original",
+                                            data=original_bytes,
+                                            file_name=f"{safe_name}_{creation_id or i}_original.mp4",
+                                            mime="video/mp4",
+                                            key=f"dl_original_{i}",
+                                            use_container_width=True,
+                                        )
+
+                                    processed_bytes = read_local_video(result.get("processed_path"))
+                                    if processed_bytes:
+                                        st.divider()
+                                        st.caption("Edited text version")
+                                        st.video(processed_bytes)
+                                        st.download_button(
+                                            "⬇️ Download text version",
+                                            data=processed_bytes,
+                                            file_name=f"{safe_name}_{creation_id or i}_with_text.mp4",
+                                            mime="video/mp4",
+                                            key=f"dl_processed_{i}",
+                                            use_container_width=True,
+                                        )
+
+                                # Show product image thumbnail
+                                if result.get("image_url") and status != "completed":
+                                    try:
+                                        st.image(result["image_url"], width=120)
+                                    except Exception:
+                                        pass
+
+                            with col_actions:
+                                # Check status
+                                if creation_id and status not in ("completed", "error") and magnific_token and api_key:
+                                    if st.button("🔄 Check", key=f"chk_{i}") or check_all:
+                                        with st.spinner("Checking..."):
+                                            status_result = check_creation_status(
+                                                api_key, magnific_token, creation_id
+                                            )
+                                        saved_gens[i]["status"] = status_result.get("status", status)
+                                        if status_result.get("url"):
+                                            saved_gens[i]["url"] = status_result["url"]
+                                        if status_result.get("preview_url"):
+                                            saved_gens[i]["preview_url"] = status_result["preview_url"]
+                                        needs_save = True
+
+                                # Regenerate
+                                if result.get("prompt_used") and result.get("image_url") and magnific_token and api_key:
+                                    if st.button("🔁 Regen", key=f"regen_{i}"):
+                                        with st.spinner("Regenerating..."):
+                                            new_result = generate_video(
+                                                api_key=api_key,
+                                                magnific_token=magnific_token,
+                                                image_url=result["image_url"],
+                                                prompt=result["prompt_used"],
+                                                duration=result.get("duration", 15),
+                                            )
+                                        new_result["product_name"] = product_name
+                                        new_result["prompt_used"] = result["prompt_used"]
+                                        new_result["image_url"] = result["image_url"]
+                                        new_result["source_url"] = result.get("source_url", "")
+                                        new_result["style"] = result.get("style", "")
+                                        new_result["duration"] = result.get("duration", 15)
+                                        new_result["accepted_hook"] = result.get("accepted_hook")
+                                        new_result["hook_options"] = result.get("hook_options", [])
+                                        new_result["caption"] = result.get("caption")
+                                        new_result["hashtags"] = result.get("hashtags")
+                                        new_result["generated_at"] = datetime.now().isoformat()
+                                        # Add new generation, keep old one
+                                        add_generation(new_result)
+                                        st.rerun()
+
+                            # Expandable prompt (works for both "prompt_used" and "prompt" keys)
+                            prompt_text_field = result.get("prompt_used") or result.get("prompt")
+                            if prompt_text_field:
+                                with st.expander(f"📋 Prompt — {product_name}", expanded=False):
+                                    st.code(prompt_text_field, language=None)
+                                    if result.get("image_url"):
+                                        st.text_input("Image URL:", value=result["image_url"], key=f"img_{i}")
+
+                            # Text is applied only here, after the video has finished. Every setting
+                            # can be changed and applied again without regenerating the AI video.
+                            video_url = result.get("url") or result.get("preview_url")
+                            if video_url and status == "completed":
+                                has_processed_version = bool(read_local_video(result.get("processed_path")))
+                                editor_title = "✍️ Modify on-screen text" if has_processed_version else "✍️ Add on-screen text"
+
+                                with st.expander(editor_title, expanded=False):
+                                    st.caption(
+                                        "The original video stays untouched. Change the settings below, "
+                                        "then click Apply / Update Text to create a separate version."
+                                    )
+
+                                    presets, preset_data = all_text_presets()
+                                    default_preset_settings, default_preset_name = default_text_settings_from_presets()
+
+                                    if result.get("text_settings"):
+                                        stored_settings = normalize_text_settings(result.get("text_settings"))
+                                    else:
+                                        stored_settings = dict(default_preset_settings)
+
+                                    active_preset_name = result.get("text_preset_name") or default_preset_name
+                                    if active_preset_name not in presets:
+                                        active_preset_name = default_preset_name
+
+                                    # Initialize each editor once. Preset buttons update these keys
+                                    # before the sliders render, so the selected style loads cleanly.
+                                    widget_keys = [
+                                        f"editor_font_{i}",
+                                        f"editor_size_{i}",
+                                        f"editor_width_{i}",
+                                        f"editor_position_{i}",
+                                        f"editor_outline_{i}",
+                                        f"editor_spacing_{i}",
+                                        f"editor_emoji_{i}",
+                                    ]
+                                    if not any(key in st.session_state for key in widget_keys):
+                                        set_editor_widget_values(i, stored_settings)
+
+                                    st.markdown('<span class="preset-pill">TEXT STYLE PRESETS</span>', unsafe_allow_html=True)
+                                    preset_col, load_col, default_col = st.columns([2.2, 1, 1.25])
+                                    with preset_col:
+                                        selected_preset = st.selectbox(
+                                            "Preset",
+                                            options=list(presets.keys()),
+                                            index=list(presets.keys()).index(active_preset_name),
+                                            key=f"preset_select_{i}",
+                                            help="Load a saved style across any completed video.",
+                                        )
+                                    with load_col:
+                                        st.write("")
+                                        if st.button(
+                                            "Load",
+                                            key=f"load_preset_{i}",
+                                            use_container_width=True,
+                                        ):
+                                            set_editor_widget_values(i, presets[selected_preset])
+                                            saved_gens[i]["text_preset_name"] = selected_preset
+                                            save_generations(saved_gens)
+                                            st.rerun()
+                                    with default_col:
+                                        st.write("")
+                                        if st.button(
+                                            "Use by default",
+                                            key=f"default_preset_{i}",
+                                            use_container_width=True,
+                                            help="New text editors will start with this preset.",
+                                        ):
+                                            preset_data["default"] = selected_preset
+                                            save_text_presets_data(preset_data)
+                                            st.success(f"{selected_preset} is now your default preset.")
+
+                                    editor_font_options = available_overlay_fonts()
+                                    editor_default_font = stored_settings.get("font_name", "TikTok Sans")
+                                    if editor_default_font not in editor_font_options:
+                                        editor_default_font = editor_font_options[0]
+                                    editor_font_name = st.selectbox(
+                                        "Font",
+                                        options=editor_font_options,
+                                        index=editor_font_options.index(editor_default_font),
+                                        key=f"editor_font_{i}",
+                                    )
+
+                                    edited_hook = st.text_area(
+                                        "Hook text",
+                                        value=result.get("accepted_hook", ""),
+                                        key=f"editor_hook_{i}",
+                                        height=90,
+                                    )
+
+                                    size_col, width_col, position_col = st.columns(3)
+                                    with size_col:
+                                        font_size = st.slider(
+                                            "Text size",
+                                            min_value=16,
+                                            max_value=48,
+                                            step=1,
+                                            key=f"editor_size_{i}",
+                                            help="Font height in pixels. 24–30 usually matches compact TikTok text.",
+                                        )
+                                    with width_col:
+                                        max_width_pct = st.slider(
+                                            "Text width",
+                                            min_value=45,
+                                            max_value=92,
+                                            step=1,
+                                            key=f"editor_width_{i}",
+                                            help="A wider text box creates fewer lines.",
+                                        )
+                                    with position_col:
+                                        vertical_position_pct = st.slider(
+                                            "Vertical position",
+                                            min_value=8,
+                                            max_value=60,
+                                            step=1,
+                                            key=f"editor_position_{i}",
+                                            help="Percentage down from the top of the video.",
+                                        )
+
+                                    outline_col, spacing_col, emoji_col = st.columns(3)
+                                    with outline_col:
+                                        outline_width = st.slider(
+                                            "Outline thickness",
+                                            min_value=1,
+                                            max_value=5,
+                                            step=1,
+                                            key=f"editor_outline_{i}",
+                                        )
+                                    with spacing_col:
+                                        line_spacing_pct = st.slider(
+                                            "Line spacing",
+                                            min_value=95,
+                                            max_value=145,
+                                            step=1,
+                                            key=f"editor_spacing_{i}",
+                                        )
+                                    with emoji_col:
+                                        emoji_size_px = st.slider(
+                                            "Emoji size",
+                                            min_value=18,
+                                            max_value=90,
+                                            step=2,
+                                            key=f"editor_emoji_{i}",
+                                            help="Exact visible emoji height in pixels. Transparent padding is removed before resizing.",
+                                        )
+
+                                    editor_settings = normalize_text_settings({
+                                        "font_name": editor_font_name,
+                                        "font_size": font_size,
+                                        "max_width_pct": max_width_pct,
+                                        "vertical_position_pct": vertical_position_pct,
+                                        "outline_width": outline_width,
+                                        "line_spacing_pct": line_spacing_pct,
+                                        "emoji_size_px": emoji_size_px,
+                                    })
+
+                                    st.markdown('<span class="preset-pill">SAVE THIS STYLE</span>', unsafe_allow_html=True)
+                                    save_name_col, save_button_col, delete_button_col = st.columns([2.2, 1, 1])
+                                    with save_name_col:
+                                        custom_preset_name = st.text_input(
+                                            "Preset name",
+                                            placeholder="My favorite style",
+                                            key=f"custom_preset_name_{i}",
+                                            label_visibility="collapsed",
+                                        )
+                                    with save_button_col:
+                                        if st.button(
+                                            "Save preset",
+                                            key=f"save_preset_{i}",
+                                            type="primary",
+                                            use_container_width=True,
+                                        ):
+                                            cleaned_name = custom_preset_name.strip()
+                                            if not cleaned_name:
+                                                st.error("Enter a preset name first.")
+                                            elif cleaned_name in BUILT_IN_TEXT_PRESETS:
+                                                st.error("Choose a different name; built-in presets cannot be overwritten.")
+                                            else:
+                                                preset_data.setdefault("presets", {})[cleaned_name] = editor_settings
+                                                save_text_presets_data(preset_data)
+                                                saved_gens[i]["text_preset_name"] = cleaned_name
+                                                save_generations(saved_gens)
+                                                st.success(f"Saved preset: {cleaned_name}")
+                                                st.rerun()
+                                    with delete_button_col:
+                                        can_delete_preset = selected_preset not in BUILT_IN_TEXT_PRESETS
+                                        if st.button(
+                                            "Delete",
+                                            key=f"delete_preset_{i}",
+                                            disabled=not can_delete_preset,
+                                            use_container_width=True,
+                                            help="Only custom presets can be deleted.",
+                                        ):
+                                            preset_data.get("presets", {}).pop(selected_preset, None)
+                                            if preset_data.get("default") == selected_preset:
+                                                preset_data["default"] = "Apple Compact"
+                                            save_text_presets_data(preset_data)
+                                            saved_gens[i]["text_preset_name"] = "Apple Compact"
+                                            save_generations(saved_gens)
+                                            st.rerun()
+
+                                    available_assets = sum(
+                                        1 for filename in EMOJI_ASSET_MAP.values()
+                                        if (EMOJI_ASSET_DIR / filename).exists()
+                                    )
+                                    st.caption(
+                                        f"Apple-style emoji PNGs found: {available_assets}/{len(EMOJI_ASSET_MAP)}. "
+                                        "The editor uses a PNG when the hook ends with a supported emoji."
+                                    )
+
+                                    apply_col, remove_col = st.columns(2)
+                                    apply_label = "🎨 Update text version" if has_processed_version else "🎨 Apply text"
+
+                                    if apply_col.button(apply_label, key=f"apply_text_{i}", type="primary", use_container_width=True):
+                                        with st.spinner("Applying your text settings with FFmpeg..."):
+                                            output_path, editor_warning = apply_text_with_ffmpeg(
+                                                video_url=video_url,
+                                                creation_id=creation_id,
+                                                hook=edited_hook.strip(),
+                                                settings=editor_settings,
+                                            )
+
+                                        if output_path:
+                                            old_path = result.get("processed_path")
+                                            if old_path and old_path != str(output_path):
+                                                try:
+                                                    Path(old_path).unlink(missing_ok=True)
+                                                except Exception:
+                                                    pass
+
+                                            saved_gens[i]["accepted_hook"] = edited_hook.strip()
+                                            saved_gens[i]["text_settings"] = editor_settings
+                                            saved_gens[i]["text_preset_name"] = selected_preset
+                                            saved_gens[i]["processed_path"] = str(output_path)
+                                            saved_gens[i]["processed_at"] = datetime.now().isoformat()
+                                            save_generations(saved_gens)
+                                            if editor_warning:
+                                                st.warning(editor_warning)
+                                            st.rerun()
+                                        else:
+                                            st.error(f"Text editor error: {editor_warning or 'Unknown error'}")
+
+                                    if has_processed_version and remove_col.button(
+                                        "🗑️ Remove text version",
+                                        key=f"remove_text_{i}",
+                                        use_container_width=True,
+                                    ):
+                                        old_path = result.get("processed_path")
+                                        if old_path:
+                                            try:
+                                                Path(old_path).unlink(missing_ok=True)
+                                            except Exception:
+                                                pass
+                                        saved_gens[i].pop("processed_path", None)
+                                        saved_gens[i].pop("processed_at", None)
+                                        save_generations(saved_gens)
+                                        st.rerun()
+
+                                    if result.get("hook_options"):
+                                        st.caption("Other generated hook options:")
+                                        for hook_option in result["hook_options"]:
+                                            st.caption(f"• {hook_option}")
+                                    if result.get("caption"):
+                                        st.caption(f"Caption: {result['caption']}")
+                                    if result.get("hashtags"):
+                                        st.caption(f"Hashtags: {result['hashtags']}")
 
 
         # Save any status updates
