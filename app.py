@@ -40,6 +40,7 @@ st.set_page_config(
 
 # ── Persistent storage ─────────────────────────────────────────────
 SAVE_FILE = Path("generations.json")
+PRESETS_FILE = Path("text_presets.json")
 PROCESSED_DIR = Path("processed_videos")
 EMOJI_ASSET_DIR = Path("emoji_assets")
 PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
@@ -73,8 +74,315 @@ DEFAULT_TEXT_SETTINGS = {
     "vertical_position_pct": 22,
     "outline_width": 2,
     "line_spacing_pct": 112,
-    "emoji_scale_pct": 105,
+    "emoji_size_px": 38,
 }
+
+BUILT_IN_TEXT_PRESETS = {
+    "Apple Compact": {
+        "font_size": 26,
+        "max_width_pct": 82,
+        "vertical_position_pct": 20,
+        "outline_width": 2,
+        "line_spacing_pct": 108,
+        "emoji_size_px": 34,
+    },
+    "TikTok Clean": {
+        "font_size": 30,
+        "max_width_pct": 76,
+        "vertical_position_pct": 21,
+        "outline_width": 2,
+        "line_spacing_pct": 112,
+        "emoji_size_px": 40,
+    },
+    "Minimal Small": {
+        "font_size": 23,
+        "max_width_pct": 86,
+        "vertical_position_pct": 24,
+        "outline_width": 1,
+        "line_spacing_pct": 106,
+        "emoji_size_px": 30,
+    },
+    "Bold Center": {
+        "font_size": 34,
+        "max_width_pct": 72,
+        "vertical_position_pct": 26,
+        "outline_width": 3,
+        "line_spacing_pct": 116,
+        "emoji_size_px": 46,
+    },
+}
+
+
+def inject_apple_glass_css():
+    """Apply a modern Apple-inspired glass UI without changing app behavior."""
+    st.markdown(
+        """
+        <style>
+        :root {
+            --glass-bg: rgba(255, 255, 255, 0.58);
+            --glass-border: rgba(255, 255, 255, 0.72);
+            --glass-shadow: 0 18px 45px rgba(15, 23, 42, 0.10);
+            --ink: #111827;
+            --muted: #667085;
+            --accent: #0A84FF;
+            --accent-2: #5E5CE6;
+        }
+
+        .stApp {
+            background:
+                radial-gradient(circle at 8% 0%, rgba(10,132,255,.17), transparent 30%),
+                radial-gradient(circle at 92% 8%, rgba(94,92,230,.15), transparent 27%),
+                radial-gradient(circle at 50% 100%, rgba(52,199,89,.10), transparent 32%),
+                linear-gradient(145deg, #f7f9fc 0%, #eef3f8 52%, #f8f9fb 100%);
+            color: var(--ink);
+        }
+
+        [data-testid="stAppViewContainer"] > .main {
+            background: transparent;
+        }
+
+        .block-container {
+            max-width: 1380px;
+            padding-top: 1.5rem;
+            padding-bottom: 4rem;
+        }
+
+        .apple-hero {
+            position: relative;
+            overflow: hidden;
+            padding: 28px 30px;
+            border-radius: 28px;
+            background: linear-gradient(135deg, rgba(255,255,255,.78), rgba(255,255,255,.46));
+            border: 1px solid rgba(255,255,255,.88);
+            box-shadow: 0 24px 60px rgba(15,23,42,.12);
+            backdrop-filter: blur(28px) saturate(160%);
+            -webkit-backdrop-filter: blur(28px) saturate(160%);
+            margin-bottom: 1.3rem;
+        }
+
+        .apple-hero:after {
+            content: "";
+            position: absolute;
+            width: 220px;
+            height: 220px;
+            right: -70px;
+            top: -90px;
+            border-radius: 999px;
+            background: linear-gradient(135deg, rgba(10,132,255,.30), rgba(94,92,230,.18));
+            filter: blur(8px);
+        }
+
+        .apple-hero h1 {
+            margin: 0;
+            font-size: clamp(2rem, 4vw, 3.4rem);
+            letter-spacing: -0.045em;
+            line-height: .98;
+            font-weight: 800;
+            color: #0b1220;
+        }
+
+        .apple-hero p {
+            margin: 12px 0 0 0;
+            color: #5f6b7a;
+            font-size: 1rem;
+            max-width: 720px;
+        }
+
+        .apple-kicker {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 7px 11px;
+            border-radius: 999px;
+            background: rgba(10,132,255,.10);
+            color: #0969c8;
+            font-weight: 700;
+            font-size: .78rem;
+            margin-bottom: 14px;
+        }
+
+        [data-testid="stSidebar"] {
+            background: rgba(246, 249, 252, .72);
+            border-right: 1px solid rgba(255,255,255,.85);
+            backdrop-filter: blur(28px) saturate(160%);
+            -webkit-backdrop-filter: blur(28px) saturate(160%);
+        }
+
+        [data-testid="stSidebar"] > div:first-child {
+            padding-top: 1.35rem;
+        }
+
+        div[data-testid="stExpander"],
+        div[data-testid="stVerticalBlockBorderWrapper"] {
+            border-radius: 22px !important;
+            border: 1px solid rgba(255,255,255,.86) !important;
+            background: rgba(255,255,255,.54) !important;
+            box-shadow: var(--glass-shadow);
+            backdrop-filter: blur(22px) saturate(145%);
+            -webkit-backdrop-filter: blur(22px) saturate(145%);
+        }
+
+        div[data-testid="stExpander"] details {
+            border: none !important;
+            background: transparent !important;
+        }
+
+        .stButton > button,
+        .stDownloadButton > button {
+            border-radius: 14px !important;
+            border: 1px solid rgba(255,255,255,.72) !important;
+            background: rgba(255,255,255,.72) !important;
+            color: #152033 !important;
+            box-shadow: 0 8px 22px rgba(15,23,42,.08) !important;
+            backdrop-filter: blur(16px);
+            font-weight: 700 !important;
+            transition: transform .16s ease, box-shadow .16s ease, background .16s ease;
+        }
+
+        .stButton > button:hover,
+        .stDownloadButton > button:hover {
+            transform: translateY(-1px);
+            background: rgba(255,255,255,.94) !important;
+            box-shadow: 0 12px 28px rgba(15,23,42,.13) !important;
+        }
+
+        .stButton > button[kind="primary"] {
+            color: white !important;
+            background: linear-gradient(135deg, #0A84FF, #5E5CE6) !important;
+            border: none !important;
+            box-shadow: 0 12px 28px rgba(10,132,255,.28) !important;
+        }
+
+        .stTextInput input,
+        .stTextArea textarea,
+        div[data-baseweb="select"] > div {
+            border-radius: 14px !important;
+            border: 1px solid rgba(148,163,184,.26) !important;
+            background: rgba(255,255,255,.72) !important;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,.75);
+        }
+
+        .stTextInput input:focus,
+        .stTextArea textarea:focus {
+            border-color: rgba(10,132,255,.55) !important;
+            box-shadow: 0 0 0 4px rgba(10,132,255,.11) !important;
+        }
+
+        [data-testid="stMetric"] {
+            padding: 16px 18px;
+            border-radius: 18px;
+            background: rgba(255,255,255,.58);
+            border: 1px solid rgba(255,255,255,.80);
+            box-shadow: 0 12px 30px rgba(15,23,42,.07);
+        }
+
+        [data-testid="stAlert"] {
+            border-radius: 16px !important;
+            border: 1px solid rgba(255,255,255,.72) !important;
+            backdrop-filter: blur(18px);
+        }
+
+        .preset-pill {
+            display: inline-block;
+            padding: 6px 10px;
+            border-radius: 999px;
+            background: rgba(10,132,255,.10);
+            color: #0969c8;
+            font-size: .78rem;
+            font-weight: 700;
+            margin-bottom: 8px;
+        }
+
+        h1, h2, h3 {
+            letter-spacing: -0.025em;
+        }
+
+        hr {
+            border-color: rgba(148,163,184,.18) !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def normalize_text_settings(settings: dict | None) -> dict:
+    """Migrate older saved settings and return a complete settings dictionary."""
+    normalized = dict(DEFAULT_TEXT_SETTINGS)
+    if settings:
+        normalized.update(settings)
+
+    # Migrate the older percentage-based emoji setting to a clear pixel size.
+    if "emoji_size_px" not in (settings or {}):
+        old_scale = int((settings or {}).get("emoji_scale_pct", 105))
+        font_size = int(normalized.get("font_size", 28))
+        normalized["emoji_size_px"] = max(18, round(font_size * old_scale / 100))
+
+    normalized.pop("emoji_scale_pct", None)
+    return normalized
+
+
+def load_text_presets_data() -> dict:
+    """Load custom text presets and the user's preferred default preset."""
+    data = {"default": "Apple Compact", "presets": {}}
+    if PRESETS_FILE.exists():
+        try:
+            loaded = json.loads(PRESETS_FILE.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data["default"] = loaded.get("default") or data["default"]
+                presets = loaded.get("presets")
+                if isinstance(presets, dict):
+                    data["presets"] = {
+                        str(name): normalize_text_settings(value)
+                        for name, value in presets.items()
+                        if isinstance(value, dict)
+                    }
+        except (json.JSONDecodeError, IOError):
+            pass
+    return data
+
+
+def save_text_presets_data(data: dict):
+    """Persist custom presets and the selected default preset."""
+    payload = {
+        "default": data.get("default") or "Apple Compact",
+        "presets": data.get("presets") or {},
+    }
+    try:
+        PRESETS_FILE.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except IOError:
+        pass
+
+
+def all_text_presets() -> tuple[dict, dict]:
+    """Return merged presets plus the raw persistent preset data."""
+    data = load_text_presets_data()
+    merged = {name: normalize_text_settings(value) for name, value in BUILT_IN_TEXT_PRESETS.items()}
+    merged.update(data.get("presets") or {})
+    return merged, data
+
+
+def default_text_settings_from_presets() -> tuple[dict, str]:
+    """Return settings for the global default preset."""
+    presets, data = all_text_presets()
+    default_name = data.get("default") or "Apple Compact"
+    if default_name not in presets:
+        default_name = "Apple Compact"
+    return dict(presets[default_name]), default_name
+
+
+def set_editor_widget_values(index: int, settings: dict):
+    """Load preset settings into the Streamlit editor widgets."""
+    normalized = normalize_text_settings(settings)
+    st.session_state[f"editor_size_{index}"] = int(normalized["font_size"])
+    st.session_state[f"editor_width_{index}"] = int(normalized["max_width_pct"])
+    st.session_state[f"editor_position_{index}"] = int(normalized["vertical_position_pct"])
+    st.session_state[f"editor_outline_{index}"] = int(normalized["outline_width"])
+    st.session_state[f"editor_spacing_{index}"] = int(normalized["line_spacing_pct"])
+    st.session_state[f"editor_emoji_{index}"] = int(normalized["emoji_size_px"])
 
 
 def load_generations() -> list[dict]:
@@ -194,7 +502,12 @@ def split_trailing_emojis(text: str) -> tuple[str, list[str]]:
 
 
 def load_emoji_png(emoji_char: str, target_height: int) -> Image.Image | None:
-    """Load and resize one Apple-style emoji PNG."""
+    """Load, tightly crop, and resize one Apple-style emoji PNG.
+
+    Cropping the transparent canvas first makes the emoji-size slider visually
+    accurate. The Swift exporter creates square PNGs with transparent padding,
+    so resizing the uncropped file made size changes look much smaller than they were.
+    """
     if not PIL_AVAILABLE:
         return None
     filename = EMOJI_ASSET_MAP.get(emoji_char)
@@ -206,6 +519,12 @@ def load_emoji_png(emoji_char: str, target_height: int) -> Image.Image | None:
 
     try:
         image = Image.open(path).convert("RGBA")
+        alpha = image.getchannel("A")
+        bbox = alpha.getbbox()
+        if bbox:
+            image = image.crop(bbox)
+
+        target_height = max(8, int(target_height))
         ratio = target_height / max(1, image.height)
         target_width = max(1, round(image.width * ratio))
         return image.resize((target_width, target_height), Image.Resampling.LANCZOS)
@@ -276,12 +595,13 @@ def create_hook_overlay_png(
     width, height = canvas_size
     text_only, emojis = split_trailing_emojis(hook)
 
+    settings = normalize_text_settings(settings)
     requested_size = int(settings.get("font_size", DEFAULT_TEXT_SETTINGS["font_size"]))
     max_width = int(width * int(settings.get("max_width_pct", 78)) / 100)
     top_y = int(height * int(settings.get("vertical_position_pct", 22)) / 100)
     stroke_width = int(settings.get("outline_width", 2))
     line_spacing_pct = int(settings.get("line_spacing_pct", 112))
-    emoji_scale_pct = int(settings.get("emoji_scale_pct", 105))
+    emoji_size_px = int(settings.get("emoji_size_px", DEFAULT_TEXT_SETTINGS["emoji_size_px"]))
 
     font_path = get_overlay_font()
     overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
@@ -315,7 +635,9 @@ def create_hook_overlay_png(
     base_line_height = max(h for _, h in line_metrics)
     line_step = max(base_line_height + 2, round(base_line_height * line_spacing_pct / 100))
 
-    emoji_height = max(18, round(actual_size * emoji_scale_pct / 100))
+    # Emoji size is an explicit pixel value, so every slider movement produces
+    # an obvious, deterministic change independent of the selected text size.
+    emoji_height = max(12, emoji_size_px)
     emoji_images = [load_emoji_png(e, emoji_height) for e in emojis]
     missing_emojis = [e for e, img in zip(emojis, emoji_images) if img is None]
     emoji_images = [img for img in emoji_images if img is not None]
@@ -1000,9 +1322,19 @@ def get_secret(key: str) -> str:
 
 
 def main():
+    inject_apple_glass_css()
+
     # ── Header ──
-    st.title("🎬 Seedance Video Generator")
-    st.caption("Paste product links → pick photos → generate videos (or get prompts)")
+    st.markdown(
+        """
+        <section class="apple-hero">
+            <div class="apple-kicker">✦ AI VIDEO WORKSPACE</div>
+            <h1>Seedance Studio</h1>
+            <p>Turn TikTok Shop products into finished vertical videos, then refine the text styling with reusable presets and Apple-style emoji overlays.</p>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
 
     # ── Sidebar ──
     with st.sidebar:
@@ -1700,8 +2032,63 @@ repeat these steps to get a fresh one.
                         "then click Apply / Update Text to create a separate version."
                     )
 
-                    stored_settings = dict(DEFAULT_TEXT_SETTINGS)
-                    stored_settings.update(result.get("text_settings") or {})
+                    presets, preset_data = all_text_presets()
+                    default_preset_settings, default_preset_name = default_text_settings_from_presets()
+
+                    if result.get("text_settings"):
+                        stored_settings = normalize_text_settings(result.get("text_settings"))
+                    else:
+                        stored_settings = dict(default_preset_settings)
+
+                    active_preset_name = result.get("text_preset_name") or default_preset_name
+                    if active_preset_name not in presets:
+                        active_preset_name = default_preset_name
+
+                    # Initialize each editor once. Preset buttons update these keys
+                    # before the sliders render, so the selected style loads cleanly.
+                    widget_keys = [
+                        f"editor_size_{i}",
+                        f"editor_width_{i}",
+                        f"editor_position_{i}",
+                        f"editor_outline_{i}",
+                        f"editor_spacing_{i}",
+                        f"editor_emoji_{i}",
+                    ]
+                    if not any(key in st.session_state for key in widget_keys):
+                        set_editor_widget_values(i, stored_settings)
+
+                    st.markdown('<span class="preset-pill">TEXT STYLE PRESETS</span>', unsafe_allow_html=True)
+                    preset_col, load_col, default_col = st.columns([2.2, 1, 1.25])
+                    with preset_col:
+                        selected_preset = st.selectbox(
+                            "Preset",
+                            options=list(presets.keys()),
+                            index=list(presets.keys()).index(active_preset_name),
+                            key=f"preset_select_{i}",
+                            help="Load a saved style across any completed video.",
+                        )
+                    with load_col:
+                        st.write("")
+                        if st.button(
+                            "Load",
+                            key=f"load_preset_{i}",
+                            use_container_width=True,
+                        ):
+                            set_editor_widget_values(i, presets[selected_preset])
+                            saved_gens[i]["text_preset_name"] = selected_preset
+                            save_generations(saved_gens)
+                            st.rerun()
+                    with default_col:
+                        st.write("")
+                        if st.button(
+                            "Use by default",
+                            key=f"default_preset_{i}",
+                            use_container_width=True,
+                            help="New text editors will start with this preset.",
+                        ):
+                            preset_data["default"] = selected_preset
+                            save_text_presets_data(preset_data)
+                            st.success(f"{selected_preset} is now your default preset.")
 
                     edited_hook = st.text_area(
                         "Hook text",
@@ -1716,17 +2103,15 @@ repeat these steps to get a fresh one.
                             "Text size",
                             min_value=16,
                             max_value=48,
-                            value=int(stored_settings["font_size"]),
                             step=1,
                             key=f"editor_size_{i}",
-                            help="28 is the smaller default. Move left for even smaller text.",
+                            help="Font height in pixels. 24–30 usually matches compact TikTok text.",
                         )
                     with width_col:
                         max_width_pct = st.slider(
                             "Text width",
                             min_value=45,
                             max_value=92,
-                            value=int(stored_settings["max_width_pct"]),
                             step=1,
                             key=f"editor_width_{i}",
                             help="A wider text box creates fewer lines.",
@@ -1736,7 +2121,6 @@ repeat these steps to get a fresh one.
                             "Vertical position",
                             min_value=8,
                             max_value=60,
-                            value=int(stored_settings["vertical_position_pct"]),
                             step=1,
                             key=f"editor_position_{i}",
                             help="Percentage down from the top of the video.",
@@ -1748,7 +2132,6 @@ repeat these steps to get a fresh one.
                             "Outline thickness",
                             min_value=1,
                             max_value=5,
-                            value=int(stored_settings["outline_width"]),
                             step=1,
                             key=f"editor_outline_{i}",
                         )
@@ -1757,28 +2140,72 @@ repeat these steps to get a fresh one.
                             "Line spacing",
                             min_value=95,
                             max_value=145,
-                            value=int(stored_settings["line_spacing_pct"]),
                             step=1,
                             key=f"editor_spacing_{i}",
                         )
                     with emoji_col:
-                        emoji_scale_pct = st.slider(
+                        emoji_size_px = st.slider(
                             "Emoji size",
-                            min_value=70,
-                            max_value=145,
-                            value=int(stored_settings["emoji_scale_pct"]),
-                            step=5,
+                            min_value=18,
+                            max_value=90,
+                            step=2,
                             key=f"editor_emoji_{i}",
+                            help="Exact visible emoji height in pixels. Transparent padding is removed before resizing.",
                         )
 
-                    editor_settings = {
+                    editor_settings = normalize_text_settings({
                         "font_size": font_size,
                         "max_width_pct": max_width_pct,
                         "vertical_position_pct": vertical_position_pct,
                         "outline_width": outline_width,
                         "line_spacing_pct": line_spacing_pct,
-                        "emoji_scale_pct": emoji_scale_pct,
-                    }
+                        "emoji_size_px": emoji_size_px,
+                    })
+
+                    st.markdown('<span class="preset-pill">SAVE THIS STYLE</span>', unsafe_allow_html=True)
+                    save_name_col, save_button_col, delete_button_col = st.columns([2.2, 1, 1])
+                    with save_name_col:
+                        custom_preset_name = st.text_input(
+                            "Preset name",
+                            placeholder="My favorite style",
+                            key=f"custom_preset_name_{i}",
+                            label_visibility="collapsed",
+                        )
+                    with save_button_col:
+                        if st.button(
+                            "Save preset",
+                            key=f"save_preset_{i}",
+                            type="primary",
+                            use_container_width=True,
+                        ):
+                            cleaned_name = custom_preset_name.strip()
+                            if not cleaned_name:
+                                st.error("Enter a preset name first.")
+                            elif cleaned_name in BUILT_IN_TEXT_PRESETS:
+                                st.error("Choose a different name; built-in presets cannot be overwritten.")
+                            else:
+                                preset_data.setdefault("presets", {})[cleaned_name] = editor_settings
+                                save_text_presets_data(preset_data)
+                                saved_gens[i]["text_preset_name"] = cleaned_name
+                                save_generations(saved_gens)
+                                st.success(f"Saved preset: {cleaned_name}")
+                                st.rerun()
+                    with delete_button_col:
+                        can_delete_preset = selected_preset not in BUILT_IN_TEXT_PRESETS
+                        if st.button(
+                            "Delete",
+                            key=f"delete_preset_{i}",
+                            disabled=not can_delete_preset,
+                            use_container_width=True,
+                            help="Only custom presets can be deleted.",
+                        ):
+                            preset_data.get("presets", {}).pop(selected_preset, None)
+                            if preset_data.get("default") == selected_preset:
+                                preset_data["default"] = "Apple Compact"
+                            save_text_presets_data(preset_data)
+                            saved_gens[i]["text_preset_name"] = "Apple Compact"
+                            save_generations(saved_gens)
+                            st.rerun()
 
                     available_assets = sum(
                         1 for filename in EMOJI_ASSET_MAP.values()
@@ -1811,6 +2238,7 @@ repeat these steps to get a fresh one.
 
                             saved_gens[i]["accepted_hook"] = edited_hook.strip()
                             saved_gens[i]["text_settings"] = editor_settings
+                            saved_gens[i]["text_preset_name"] = selected_preset
                             saved_gens[i]["processed_path"] = str(output_path)
                             saved_gens[i]["processed_at"] = datetime.now().isoformat()
                             save_generations(saved_gens)
