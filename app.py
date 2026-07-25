@@ -1389,30 +1389,36 @@ Return ONLY valid JSON (no markdown, no backticks):
 {{"product_name": "...", "hook_options": ["hook 1", "hook 2", "hook 3", "hook 4", "hook 5"], "caption": "...", "hashtags": "#tag1 #tag2", "sound_tip": "..."}}"""
 
 WAREHOUSE_PROMPT_SYSTEM = """You are a TikTok Shop affiliate content producer. Write a
-Seedance 2.0 prompt for the Warehouse walk-up deal-drop style.
+Seedance 2.0 prompt for the Warehouse close walk-up deal-drop style.
 
 HARD RULES:
-- 9:16 vertical, exactly about 5 seconds, TikTok UGC phone footage.
+- 9:16 vertical, exactly about 5 seconds, raw TikTok UGC phone footage.
 - COMPLETELY SILENT: no audio, no voiceover, no narration.
-- ONE continuous shot with zero cuts, jumps, scene changes, montage, pan, tilt, orbit, or look-around.
+- ONE continuous take with zero cuts, jumps, scene changes, montage, orbit, or dramatic camera moves.
 - Pure first-person shopper POV. No people, hands, face, body, characters, or animals.
-- The camera walks straight toward a warehouse bulk product display at a normal walking pace.
-- Start 6-8 feet back with the full display visible; finish close with products filling about 90% of frame.
-- Natural gait bounce and handheld micro-shake; chest/hip-height phone perspective.
-- Warehouse club environment: high industrial ceiling, exposed beams, bright fluorescent lighting,
-  polished concrete floor, orange and teal metal racking, generic adjacent bulk merchandise on pallets.
-- Display multiple units on a pallet, branded cardboard shipper, shelf, or wire bin. Match the supplied
-  reference images exactly for product packaging, colors, proportions, labels, finish, and branding.
-- ZERO rendered text: no captions, subtitles, overlays, prices, promotional signs, watermarks, or invented
-  writing. Existing physical branding printed on the real product packaging is the only exception.
+- Begin already close to the warehouse display, about 3-4 feet away or only 1-2 natural walking steps away.
+- In the opening frame, the full pallet/display is already easy to see and occupies roughly 55-70% of the frame.
+  This is NOT a distant establishing shot and must never begin 6-8 feet away.
+- Walk forward slowly for only 1-2 steps until the products occupy roughly 80-90% of the frame.
+- Slightly off-center aisle discovery at the start, then a subtle natural straighten toward the product.
+- Natural vertical gait bounce, tiny side-to-side drift, handheld micro-shake, and a gentle walking stop.
+  Chest-height phone perspective with a mildly wide phone lens; no polished gimbal movement.
+- Keep the product display centered in the lower/middle frame while some ceiling, racking, adjacent pallets,
+  and polished concrete remain visible for warehouse context.
+- Warehouse club environment: high industrial ceiling, exposed beams, fluorescent lighting, polished concrete,
+  orange/teal metal racking, and generic adjacent bulk merchandise.
+- Show abundant repeated units in a real pallet display, branded cardboard shipper, shelf, or wire bin. Match all
+  supplied reference images exactly for packaging, colors, proportions, labels, finish, logo, and product shape.
+- ZERO rendered overlay text: no captions, subtitles, prices, sale signs, promotional graphics, or watermarks.
+  Existing physical branding printed on the actual product packaging is allowed.
 - Prompt must be under 1,900 characters.
 
 Required structure inside the prompt:
-[00:00-00:02] Wide approach: slightly angled aisle discovery, full bulk display and warehouse context visible.
-Camera walks steadily toward the display.
-[00:02-00:05] Close arrival: camera straightens and reaches the display; multiple units and real packaging
-fill the frame, with labels and product details legible; natural walking-pace stop.
-End with a NEGATIVE sentence repeating no people/hands/body, no cuts, no audio, and no rendered text/signs.
+[00:00-00:02] Close aisle discovery: camera is already only a few feet from the complete display. The pallet or
+shipper fills most of the vertical frame while warehouse surroundings remain visible. Begin a slow 1-2 step approach.
+[00:02-00:05] Tight arrival: continue the short approach until repeated products and authentic packaging dominate
+the frame. Labels and product details are clear. End with a natural handheld walking stop, not a zoom.
+End with a NEGATIVE sentence repeating no people/hands/body, no cuts, no audio, no rendered overlay text, and no zoom.
 
 Return ONLY valid JSON (no markdown, no backticks):
 {{"product_name": "...", "prompt": "the full Seedance prompt under 1900 characters", "char_count": 123}}"""
@@ -1985,11 +1991,13 @@ def write_prompt(
 GENERATE_SYSTEM = """You are a video production assistant. You have access to Magnific tools.
 
 Your job:
-1. Upload every provided product reference image to Magnific using creations_upload_image.
+1. Upload every provided product image to Magnific using creations_upload_image.
 2. Generate a video using video_generate with:
    - The prompt provided
-   - The first uploaded creation as the primary image reference
-   - Any additional uploaded creations as supporting reference images when the tool supports multiple references
+   - EVERY uploaded image attached only as a general image/reference input for visual accuracy
+   - NEVER use start_image, start frame, first frame, initial frame, end frame, or keyframe mode
+   - Do not make any uploaded image the opening frame of the video
+   - Reference image 1 may receive the highest packaging-accuracy priority, but it is still only a general reference
    - Model slug: bytedance-seedance-fast-2.0
    - Aspect ratio: 9:16, resolution: 720p
    - Duration as specified
@@ -2029,8 +2037,10 @@ def generate_video(
             messages=[{
                 "role": "user",
                 "content": (
-                    f"Upload every reference image below and generate a {duration}s video.\n"
-                    f"Use Reference image 1 as the primary reference and the others for product accuracy.\n"
+                    f"Upload every image below and generate a {duration}s video.\n"
+                    f"Attach ALL uploaded images only as general image/reference inputs. "
+                    f"NEVER use any image as a start frame, start_image, initial frame, end frame, or keyframe.\n"
+                    f"Image 1 has the highest product-accuracy priority, but it must still remain a general reference only.\n"
                     f"{refs_text}\n\n"
                     f"Prompt:\n{prompt}"
                 ),
