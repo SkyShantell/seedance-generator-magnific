@@ -20,7 +20,7 @@ import shutil
 import subprocess
 import tempfile
 from datetime import datetime
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 from html import unescape as html_unescape
 from pathlib import Path
 
@@ -1510,18 +1510,109 @@ def resolved_style_duration(style: str, selected_duration: int = 15) -> int:
 # ═══════════════════════════════════════════════════════════════════
 
 def _name_from_url(url: str) -> str:
-    parsed = urlparse(url)
-    parts = parsed.path.strip("/").split("/")
-    best = ""
-    for part in parts:
-        if len(part) < 5 or part.isdigit() or part.lower() in ("us", "pdp", "dp", "ip", "product"):
+    """Build a readable product name from a TikTok product URL slug."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return "Unknown Product"
+
+    ignored = {
+        "us", "uk", "ca", "au", "pdp", "dp", "ip", "product", "products",
+        "shop", "t", "view", "detail", "item", "share",
+    }
+    candidates = []
+    for raw_part in parsed.path.strip("/").split("/"):
+        part = unquote(raw_part).strip()
+        lowered = part.lower()
+        if not part or lowered in ignored or part.isdigit():
             continue
-        if len(part) > len(best):
-            best = part
-    if best:
-        words = best.replace("-", " ").replace("_", " ").split()[:10]
-        return " ".join(words).title()
-    return "Unknown Product"
+        # Remove a trailing product ID when TikTok appends it to the slug.
+        part = re.sub(r"[-_]?\d{10,}$", "", part).strip("-_")
+        if len(part) < 4 or not re.search(r"[A-Za-z]", part):
+            continue
+        # Do not mistake TikTok short-link/share tokens for product names.
+        if "-" not in part and "_" not in part and re.fullmatch(r"(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9]{6,18}", part):
+            continue
+        candidates.append(part)
+
+    if not candidates:
+        return "Unknown Product"
+
+    best = max(candidates, key=lambda value: (value.count("-") + value.count("_"), len(value)))
+    words = re.sub(r"[-_]+", " ", best)
+    words = re.sub(r"\s+", " ", words).strip()
+    words = " ".join(words.split()[:16])
+    return words.title() if words else "Unknown Product"
+
+
+def _extract_meta_candidates(html: str):
+    """Read title-like values from meta/link tags regardless of attribute order."""
+    names = []
+    urls = []
+
+    for tag in re.findall(r"<meta\b[^>]*>", html, flags=re.IGNORECASE):
+        attrs = dict(
+            (key.lower(), html_unescape(value))
+            for key, _quote, value in re.findall(
+                r"([A-Za-z_:][-A-Za-z0-9_:.]*)\s*=\s*([\"'])(.*?)\2",
+                tag,
+                flags=re.DOTALL,
+            )
+        )
+        marker = (attrs.get("property") or attrs.get("name") or attrs.get("itemprop") or "").lower()
+        content = (attrs.get("content") or "").strip()
+        if not content:
+            continue
+        if marker in {"og:title", "twitter:title", "title", "product:name", "product_title"}:
+            names.append(content)
+        elif marker in {"og:url", "twitter:url"}:
+            urls.append(content)
+
+    for tag in re.findall(r"<link\b[^>]*>", html, flags=re.IGNORECASE):
+        attrs = dict(
+            (key.lower(), html_unescape(value))
+            for key, _quote, value in re.findall(
+                r"([A-Za-z_:][-A-Za-z0-9_:.]*)\s*=\s*([\"'])(.*?)\2",
+                tag,
+                flags=re.DOTALL,
+            )
+        )
+        if (attrs.get("rel") or "").lower() == "canonical" and attrs.get("href"):
+            urls.append(attrs["href"].strip())
+
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
+    if title_match:
+        names.append(re.sub(r"<[^>]+>", " ", title_match.group(1)))
+
+    return names, urls
+
+
+def _extract_raw_title_candidates(html: str):
+    """Find product-title fields in TikTok hydration blobs, including escaped JSON."""
+    candidates = []
+    keys = (
+        "product_name", "productName", "product_title", "productTitle",
+        "item_name", "itemName", "item_title", "itemTitle",
+        "display_name", "displayName", "seo_title", "seoTitle",
+    )
+    key_pattern = "|".join(re.escape(key) for key in keys)
+    patterns = [
+        rf'["\'](?:{key_pattern})["\']\s*:\s*["\']([^"\']{{4,220}})["\']',
+        rf'\\["\'](?:{key_pattern})\\["\']\s*:\s*\\["\'](.{{4,220}}?)\\["\']',
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, html, flags=re.IGNORECASE | re.DOTALL):
+            value = match.group(1)
+            value = value.replace("\\u002F", "/").replace("\\/", "/")
+            try:
+                value = bytes(value, "utf-8").decode("unicode_escape")
+            except Exception:
+                pass
+            value = html_unescape(value)
+            value = re.sub(r"\s+", " ", value).strip()
+            if value:
+                candidates.append(value)
+    return candidates
 
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".avif")
@@ -1675,24 +1766,12 @@ def scrape_product(url: str) -> dict | None:
                 html, re.IGNORECASE
             )
 
-        # og:title
-        title_match = re.search(
-            r'<meta\s+(?:property|name)=["\']og:title["\']\s+content=["\']([^"\']+)["\']',
-            html, re.IGNORECASE
-        )
-        if not title_match:
-            title_match = re.search(
-                r'content=["\']([^"\']+)["\']\s+(?:property|name)=["\']og:title["\']',
-                html, re.IGNORECASE
-            )
-        if not title_match:
-            title_match = re.search(r'<title>([^<]+)</title>', html, re.IGNORECASE)
+        meta_name_candidates, meta_url_candidates = _extract_meta_candidates(html)
 
         listing_images = []
         review_images = []
-        name_candidates = []
-        if title_match:
-            name_candidates.append(title_match.group(1).strip())
+        name_candidates = list(meta_name_candidates)
+        name_candidates.extend(_extract_raw_title_candidates(html))
         if img_match:
             listing_images.append(img_match.group(1))
 
@@ -1757,7 +1836,15 @@ def scrape_product(url: str) -> dict | None:
 
         name = _best_product_name(name_candidates)
         if not name or name == "Unknown Product":
-            name = _name_from_url(url)
+            # Short share links often redirect to a full PDP URL containing the product slug.
+            fallback_urls = [resp.url] + meta_url_candidates + [url]
+            for fallback_url in fallback_urls:
+                candidate_name = _name_from_url(fallback_url)
+                if candidate_name and candidate_name != "Unknown Product":
+                    name = candidate_name
+                    break
+        if not name:
+            name = "Unknown Product"
 
         return {
             "name": name[:100],
@@ -2251,12 +2338,17 @@ def main():
             st.markdown("---")
 
             detected_name = product.get("name") or "Unknown Product"
+            product_fingerprint = hashlib.sha1(
+                product.get("source_url", str(idx)).encode("utf-8")
+            ).hexdigest()[:10]
+            product_name_key = f"product_name_{idx}_{product_fingerprint}"
+            if product_name_key not in st.session_state:
+                st.session_state[product_name_key] = "" if detected_name == "Unknown Product" else detected_name
             edited_name = st.text_input(
                 "Product name",
-                value="" if detected_name == "Unknown Product" else detected_name,
                 placeholder="Type the product name if TikTok did not provide it",
-                key=f"product_name_{idx}",
-                help="You can always correct the detected name before hooks or prompts are generated.",
+                key=product_name_key,
+                help="The app fills this automatically when TikTok exposes a title. You can still correct it here.",
             ).strip()
             if not edited_name:
                 edited_name = detected_name
@@ -2276,6 +2368,17 @@ def main():
                 f"Review/customer photos ({len(review_images)})",
             ])
 
+            listing_state_key = f"listing_refs_{idx}"
+            review_state_key = f"review_refs_{idx}"
+            primary_state_key = f"primary_reference_url_{idx}"
+
+            if listing_state_key not in st.session_state:
+                st.session_state[listing_state_key] = [0] if listing_images else []
+            if review_state_key not in st.session_state:
+                st.session_state[review_state_key] = []
+
+            st.caption("Click **Select** on any images you want to use. Click **Make primary** on the main image you want Seedance to follow most closely.")
+
             with listing_tab:
                 if listing_images:
                     listing_cols = st.columns(4)
@@ -2285,15 +2388,44 @@ def main():
                                 st.image(image_url, use_container_width=True, caption=f"Listing {image_index + 1}")
                             except Exception:
                                 st.caption(f"Listing {image_index + 1}: {image_url[:45]}...")
-                    selected_listing_indices = st.multiselect(
-                        "Select listing references",
-                        options=list(range(len(listing_images))),
-                        default=[0],
-                        format_func=lambda value: f"Listing {value + 1}",
-                        key=f"listing_refs_{idx}",
-                    )
+
+                            is_selected = image_index in st.session_state.get(listing_state_key, [])
+                            is_primary = st.session_state.get(primary_state_key) == image_url
+                            if is_primary:
+                                st.success("Primary reference")
+                            elif is_selected:
+                                st.info("Selected")
+                            else:
+                                st.caption("Not selected")
+
+                            select_col, primary_col = st.columns(2)
+                            with select_col:
+                                if st.button(
+                                    "Deselect" if is_selected else "Select",
+                                    key=f"listing_toggle_{idx}_{image_index}",
+                                    use_container_width=True,
+                                ):
+                                    selected_items = list(st.session_state.get(listing_state_key, []))
+                                    if image_index in selected_items:
+                                        selected_items.remove(image_index)
+                                        if st.session_state.get(primary_state_key) == image_url:
+                                            st.session_state[primary_state_key] = None
+                                    else:
+                                        selected_items.append(image_index)
+                                        if not st.session_state.get(primary_state_key):
+                                            st.session_state[primary_state_key] = image_url
+                                    st.session_state[listing_state_key] = selected_items
+                                    st.rerun()
+                            with primary_col:
+                                if st.button(
+                                    "Make primary",
+                                    key=f"listing_primary_{idx}_{image_index}",
+                                    disabled=not is_selected or is_primary,
+                                    use_container_width=True,
+                                ):
+                                    st.session_state[primary_state_key] = image_url
+                                    st.rerun()
                 else:
-                    selected_listing_indices = []
                     st.info("No official listing photos were exposed by this page.")
 
             with review_tab:
@@ -2305,16 +2437,44 @@ def main():
                                 st.image(image_url, use_container_width=True, caption=f"Review {image_index + 1}")
                             except Exception:
                                 st.caption(f"Review {image_index + 1}: {image_url[:45]}...")
-                    selected_review_indices = st.multiselect(
-                        "Select review/customer references",
-                        options=list(range(len(review_images))),
-                        default=[],
-                        format_func=lambda value: f"Review {value + 1}",
-                        key=f"review_refs_{idx}",
-                        help="Customer photos can help preserve the real size, finish, packaging, and in-hand appearance.",
-                    )
+
+                            is_selected = image_index in st.session_state.get(review_state_key, [])
+                            is_primary = st.session_state.get(primary_state_key) == image_url
+                            if is_primary:
+                                st.success("Primary reference")
+                            elif is_selected:
+                                st.info("Selected")
+                            else:
+                                st.caption("Not selected")
+
+                            select_col, primary_col = st.columns(2)
+                            with select_col:
+                                if st.button(
+                                    "Deselect" if is_selected else "Select",
+                                    key=f"review_toggle_{idx}_{image_index}",
+                                    use_container_width=True,
+                                ):
+                                    selected_items = list(st.session_state.get(review_state_key, []))
+                                    if image_index in selected_items:
+                                        selected_items.remove(image_index)
+                                        if st.session_state.get(primary_state_key) == image_url:
+                                            st.session_state[primary_state_key] = None
+                                    else:
+                                        selected_items.append(image_index)
+                                        if not st.session_state.get(primary_state_key):
+                                            st.session_state[primary_state_key] = image_url
+                                    st.session_state[review_state_key] = selected_items
+                                    st.rerun()
+                            with primary_col:
+                                if st.button(
+                                    "Make primary",
+                                    key=f"review_primary_{idx}_{image_index}",
+                                    disabled=not is_selected or is_primary,
+                                    use_container_width=True,
+                                ):
+                                    st.session_state[primary_state_key] = image_url
+                                    st.rerun()
                 else:
-                    selected_review_indices = []
                     st.info("TikTok did not expose review photos in the public page data. You can paste direct review-photo URLs below.")
 
                 manual_review_urls_text = st.text_area(
@@ -2323,6 +2483,15 @@ def main():
                     height=90,
                     key=f"manual_review_urls_{idx}",
                 )
+
+            selected_listing_indices = [
+                image_index for image_index in st.session_state.get(listing_state_key, [])
+                if 0 <= image_index < len(listing_images)
+            ]
+            selected_review_indices = [
+                image_index for image_index in st.session_state.get(review_state_key, [])
+                if 0 <= image_index < len(review_images)
+            ]
 
             selected_candidates = []
             for image_index in selected_listing_indices:
@@ -2342,19 +2511,21 @@ def main():
                 fallback_images = listing_images or review_images or product.get("images", [])
                 if fallback_images:
                     selected_candidates = [("Automatic fallback", fallback_images[0])]
+                    st.session_state[primary_state_key] = fallback_images[0]
                     st.info("No references were selected, so the first available image will be used.")
 
             if selected_candidates:
-                primary_index = st.selectbox(
-                    "Primary reference image",
-                    options=list(range(len(selected_candidates))),
-                    format_func=lambda value, choices=selected_candidates: choices[value][0],
-                    key=f"primary_reference_{idx}",
-                    help="The primary reference controls the main product appearance. Other selections are supporting references.",
-                )
-                ordered_candidates = [selected_candidates[primary_index]] + [
-                    candidate for candidate_index, candidate in enumerate(selected_candidates)
-                    if candidate_index != primary_index
+                primary_reference_url = st.session_state.get(primary_state_key)
+                if not any(url == primary_reference_url for _label, url in selected_candidates):
+                    primary_reference_url = selected_candidates[0][1]
+                    st.session_state[primary_state_key] = primary_reference_url
+
+                ordered_candidates = [
+                    candidate for candidate in selected_candidates
+                    if candidate[1] == primary_reference_url
+                ] + [
+                    candidate for candidate in selected_candidates
+                    if candidate[1] != primary_reference_url
                 ]
                 selections[idx] = [url for _label, url in ordered_candidates]
                 st.caption(f"Using {len(selections[idx])} reference image(s). Primary: {ordered_candidates[0][0]}")
