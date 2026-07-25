@@ -2487,7 +2487,14 @@ def main():
 
     if "runtime_anthropic_api_key" not in st.session_state:
         st.session_state["runtime_anthropic_api_key"] = api_key_from_secrets
+    elif not st.session_state.get("runtime_anthropic_api_key") and api_key_from_secrets:
+        # Recover automatically if a previous widget rerun blanked the session value.
+        st.session_state["runtime_anthropic_api_key"] = api_key_from_secrets
+
     if "runtime_magnific_token" not in st.session_state:
+        st.session_state["runtime_magnific_token"] = token_from_secrets
+    elif not st.session_state.get("runtime_magnific_token") and token_from_secrets:
+        # The saved Streamlit secret is authoritative unless the user explicitly applies an override.
         st.session_state["runtime_magnific_token"] = token_from_secrets
 
     with st.container(border=True):
@@ -2570,22 +2577,58 @@ def main():
             if api_key_from_secrets:
                 st.success("Anthropic API key loaded from Streamlit secrets.")
             else:
-                st.session_state["runtime_anthropic_api_key"] = st.text_input(
+                anthropic_candidate = st.text_input(
                     "Anthropic API Key",
                     type="password",
-                    value=st.session_state.get("runtime_anthropic_api_key", ""),
-                    key="runtime_anthropic_api_key_input",
+                    value="",
+                    key="anthropic_api_key_candidate",
+                    placeholder="Paste a key only when you need to replace the current one",
                 )
+                if st.button("Use new Anthropic key", key="apply_anthropic_key", use_container_width=True):
+                    if anthropic_candidate.strip():
+                        st.session_state["runtime_anthropic_api_key"] = anthropic_candidate.strip()
+                        st.success("Anthropic key updated for this app session.")
+                        st.rerun()
+                    else:
+                        st.warning("Paste a key first.")
 
-            st.session_state["runtime_magnific_token"] = st.text_input(
-                "Magnific token",
+            if token_from_secrets and st.session_state.get("runtime_magnific_token") == token_from_secrets:
+                st.success("Magnific token loaded from Streamlit secrets.")
+            elif st.session_state.get("runtime_magnific_token"):
+                st.success("Magnific token override is active for this app session.")
+            else:
+                st.warning("No Magnific token is currently active.")
+
+            magnific_candidate = st.text_input(
+                "Replace Magnific token (optional)",
                 type="password",
-                value=st.session_state.get("runtime_magnific_token", ""),
-                key="runtime_magnific_token_input",
-                help="Paste a refreshed token here whenever Magnific authentication expires.",
+                value="",
+                key="magnific_token_candidate",
+                placeholder="Leave blank to keep using the saved token",
+                help="This field never overwrites the working token unless you click Use new token.",
             )
-            magnific_token = st.session_state.get("runtime_magnific_token", "")
-            api_key = st.session_state.get("runtime_anthropic_api_key", "")
+            token_action_col1, token_action_col2 = st.columns(2)
+            with token_action_col1:
+                if st.button("Use new token", key="apply_magnific_token", type="primary", use_container_width=True):
+                    if magnific_candidate.strip():
+                        st.session_state["runtime_magnific_token"] = magnific_candidate.strip()
+                        st.success("Magnific token updated for this app session.")
+                        st.rerun()
+                    else:
+                        st.warning("Paste a token first.")
+            with token_action_col2:
+                if st.button(
+                    "Restore saved secret",
+                    key="restore_magnific_secret",
+                    disabled=not bool(token_from_secrets),
+                    use_container_width=True,
+                ):
+                    st.session_state["runtime_magnific_token"] = token_from_secrets
+                    st.success("Restored the Magnific token from Streamlit secrets.")
+                    st.rerun()
+
+            magnific_token = st.session_state.get("runtime_magnific_token") or token_from_secrets
+            api_key = st.session_state.get("runtime_anthropic_api_key") or api_key_from_secrets
 
             st.markdown("**How to refresh the Magnific token**")
             st.markdown("""
