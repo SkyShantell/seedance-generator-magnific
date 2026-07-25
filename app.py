@@ -202,7 +202,7 @@ def inject_apple_glass_css():
         .apple-hero {
             position: relative;
             overflow: hidden;
-            padding: 30px 32px;
+            padding: 22px 26px;
             border-radius: 28px;
             background:
                 linear-gradient(145deg, rgba(31, 37, 51, .90), rgba(18, 22, 31, .76));
@@ -210,7 +210,7 @@ def inject_apple_glass_css():
             box-shadow: var(--glass-shadow);
             backdrop-filter: blur(30px) saturate(145%);
             -webkit-backdrop-filter: blur(30px) saturate(145%);
-            margin-bottom: 1.35rem;
+            margin-bottom: .95rem;
         }
 
         .apple-hero:before {
@@ -238,7 +238,7 @@ def inject_apple_glass_css():
             position: relative;
             z-index: 1;
             margin: 0;
-            font-size: clamp(2rem, 4vw, 3.4rem);
+            font-size: clamp(2rem, 3.2vw, 2.8rem);
             letter-spacing: -0.045em;
             line-height: .98;
             font-weight: 800;
@@ -248,7 +248,7 @@ def inject_apple_glass_css():
         .apple-hero p {
             position: relative;
             z-index: 1;
-            margin: 14px 0 0 0;
+            margin: 10px 0 0 0;
             color: #b1b9c8 !important;
             font-size: 1rem;
             max-width: 760px;
@@ -327,6 +327,15 @@ def inject_apple_glass_css():
         [data-testid="stSidebar"] [data-testid="stCaptionContainer"] *,
         [data-testid="stSidebar"] small {
             color: var(--muted) !important;
+        }
+
+        /* This version keeps all controls in the main workspace. Hide the unused
+           Streamlit sidebar and its tiny floating arrow completely. */
+        [data-testid="stSidebar"],
+        [data-testid="stSidebarCollapsedControl"],
+        [data-testid="stSidebarCollapseButton"] {
+            display: none !important;
+            visibility: hidden !important;
         }
 
         /* Glass cards */
@@ -1438,22 +1447,86 @@ def _name_from_url(url: str) -> str:
     return "Unknown Product"
 
 
-def _find_images_in_dict(obj, depth=0, max_depth=8):
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".avif")
+REVIEW_IMAGE_HINTS = (
+    "review", "rating", "feedback", "buyer", "customer", "comment",
+    "ugc", "user_content", "usercontent", "buyer_show", "buyershow",
+    "review_media", "reviewmedia", "review_image", "reviewimage",
+    "review_photo", "reviewphoto", "晒单", "评价",
+)
+NON_PRODUCT_IMAGE_HINTS = (
+    "avatar", "profile", "icon", "logo", "badge", "sprite", "favicon",
+)
+
+
+def _looks_like_image_url(value: str) -> bool:
+    """Return True for normal image URLs and common TikTok CDN image URLs."""
+    if not isinstance(value, str) or not value.startswith(("http://", "https://")):
+        return False
+    lowered = html_unescape(value).lower()
+    return (
+        any(ext in lowered for ext in IMAGE_EXTENSIONS)
+        or any(token in lowered for token in ("image", "img", "tos-", "p16-", "tplv-"))
+    )
+
+
+def _dedupe_image_urls(urls):
+    seen = set()
+    cleaned_urls = []
+    for value in urls:
+        if not value:
+            continue
+        cleaned = html_unescape(str(value)).replace("\\u002F", "/").replace("\\/", "/").strip()
+        if cleaned and cleaned not in seen and _looks_like_image_url(cleaned):
+            seen.add(cleaned)
+            cleaned_urls.append(cleaned)
+    return cleaned_urls
+
+
+def _collect_categorized_images(obj, path=(), depth=0, max_depth=12):
+    """Collect listing and review/customer images while retaining JSON path context."""
     if depth > max_depth:
-        return []
-    images = []
+        return [], []
+
+    listing_images = []
+    review_images = []
+
     if isinstance(obj, dict):
-        for k, v in obj.items():
-            if isinstance(v, str) and v.startswith("http") and any(
-                ext in v.lower() for ext in ['.jpg', '.jpeg', '.png', '.webp']
-            ):
-                images.append(v)
+        for key, value in obj.items():
+            child_path = path + (str(key).lower(),)
+            if isinstance(value, str) and _looks_like_image_url(value):
+                context = " ".join(child_path)
+                leaf = child_path[-1] if child_path else ""
+                # Skip avatars, logos and UI graphics unless the path explicitly says review media/photo.
+                is_review = any(token in context for token in REVIEW_IMAGE_HINTS)
+                is_non_product = any(token in leaf for token in NON_PRODUCT_IMAGE_HINTS)
+                if is_non_product and not is_review:
+                    continue
+                if is_review:
+                    review_images.append(value)
+                else:
+                    listing_images.append(value)
             else:
-                images.extend(_find_images_in_dict(v, depth + 1, max_depth))
+                nested_listing, nested_review = _collect_categorized_images(
+                    value, child_path, depth + 1, max_depth
+                )
+                listing_images.extend(nested_listing)
+                review_images.extend(nested_review)
     elif isinstance(obj, list):
         for item in obj:
-            images.extend(_find_images_in_dict(item, depth + 1, max_depth))
-    return images
+            nested_listing, nested_review = _collect_categorized_images(
+                item, path, depth + 1, max_depth
+            )
+            listing_images.extend(nested_listing)
+            review_images.extend(nested_review)
+
+    return listing_images, review_images
+
+
+def _find_images_in_dict(obj, depth=0, max_depth=8):
+    """Backward-compatible helper returning all categorized images."""
+    listing, review = _collect_categorized_images(obj, depth=depth, max_depth=max_depth)
+    return _dedupe_image_urls(listing + review)
 
 
 def _find_product_names_in_dict(obj, depth=0, max_depth=10):
@@ -1510,7 +1583,7 @@ def _best_product_name(candidates):
 
 def scrape_product(url: str) -> dict | None:
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=15, allow_redirects=True)
+        resp = requests.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
         resp.raise_for_status()
         html = resp.text
 
@@ -1538,72 +1611,86 @@ def scrape_product(url: str) -> dict | None:
         if not title_match:
             title_match = re.search(r'<title>([^<]+)</title>', html, re.IGNORECASE)
 
-        images = []
+        listing_images = []
+        review_images = []
         name_candidates = []
         if title_match:
             name_candidates.append(title_match.group(1).strip())
         if img_match:
-            images.append(img_match.group(1))
+            listing_images.append(img_match.group(1))
 
-        # JSON-LD
+        # JSON-LD normally contains official listing images.
         ld_blocks = re.findall(
-            r'<script\s+type=["\']application/ld\+json["\']>\s*({.*?})\s*</script>',
-            html, re.DOTALL
+            r'<script\s+type=["\']application/ld\+json["\']>\s*(.*?)\s*</script>',
+            html, re.DOTALL | re.IGNORECASE
         )
         for block in ld_blocks:
             try:
-                ld = json.loads(block)
+                ld = json.loads(html_unescape(block))
                 name_candidates.extend(_find_product_names_in_dict(ld))
-                if isinstance(ld, dict) and "image" in ld:
-                    img_val = ld["image"]
-                    if isinstance(img_val, str):
-                        images.append(img_val)
-                    elif isinstance(img_val, list):
-                        images.extend([i for i in img_val if isinstance(i, str)])
-            except json.JSONDecodeError:
+                ld_listing, ld_review = _collect_categorized_images(ld)
+                listing_images.extend(ld_listing)
+                review_images.extend(ld_review)
+            except (json.JSONDecodeError, TypeError):
                 pass
 
-        # __NEXT_DATA__
-        next_data = re.search(
-            r'<script\s+id=["\']__NEXT_DATA__["\']\s+type=["\']application/json["\']>\s*({.*?})\s*</script>',
-            html, re.DOTALL
+        # Parse all hydration/application JSON payloads. TikTok often places review media
+        # in these blocks even when it is not visible in the initial HTML markup.
+        json_blocks = re.findall(
+            r'<script[^>]*type=["\']application/json["\'][^>]*>\s*(.*?)\s*</script>',
+            html, re.DOTALL | re.IGNORECASE
         )
-        if next_data:
+        for block in json_blocks:
             try:
-                nd = json.loads(next_data.group(1))
-                images.extend(_find_images_in_dict(nd))
-                name_candidates.extend(_find_product_names_in_dict(nd))
-            except json.JSONDecodeError:
-                pass
+                payload = json.loads(html_unescape(block))
+            except (json.JSONDecodeError, TypeError):
+                continue
+            name_candidates.extend(_find_product_names_in_dict(payload))
+            payload_listing, payload_review = _collect_categorized_images(payload)
+            listing_images.extend(payload_listing)
+            review_images.extend(payload_review)
 
-        # CDN image URLs
-        cdn_imgs = re.findall(
-            r'(https?://[^"\'\s]+(?:\.jpg|\.jpeg|\.png|\.webp)(?:\?[^"\'\s]*)?)',
-            html
+        # Image URLs in raw HTML. Nearby review-related text determines the bucket.
+        raw_image_pattern = re.compile(
+            r'https?://[^"\'\s<>]+(?:\.jpg|\.jpeg|\.png|\.webp|\.avif)(?:\?[^"\'\s<>]*)?',
+            re.IGNORECASE,
         )
-        for ci in cdn_imgs:
-            if any(kw in ci.lower() for kw in ['product', 'pdp', 'origin', 'large', '800', '1000', '1200']):
-                images.append(ci)
+        for match in raw_image_pattern.finditer(html):
+            image_url = match.group(0)
+            context = html[max(0, match.start() - 450): min(len(html), match.end() + 450)].lower()
+            if any(token in context for token in REVIEW_IMAGE_HINTS):
+                review_images.append(image_url)
+            elif any(token in image_url.lower() for token in ("product", "pdp", "origin", "large", "800", "1000", "1200")):
+                listing_images.append(image_url)
 
-        if not images:
+        listing_images = _dedupe_image_urls(listing_images)
+        review_images = _dedupe_image_urls(review_images)
+
+        # Do not repeat official listing images inside the review-photo section.
+        listing_set = set(listing_images)
+        review_images = [image for image in review_images if image not in listing_set]
+
+        if not listing_images and review_images:
+            # A review photo can still be used as the primary reference if that is all TikTok exposes.
+            listing_images = [review_images[0]]
+
+        all_images = _dedupe_image_urls(listing_images + review_images)
+        if not all_images:
             return None
-
-        # Deduplicate and clean
-        seen = set()
-        unique = []
-        for img in images:
-            cleaned = html_unescape(img)
-            if cleaned not in seen:
-                seen.add(cleaned)
-                unique.append(cleaned)
 
         name = _best_product_name(name_candidates)
         if not name or name == "Unknown Product":
             name = _name_from_url(url)
 
-        return {"name": name[:100], "images": unique[:12], "source_url": url}
+        return {
+            "name": name[:100],
+            "images": all_images[:36],
+            "listing_images": listing_images[:18],
+            "review_images": review_images[:24],
+            "source_url": url,
+        }
 
-    except Exception as e:
+    except Exception:
         return None
 
 
@@ -1731,8 +1818,9 @@ def generate_video(
             messages=[{
                 "role": "user",
                 "content": (
-                    f"Upload this image and generate a {duration}s video.\n"
-                    f"Image URL: {image_url}\n"
+                    f"Upload every reference image below and generate a {duration}s video.\n"
+                    f"Use Reference image 1 as the primary reference and the others for product accuracy.\n"
+                    f"{refs_text}\n\n"
                     f"Prompt:\n{prompt}"
                 ),
             }],
@@ -1884,90 +1972,94 @@ def main():
         unsafe_allow_html=True,
     )
 
-    # ── Always-visible settings panel ──
-    # Settings live in the main workspace instead of a hard-to-find sidebar.
-    api_key = get_secret("ANTHROPIC_API_KEY")
-    saved_token = get_secret("MAGNIFIC_AUTH_TOKEN")
-    magnific_token = saved_token
-    style = "shoe_video"
-    duration = 15
-    voice_script = ""
+    # ── Always-visible video setup ──
+    api_key_from_secrets = get_secret("ANTHROPIC_API_KEY")
+    token_from_secrets = get_secret("MAGNIFIC_AUTH_TOKEN")
+
+    if "runtime_anthropic_api_key" not in st.session_state:
+        st.session_state["runtime_anthropic_api_key"] = api_key_from_secrets
+    if "runtime_magnific_token" not in st.session_state:
+        st.session_state["runtime_magnific_token"] = token_from_secrets
 
     with st.container(border=True):
-        settings_button_col, settings_status_col = st.columns([1.15, 3.85], vertical_alignment="center")
+        st.markdown("### Video setup")
+        st.caption("Choose the format first. API controls stay below in the same dark workspace—no hidden sidebar or white popover.")
 
-        with settings_button_col:
-            with st.popover("⚙️ Settings & API", use_container_width=True):
-                st.markdown("### API access")
+        style = st.radio(
+            "Video style",
+            options=["shoe_video", "texthook_broll"],
+            format_func=lambda value: {
+                "shoe_video": "👟 Shoe Video (feet-only)",
+                "texthook_broll": "📱 Text-Hook B-Roll",
+            }[value],
+            key="main_video_style",
+            horizontal=True,
+            label_visibility="collapsed",
+        )
 
-                if api_key:
-                    st.success("🔑 Anthropic key loaded")
-                else:
-                    api_key = st.text_input(
-                        "Anthropic API Key",
-                        type="password",
-                        key="main_anthropic_api_key",
-                    )
+        if style == "shoe_video":
+            duration_col, voice_col = st.columns([1, 3], vertical_alignment="top")
+            with duration_col:
+                duration = st.select_slider(
+                    "Duration",
+                    options=[5, 10, 15],
+                    value=15,
+                    key="main_video_duration",
+                )
+            with voice_col:
+                voice_script = st.text_area(
+                    "Voiceover (optional)",
+                    placeholder="Leave empty for a silent video",
+                    height=82,
+                    key="main_voice_script",
+                )
+        else:
+            duration = 8
+            voice_script = None
+            st.info("Text-Hook B-Roll is fixed at 8 seconds and silent. The chosen hook is added afterward with FFmpeg.")
 
-                magnific_token = st.text_input(
-                    "Magnific token",
+        api_key = st.session_state.get("runtime_anthropic_api_key", "")
+        magnific_token = st.session_state.get("runtime_magnific_token", "")
+        status_col_1, status_col_2, status_col_3 = st.columns(3)
+        if api_key:
+            status_col_1.success("Anthropic connected")
+        else:
+            status_col_1.warning("Anthropic key needed")
+        if magnific_token:
+            status_col_2.success("Magnific connected")
+        else:
+            status_col_2.info("Prompt-only mode")
+        status_col_3.info(f"{'Shoe Video' if style == 'shoe_video' else 'Text-Hook B-Roll'} · {duration}s")
+
+        with st.expander("API connection", expanded=not bool(api_key and magnific_token)):
+            if api_key_from_secrets:
+                st.success("Anthropic API key loaded from Streamlit secrets.")
+            else:
+                st.session_state["runtime_anthropic_api_key"] = st.text_input(
+                    "Anthropic API Key",
                     type="password",
-                    value=saved_token,
-                    key="main_magnific_token",
+                    value=st.session_state.get("runtime_anthropic_api_key", ""),
+                    key="runtime_anthropic_api_key_input",
                 )
 
-                if magnific_token:
-                    st.success("✅ Auto-generation enabled")
-                else:
-                    st.info("No Magnific token — prompts will still be created for manual generation.")
+            st.session_state["runtime_magnific_token"] = st.text_input(
+                "Magnific token",
+                type="password",
+                value=st.session_state.get("runtime_magnific_token", ""),
+                key="runtime_magnific_token_input",
+                help="Paste a refreshed token here whenever Magnific authentication expires.",
+            )
+            magnific_token = st.session_state.get("runtime_magnific_token", "")
+            api_key = st.session_state.get("runtime_anthropic_api_key", "")
 
-                with st.expander("How to refresh the Magnific token"):
-                    st.markdown("""
+            st.markdown("**How to refresh the Magnific token**")
+            st.markdown("""
 1. Run `npx @modelcontextprotocol/inspector` on a computer with Node.js.
 2. Set **Transport Type** to `Streamable HTTP`.
 3. Set the URL to `https://mcp.magnific.com`.
 4. Connect, open Auth Settings, and complete the Quick OAuth Flow.
 5. Copy the `access_token` and paste it above.
-                    """)
-
-                st.divider()
-                st.markdown("### Video settings")
-                style = st.radio(
-                    "Video style",
-                    options=["shoe_video", "texthook_broll"],
-                    format_func=lambda value: {
-                        "shoe_video": "👟 Shoe Video (feet-only)",
-                        "texthook_broll": "📱 Text-Hook B-Roll",
-                    }[value],
-                    key="main_video_style",
-                )
-
-                if style == "shoe_video":
-                    duration = st.select_slider(
-                        "Duration",
-                        options=[5, 10, 15],
-                        value=15,
-                        key="main_video_duration",
-                    )
-                    voice_script = st.text_area(
-                        "Voiceover (optional)",
-                        placeholder="Leave empty for a silent video",
-                        height=90,
-                        key="main_voice_script",
-                    )
-                else:
-                    duration = 8
-                    voice_script = None
-                    st.caption("Text-Hook B-Roll is always 8 seconds and silent.")
-
-        with settings_status_col:
-            generation_mode = "Automatic generation" if magnific_token else "Prompt-only mode"
-            style_label = "Shoe Video" if style == "shoe_video" else "Text-Hook B-Roll"
-            key_label = "Anthropic connected" if api_key else "Anthropic key needed"
-            st.markdown(
-                f"**{style_label} · {duration}s**  \n{generation_mode} · {key_label}"
-            )
-            st.caption("Open Settings & API at any time. You no longer need the hidden Streamlit sidebar.")
+            """)
 
     # ════════════════════════════════════════════════════════════════
     #  STEP 1 — PASTE LINKS
@@ -1983,7 +2075,7 @@ def main():
         label_visibility="collapsed",
     )
 
-    scrape_btn = st.button("🔍 Scrape Product Photos", use_container_width=True)
+    scrape_btn = st.button("🔍 Scrape Product & Review Photos", use_container_width=True)
 
     links = [
         line.strip() for line in links_input.strip().split("\n")
@@ -1998,8 +2090,8 @@ def main():
 
     if scrape_btn and links:
         st.divider()
-        st.subheader("② Select the Right Photo for Each Product")
-        st.caption("Some products have multiple colors or angles — pick the one you want in the video.")
+        st.subheader("② Select Product References")
+        st.caption("Choose official listing photos, customer review photos, or both. Multiple references improve product accuracy.")
 
         scraped_products = []
         progress = st.progress(0, text="Scraping...")
@@ -2046,30 +2138,101 @@ def main():
             if edited_name == "Unknown Product":
                 st.warning("TikTok did not expose a product title. Enter the product name above before generating hooks.")
 
-            st.caption(f"Source: {product['source_url'][:80]}...")
-            images = product["images"][:12]
+            st.caption(f"Source: {product['source_url'][:100]}...")
 
-            cols = st.columns(4)
-            for img_idx, img_url in enumerate(images):
-                with cols[img_idx % 4]:
-                    try:
-                        st.image(img_url, use_container_width=True, caption=f"Option {img_idx + 1}")
-                    except Exception:
-                        st.caption(f"Option {img_idx + 1}: {img_url[:40]}...")
+            listing_images = product.get("listing_images") or product.get("images", [])
+            review_images = product.get("review_images") or []
 
-            default_refs = [0] if images else []
-            selected_indices = st.multiselect(
-                f"Reference images for **{edited_name[:40]}** (select one or more):",
-                options=list(range(len(images))),
-                default=default_refs,
-                format_func=lambda x: f"Option {x + 1}",
-                key=f"select_multi_{idx}",
-                help="The first selected image is the primary reference. Additional images help preserve packaging, angles, and details.",
-            )
-            if not selected_indices and images:
-                st.info("No references selected, so Option 1 will be used automatically.")
-                selected_indices = [0]
-            selections[idx] = [images[i] for i in selected_indices]
+            listing_tab, review_tab = st.tabs([
+                f"Listing photos ({len(listing_images)})",
+                f"Review/customer photos ({len(review_images)})",
+            ])
+
+            with listing_tab:
+                if listing_images:
+                    listing_cols = st.columns(4)
+                    for image_index, image_url in enumerate(listing_images):
+                        with listing_cols[image_index % 4]:
+                            try:
+                                st.image(image_url, use_container_width=True, caption=f"Listing {image_index + 1}")
+                            except Exception:
+                                st.caption(f"Listing {image_index + 1}: {image_url[:45]}...")
+                    selected_listing_indices = st.multiselect(
+                        "Select listing references",
+                        options=list(range(len(listing_images))),
+                        default=[0],
+                        format_func=lambda value: f"Listing {value + 1}",
+                        key=f"listing_refs_{idx}",
+                    )
+                else:
+                    selected_listing_indices = []
+                    st.info("No official listing photos were exposed by this page.")
+
+            with review_tab:
+                if review_images:
+                    review_cols = st.columns(4)
+                    for image_index, image_url in enumerate(review_images):
+                        with review_cols[image_index % 4]:
+                            try:
+                                st.image(image_url, use_container_width=True, caption=f"Review {image_index + 1}")
+                            except Exception:
+                                st.caption(f"Review {image_index + 1}: {image_url[:45]}...")
+                    selected_review_indices = st.multiselect(
+                        "Select review/customer references",
+                        options=list(range(len(review_images))),
+                        default=[],
+                        format_func=lambda value: f"Review {value + 1}",
+                        key=f"review_refs_{idx}",
+                        help="Customer photos can help preserve the real size, finish, packaging, and in-hand appearance.",
+                    )
+                else:
+                    selected_review_indices = []
+                    st.info("TikTok did not expose review photos in the public page data. You can paste direct review-photo URLs below.")
+
+                manual_review_urls_text = st.text_area(
+                    "Add review-photo URLs manually (optional)",
+                    placeholder="Paste one direct image URL per line",
+                    height=90,
+                    key=f"manual_review_urls_{idx}",
+                )
+
+            selected_candidates = []
+            for image_index in selected_listing_indices:
+                selected_candidates.append((f"Listing {image_index + 1}", listing_images[image_index]))
+            for image_index in selected_review_indices:
+                selected_candidates.append((f"Review {image_index + 1}", review_images[image_index]))
+
+            manual_review_urls = _dedupe_image_urls([
+                line.strip()
+                for line in manual_review_urls_text.splitlines()
+                if line.strip()
+            ])
+            for manual_index, image_url in enumerate(manual_review_urls, start=1):
+                selected_candidates.append((f"Manual review {manual_index}", image_url))
+
+            if not selected_candidates:
+                fallback_images = listing_images or review_images or product.get("images", [])
+                if fallback_images:
+                    selected_candidates = [("Automatic fallback", fallback_images[0])]
+                    st.info("No references were selected, so the first available image will be used.")
+
+            if selected_candidates:
+                primary_index = st.selectbox(
+                    "Primary reference image",
+                    options=list(range(len(selected_candidates))),
+                    format_func=lambda value, choices=selected_candidates: choices[value][0],
+                    key=f"primary_reference_{idx}",
+                    help="The primary reference controls the main product appearance. Other selections are supporting references.",
+                )
+                ordered_candidates = [selected_candidates[primary_index]] + [
+                    candidate for candidate_index, candidate in enumerate(selected_candidates)
+                    if candidate_index != primary_index
+                ]
+                selections[idx] = [url for _label, url in ordered_candidates]
+                st.caption(f"Using {len(selections[idx])} reference image(s). Primary: {ordered_candidates[0][0]}")
+            else:
+                selections[idx] = []
+
 
         # ════════════════════════════════════════════════════════════════
         #  STEP 3 — GENERATE OR GET PROMPTS
@@ -2282,6 +2445,8 @@ def main():
             entry["image_urls"] = fp.get("image_urls", [fp["image_url"]])
             entry["source_url"] = fp["source_url"]
             entry["style"] = style
+            entry["duration"] = duration if style == "shoe_video" else 8
+            entry["voice_script"] = voice_script or ""
             entry["status"] = "prompt_only"
             entry["generated_at"] = datetime.now().isoformat()
             add_generation(entry)
@@ -2389,7 +2554,7 @@ def main():
                 st.error(f"❌ **{product['name']}** — {error_msg}")
 
                 if any(kw in error_msg.lower() for kw in ['401', 'unauthorized', 'auth', 'token', 'forbidden', '403']):
-                    st.warning("🔄 **Token expired.** Paste a fresh token in the sidebar and re-run.")
+                    st.warning("🔄 **Token expired.** Paste a fresh token in the API connection section and re-run.")
                     token_expired = True
 
                     # Show the prompt so they can still use it manually
@@ -2424,6 +2589,7 @@ def main():
             r["source_url"] = fp["source_url"]
             r["style"] = style
             r["duration"] = duration if style == "shoe_video" else 8
+            r["voice_script"] = voice_script or ""
             r["generated_at"] = datetime.now().isoformat()
             add_generation(r)
 
@@ -2736,23 +2902,54 @@ def main():
                             save_generations(saved_gens)
                             st.rerun()
 
-                    if result.get("prompt_used") and result.get("image_url") and magnific_token and api_key:
-                        if st.button("🔁 Regenerate", key=f"regen_{i}", use_container_width=True):
-                            with st.spinner("Regenerating..."):
+                    current_prompt = result.get("prompt_used") or result.get("prompt")
+                    if current_prompt and api_key:
+                        if st.button("🪄 Regenerate prompt", key=f"regen_prompt_{i}", use_container_width=True):
+                            stored_style = result.get("style") or "texthook_broll"
+                            stored_duration = int(result.get("duration") or (8 if stored_style == "texthook_broll" else 15))
+                            with st.spinner("Writing a new prompt..."):
+                                regenerated_prompt = write_prompt(
+                                    api_key=api_key,
+                                    product_name=product_name,
+                                    style=stored_style,
+                                    duration=stored_duration,
+                                    voice_script=result.get("voice_script") or None,
+                                    selected_hook=result.get("accepted_hook") or None,
+                                )
+                            if regenerated_prompt.get("prompt"):
+                                result["prompt"] = regenerated_prompt["prompt"]
+                                result["prompt_used"] = regenerated_prompt["prompt"]
+                                result["prompt_regenerated_at"] = datetime.now().isoformat()
+                                saved_gens[i] = result
+                                save_generations(saved_gens)
+                                st.success("New prompt saved. Use Generate/Regenerate video when ready.")
+                            else:
+                                st.error(regenerated_prompt.get("error", "The prompt could not be regenerated."))
+
+                    current_prompt = result.get("prompt_used") or result.get("prompt")
+                    if current_prompt and result.get("image_url") and magnific_token and api_key:
+                        video_button_label = "🎬 Generate video" if status == "prompt_only" else "🎬 Regenerate video"
+                        if st.button(video_button_label, key=f"regen_{i}", use_container_width=True):
+                            stored_style = result.get("style") or "texthook_broll"
+                            stored_duration = int(result.get("duration") or (8 if stored_style == "texthook_broll" else 15))
+                            with st.spinner("Sending the current prompt and references to Magnific..."):
                                 new_result = generate_video(
                                     api_key=api_key,
                                     magnific_token=magnific_token,
                                     image_url=result["image_url"],
-                                    prompt=result["prompt_used"],
-                                    duration=result.get("duration", 15),
+                                    image_urls=result.get("image_urls", [result["image_url"]]),
+                                    prompt=current_prompt,
+                                    duration=stored_duration,
                                 )
                             new_result["product_name"] = product_name
-                            new_result["prompt_used"] = result["prompt_used"]
+                            new_result["prompt_used"] = current_prompt
+                            new_result["prompt"] = current_prompt
                             new_result["image_url"] = result["image_url"]
                             new_result["image_urls"] = result.get("image_urls", [result["image_url"]])
                             new_result["source_url"] = result.get("source_url", "")
-                            new_result["style"] = result.get("style", "")
-                            new_result["duration"] = result.get("duration", 15)
+                            new_result["style"] = stored_style
+                            new_result["duration"] = stored_duration
+                            new_result["voice_script"] = result.get("voice_script", "")
                             new_result["accepted_hook"] = result.get("accepted_hook")
                             new_result["hook_options"] = result.get("hook_options", [])
                             new_result["caption"] = result.get("caption")
