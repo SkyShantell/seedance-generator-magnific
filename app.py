@@ -1128,6 +1128,7 @@ def generation_export_rows(generations: list[dict]) -> list[dict]:
             "product_link": item.get("source_url", ""),
             "caption": caption,
             "hashtags": hashtags,
+            "sound_tip": item.get("sound_tip", ""),
             "full_caption": full_caption,
             "on_screen_text": item.get("accepted_hook", ""),
             "video_url": video_url,
@@ -1145,7 +1146,7 @@ def generations_csv_bytes(generations: list[dict]) -> bytes:
     rows = generation_export_rows(generations)
     buffer = io.StringIO()
     fieldnames = [
-        "product_name", "product_link", "caption", "hashtags", "full_caption",
+        "product_name", "product_link", "caption", "hashtags", "sound_tip", "full_caption",
         "on_screen_text", "video_url", "processed_video_file", "style",
         "status", "creation_id", "generated_at",
     ]
@@ -1161,7 +1162,7 @@ def past_hooks_csv_bytes(generations: list[dict]) -> bytes:
     fieldnames = [
         "product_name", "product_link", "accepted_hook", "hook_option_1",
         "hook_option_2", "hook_option_3", "hook_option_4", "hook_option_5",
-        "caption", "hashtags", "style", "status", "generated_at", "video_url",
+        "caption", "hashtags", "sound_tip", "style", "status", "generated_at", "video_url",
     ]
     writer = csv.DictWriter(buffer, fieldnames=fieldnames)
     writer.writeheader()
@@ -1179,6 +1180,7 @@ def past_hooks_csv_bytes(generations: list[dict]) -> bytes:
             "hook_option_5": options[4],
             "caption": item.get("caption", ""),
             "hashtags": item.get("hashtags", ""),
+            "sound_tip": item.get("sound_tip", ""),
             "style": item.get("style", ""),
             "status": item.get("status", ""),
             "generated_at": item.get("generated_at", ""),
@@ -1355,6 +1357,66 @@ Text hook rules (gen-z texting voice):
 Return ONLY valid JSON (no markdown, no backticks):
 {{"product_name": "...", "hook_options": ["hook 1", "hook 2", "hook 3", "hook 4", "hook 5"], "caption": "tiktok caption (NOT the hook — a separate short caption for the post)", "hashtags": "#tag1 #tag2..."}}"""
 
+WAREHOUSE_HOOKS_SYSTEM = """You are a TikTok Shop affiliate content producer. Generate 5
+on-screen text hooks for a silent warehouse walk-up deal video.
+
+Use the product name exactly where [product] appears. Select five DIFFERENT angles from this
+proven library; preserve each template's casual wording and emoji pattern:
+1. I am SO sorry if you already grabbed a [product] because the discount is huge today
+2. Sincerely apologize to anyone who already got a [product] cus they are TRIPLE discounted today 😭
+3. Sorry to the ladies who bought these [product] before the new Summer Reductions this week 😭😭
+4. Condolences to the ladies who bought this New [product] before this Summer Half Off Reduction 😭😭
+5. POV: You wake up and the [product] is SO affordable on TikTok now 🤯😱
+6. Glad I waited to grab the [product] because they are TRIPLE DISCOUNTED RIGHT NOW 😱🤑
+7. You got BLESSED today bc the [product] is now SUPER cheap 🤩
+8. If you waited until today you absolutely won cause the [product] is soooo low 🤑
+9. Yall must have bullied the price down because the [product] are crazy cheap rn 😭
+10. TikTok bullied the price down and now the [product] is on a massive sale…..only for a limited time don't miss out 😅
+11. Someone fcked up at TikTok cus today the [product] is violently low right now
+12. Apparently if your TikTok account is old enough you can get the [product] on a mega discount… its only for today though
+13. Anyone else grabbing a boatload of the [product] or am I just stupid
+
+Rules:
+- Casual, chaotic, sassy deal-drop/FOMO voice; never polished corporate copy.
+- No link in bio and no formal CTA.
+- Do not claim an exact price or percentage unless the template already uses broad sale wording.
+- The render is silent; this hook is burned in later with FFmpeg.
+- Caption: one short warehouse-find line in the same voice.
+- Hashtags: 8-12 tags including #tiktokshop #tiktokmademebuyit #costcofinds #warehousedeals plus product/category tags.
+- Sound tip: short reminder to add an upbeat trending TikTok sound in-app.
+
+Return ONLY valid JSON (no markdown, no backticks):
+{{"product_name": "...", "hook_options": ["hook 1", "hook 2", "hook 3", "hook 4", "hook 5"], "caption": "...", "hashtags": "#tag1 #tag2", "sound_tip": "..."}}"""
+
+WAREHOUSE_PROMPT_SYSTEM = """You are a TikTok Shop affiliate content producer. Write a
+Seedance 2.0 prompt for the Warehouse walk-up deal-drop style.
+
+HARD RULES:
+- 9:16 vertical, exactly about 5 seconds, TikTok UGC phone footage.
+- COMPLETELY SILENT: no audio, no voiceover, no narration.
+- ONE continuous shot with zero cuts, jumps, scene changes, montage, pan, tilt, orbit, or look-around.
+- Pure first-person shopper POV. No people, hands, face, body, characters, or animals.
+- The camera walks straight toward a warehouse bulk product display at a normal walking pace.
+- Start 6-8 feet back with the full display visible; finish close with products filling about 90% of frame.
+- Natural gait bounce and handheld micro-shake; chest/hip-height phone perspective.
+- Warehouse club environment: high industrial ceiling, exposed beams, bright fluorescent lighting,
+  polished concrete floor, orange and teal metal racking, generic adjacent bulk merchandise on pallets.
+- Display multiple units on a pallet, branded cardboard shipper, shelf, or wire bin. Match the supplied
+  reference images exactly for product packaging, colors, proportions, labels, finish, and branding.
+- ZERO rendered text: no captions, subtitles, overlays, prices, promotional signs, watermarks, or invented
+  writing. Existing physical branding printed on the real product packaging is the only exception.
+- Prompt must be under 1,900 characters.
+
+Required structure inside the prompt:
+[00:00-00:02] Wide approach: slightly angled aisle discovery, full bulk display and warehouse context visible.
+Camera walks steadily toward the display.
+[00:02-00:05] Close arrival: camera straightens and reaches the display; multiple units and real packaging
+fill the frame, with labels and product details legible; natural walking-pace stop.
+End with a NEGATIVE sentence repeating no people/hands/body, no cuts, no audio, and no rendered text/signs.
+
+Return ONLY valid JSON (no markdown, no backticks):
+{{"product_name": "...", "prompt": "the full Seedance prompt under 1900 characters", "char_count": 123}}"""
+
 TEXTHOOK_PROMPT_SYSTEM = """You are a TikTok Shop affiliate content producer. Write a
 Seedance 2.0 video prompt for a clean text-hook b-roll video.
 
@@ -1426,6 +1488,21 @@ Return ONLY valid JSON (no markdown, no backticks):
 
 VOICEOVER_SILENT = "## Audio:\nNO voiceover. Ambient sound only."
 VOICEOVER_WITH_SCRIPT = '## Voiceover:\nInclude this voiceover (warm excited woman, casual and friendly):\n"{script}"'
+
+
+STYLE_LABELS = {
+    "shoe_video": "👟 Shoe Video (feet-only)",
+    "texthook_broll": "📱 Text-Hook B-Roll",
+    "warehouse": "🏬 Warehouse",
+}
+
+
+def resolved_style_duration(style: str, selected_duration: int = 15) -> int:
+    if style == "warehouse":
+        return 5
+    if style == "texthook_broll":
+        return 8
+    return int(selected_duration)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1698,26 +1775,38 @@ def scrape_product(url: str) -> dict | None:
 #  PROMPT WRITER (Claude only — no MCP, cheap + fast)
 # ═══════════════════════════════════════════════════════════════════
 
-def write_hooks(api_key: str, product_name: str) -> dict:
-    """Generate 5 hook options for a product. Cheap/fast — no MCP."""
+def _extract_json_object(raw_text: str) -> dict | None:
+    cleaned = re.sub(r'```json\s*', '', raw_text)
+    cleaned = re.sub(r'```\s*', '', cleaned)
+    json_start = cleaned.find("{")
+    json_end = cleaned.rfind("}") + 1
+    if json_start < 0 or json_end <= json_start:
+        return None
+    try:
+        return json.loads(cleaned[json_start:json_end])
+    except json.JSONDecodeError:
+        return None
+
+
+def write_hooks(api_key: str, product_name: str, style: str = "texthook_broll") -> dict:
+    """Generate five style-matched hook options for a product. Cheap/fast — no MCP."""
+    system = WAREHOUSE_HOOKS_SYSTEM if style == "warehouse" else TEXTHOOK_HOOKS_SYSTEM
+    task = (
+        f"Write 5 warehouse deal-drop text hooks for this product: {product_name}"
+        if style == "warehouse"
+        else f"Write 5 text hook options for this product: {product_name}"
+    )
     try:
         client = anthropic.Anthropic(api_key=api_key)
         response = client.messages.create(
             model=MODEL,
-            max_tokens=1024,
-            system=TEXTHOOK_HOOKS_SYSTEM,
-            messages=[{
-                "role": "user",
-                "content": f"Write 5 text hook options for this product: {product_name}"
-            }],
+            max_tokens=1400,
+            system=system,
+            messages=[{"role": "user", "content": task}],
         )
-        text = response.content[0].text
-        cleaned = re.sub(r'```json\s*', '', text)
-        cleaned = re.sub(r'```\s*', '', cleaned)
-        json_start = cleaned.find("{")
-        json_end = cleaned.rfind("}") + 1
-        if json_start >= 0 and json_end > json_start:
-            return json.loads(cleaned[json_start:json_end])
+        parsed = _extract_json_object(response.content[0].text)
+        if parsed is not None:
+            return parsed
         return {"error": "Couldn't parse JSON", "product_name": product_name}
     except Exception as e:
         return {"error": str(e), "product_name": product_name}
@@ -1735,11 +1824,17 @@ def write_prompt(
     if style == "shoe_video":
         vo = VOICEOVER_WITH_SCRIPT.format(script=voice_script) if voice_script else VOICEOVER_SILENT
         system = SHOE_VIDEO_SYSTEM.format(voiceover_instruction=vo)
-        dur = duration
+    elif style == "warehouse":
+        system = WAREHOUSE_PROMPT_SYSTEM
     else:
         # The selected hook is added after generation with FFmpeg.
         system = TEXTHOOK_PROMPT_SYSTEM
-        dur = 8
+
+    dur = resolved_style_duration(style, duration)
+    user_task = (
+        f"Write a {dur}-second Seedance 2.0 prompt for this product: {product_name}. "
+        "The generator will receive the selected reference images separately, so instruct it to match them exactly."
+    )
 
     try:
         client = anthropic.Anthropic(api_key=api_key)
@@ -1747,21 +1842,50 @@ def write_prompt(
             model=MODEL,
             max_tokens=2048,
             system=system,
-            messages=[{
-                "role": "user",
-                "content": f"Write a {dur}-second Seedance 2.0 prompt for this product: {product_name}"
-            }],
+            messages=[{"role": "user", "content": user_task}],
         )
 
-        text = response.content[0].text
-        cleaned = re.sub(r'```json\s*', '', text)
-        cleaned = re.sub(r'```\s*', '', cleaned)
-        json_start = cleaned.find("{")
-        json_end = cleaned.rfind("}") + 1
-        if json_start >= 0 and json_end > json_start:
-            return json.loads(cleaned[json_start:json_end])
+        parsed = _extract_json_object(response.content[0].text)
+        if parsed is None:
+            return {
+                "prompt": response.content[0].text,
+                "product_name": product_name,
+                "error": "Couldn't parse JSON",
+            }
 
-        return {"prompt": text, "product_name": product_name, "error": "Couldn't parse JSON"}
+        prompt_text = str(parsed.get("prompt") or "").strip()
+        parsed["char_count"] = len(prompt_text)
+
+        # The Warehouse skill requires a verified, actual count below 1,900 characters.
+        if style == "warehouse" and prompt_text and len(prompt_text) >= 1900:
+            retry = client.messages.create(
+                model=MODEL,
+                max_tokens=2048,
+                system=system,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"Rewrite this Warehouse prompt so the actual Python len() is under 1900 characters. "
+                        f"Preserve every product-accuracy detail and all hard rules; trim only background wording.\n\n"
+                        f"Product: {product_name}\nPrompt to shorten:\n{prompt_text}"
+                    ),
+                }],
+            )
+            retry_parsed = _extract_json_object(retry.content[0].text)
+            if retry_parsed and retry_parsed.get("prompt"):
+                parsed = retry_parsed
+                prompt_text = str(parsed.get("prompt") or "").strip()
+                parsed["char_count"] = len(prompt_text)
+
+        if style == "warehouse" and len(prompt_text) >= 1900:
+            return {
+                "error": f"Warehouse prompt is {len(prompt_text)} characters; it must be under 1900.",
+                "product_name": product_name,
+                "prompt": prompt_text,
+                "char_count": len(prompt_text),
+            }
+
+        return parsed
 
     except Exception as e:
         return {"error": str(e), "product_name": product_name}
@@ -1966,7 +2090,7 @@ def main():
         <section class="apple-hero">
             <div class="apple-kicker">✦ AI VIDEO WORKSPACE</div>
             <h1>Seedance Studio</h1>
-            <p>Turn TikTok Shop products into finished vertical videos, then refine the text styling with reusable presets and Apple-style emoji overlays.</p>
+            <p>Turn TikTok Shop products into Shoe, B-Roll, or Warehouse walk-up videos, then refine the text styling with reusable presets and Apple-style emoji overlays.</p>
         </section>
         """,
         unsafe_allow_html=True,
@@ -1987,11 +2111,8 @@ def main():
 
         style = st.radio(
             "Video style",
-            options=["shoe_video", "texthook_broll"],
-            format_func=lambda value: {
-                "shoe_video": "👟 Shoe Video (feet-only)",
-                "texthook_broll": "📱 Text-Hook B-Roll",
-            }[value],
+            options=["shoe_video", "texthook_broll", "warehouse"],
+            format_func=lambda value: STYLE_LABELS[value],
             key="main_video_style",
             horizontal=True,
             label_visibility="collapsed",
@@ -2013,6 +2134,13 @@ def main():
                     height=82,
                     key="main_voice_script",
                 )
+        elif style == "warehouse":
+            duration = 5
+            voice_script = None
+            st.info(
+                "Warehouse is fixed at 5 seconds and silent: one continuous first-person walk-up "
+                "toward a bulk pallet display. No people, hands, cuts, or rendered text."
+            )
         else:
             duration = 8
             voice_script = None
@@ -2029,7 +2157,7 @@ def main():
             status_col_2.success("Magnific connected")
         else:
             status_col_2.info("Prompt-only mode")
-        status_col_3.info(f"{'Shoe Video' if style == 'shoe_video' else 'Text-Hook B-Roll'} · {duration}s")
+        status_col_3.info(f"{STYLE_LABELS[style]} · {resolved_style_duration(style, duration)}s")
 
         with st.expander("API connection", expanded=not bool(api_key and magnific_token)):
             if api_key_from_secrets:
@@ -2253,12 +2381,18 @@ def main():
                 "source_url": product["source_url"],
             })
 
-        # ── For both styles: pick hooks FIRST, then generate ──
+        # ── Pick hooks FIRST, then generate ──
         hooks_ready = False
 
-        # Both video styles can use generated on-screen text hooks.
+        # Hook voice changes by style. Clear old options when the selected style changes
+        # so Warehouse hooks can never be mixed with B-roll/Shoe hooks.
+        if st.session_state.get("product_hooks_style") != style:
+            st.session_state["product_hooks"] = {}
+            st.session_state["product_hooks_style"] = style
+
+        # All three styles use generated on-screen text hooks.
         # The selected hook is stored now and burned onto the finished video later with FFmpeg.
-        if style in ("texthook_broll", "shoe_video"):
+        if style in ("texthook_broll", "shoe_video", "warehouse"):
             hooks_ready = False
 
             # ── Step 3a: Generate hook options ──
@@ -2275,12 +2409,13 @@ def main():
                     progress.progress(i / len(final_products),
                                       text=f"Hooks {i+1}/{len(final_products)}: {product['name'][:30]}...")
                     with st.spinner(f"Writing hooks for {product['name'][:30]}..."):
-                        hook_result = write_hooks(api_key, product["name"])
+                        hook_result = write_hooks(api_key, product["name"], style=style)
                     st.session_state["product_hooks"][i] = {
                         "product_name": product["name"],
                         "hook_options": hook_result.get("hook_options", []),
                         "caption": hook_result.get("caption", ""),
                         "hashtags": hook_result.get("hashtags", ""),
+                        "sound_tip": hook_result.get("sound_tip", ""),
                         "accepted_hook": None,
                     }
                     if hook_result.get("error"):
@@ -2324,6 +2459,8 @@ def main():
                         st.caption(f"Caption: {hook_data['caption']}")
                     if hook_data.get("hashtags"):
                         st.caption(f"Hashtags: {hook_data['hashtags']}")
+                    if hook_data.get("sound_tip"):
+                        st.caption(f"Sound tip: {hook_data['sound_tip']}")
 
                 hooks_ready = all_accepted
                 if not hooks_ready:
@@ -2371,7 +2508,7 @@ def main():
             # Get the accepted hook for texthook_broll style
             selected_hook = None
             hook_data_for_product = None
-            if style in ("texthook_broll", "shoe_video"):
+            if style in ("texthook_broll", "shoe_video", "warehouse"):
                 hook_data_for_product = st.session_state.get("product_hooks", {}).get(i)
                 if hook_data_for_product:
                     selected_hook = hook_data_for_product.get("accepted_hook")
@@ -2392,6 +2529,7 @@ def main():
                 result["hook_options"] = hook_data_for_product.get("hook_options", [])
                 result["caption"] = hook_data_for_product.get("caption")
                 result["hashtags"] = hook_data_for_product.get("hashtags")
+                result["sound_tip"] = hook_data_for_product.get("sound_tip")
 
             results.append(result)
 
@@ -2445,7 +2583,7 @@ def main():
             entry["image_urls"] = fp.get("image_urls", [fp["image_url"]])
             entry["source_url"] = fp["source_url"]
             entry["style"] = style
-            entry["duration"] = duration if style == "shoe_video" else 8
+            entry["duration"] = resolved_style_duration(style, duration)
             entry["voice_script"] = voice_script or ""
             entry["status"] = "prompt_only"
             entry["generated_at"] = datetime.now().isoformat()
@@ -2480,6 +2618,7 @@ def main():
                         "hook_options": r.get("hook_options"),
                         "caption": r.get("caption"),
                         "hashtags": r.get("hashtags"),
+                        "sound_tip": r.get("sound_tip"),
                     }
                     for fp, r in zip(final_products, results)
                 ],
@@ -2509,7 +2648,7 @@ def main():
             # Step A: Write the prompt (cheap, no MCP)
             selected_hook = None
             hook_data_for_product = None
-            if style in ("texthook_broll", "shoe_video"):
+            if style in ("texthook_broll", "shoe_video", "warehouse"):
                 hook_data_for_product = st.session_state.get("product_hooks", {}).get(i)
                 if hook_data_for_product:
                     selected_hook = hook_data_for_product.get("accepted_hook")
@@ -2540,7 +2679,7 @@ def main():
                     image_url=product["image_url"],
                     image_urls=product.get("image_urls"),
                     prompt=prompt_text,
-                    duration=duration if style == "shoe_video" else 8,
+                    duration=resolved_style_duration(style, duration),
                 )
 
             gen_result["product_name"] = product["name"]
@@ -2570,12 +2709,15 @@ def main():
                 gen_result["hook_options"] = hook_data_for_product.get("hook_options", [])
                 gen_result["caption"] = hook_data_for_product.get("caption")
                 gen_result["hashtags"] = hook_data_for_product.get("hashtags")
+                gen_result["sound_tip"] = hook_data_for_product.get("sound_tip")
                 if selected_hook:
                     st.info(f"📝 Hook saved for the text editor: {selected_hook}")
                 if hook_data_for_product.get("caption"):
                     st.caption(f"Caption: {hook_data_for_product['caption']}")
                 if hook_data_for_product.get("hashtags"):
                     st.caption(f"Hashtags: {hook_data_for_product['hashtags']}")
+                if hook_data_for_product.get("sound_tip"):
+                    st.caption(f"Sound tip: {hook_data_for_product['sound_tip']}")
 
             if i < len(final_products) - 1:
                 time.sleep(5)
@@ -2588,7 +2730,7 @@ def main():
             r["image_urls"] = fp.get("image_urls", [fp["image_url"]])
             r["source_url"] = fp["source_url"]
             r["style"] = style
-            r["duration"] = duration if style == "shoe_video" else 8
+            r["duration"] = resolved_style_duration(style, duration)
             r["voice_script"] = voice_script or ""
             r["generated_at"] = datetime.now().isoformat()
             add_generation(r)
@@ -2804,7 +2946,8 @@ def main():
                     list_product_name = list_result.get("product_name", "Unknown Product")
                     list_status = list_result.get("status", "unknown")
                     list_hook = list_result.get("accepted_hook", "") or ""
-                    search_haystack = f"{list_product_name} {list_status} {list_hook}".lower()
+                    list_style = list_result.get("style", "texthook_broll")
+                    search_haystack = f"{list_product_name} {list_status} {list_hook} {list_style}".lower()
                     if generation_search and generation_search not in search_haystack:
                         continue
 
@@ -2832,7 +2975,7 @@ def main():
 
                     with st.container(border=True):
                         st.markdown(f"**{list_product_name}**")
-                        st.caption(f"{list_badge}{text_marker}")
+                        st.caption(f"{STYLE_LABELS.get(list_style, list_style)} · {list_badge}{text_marker}")
                         if list_time:
                             st.caption(list_time)
                         if list_hook:
@@ -2883,7 +3026,7 @@ def main():
                 header_info, header_actions = st.columns([3.4, 1.6], vertical_alignment="center")
                 with header_info:
                     st.markdown(f"### {product_name}")
-                    st.caption(f"{badge}{time_str}")
+                    st.caption(f"{STYLE_LABELS.get(result.get('style', 'texthook_broll'), result.get('style', ''))} · {badge}{time_str}")
                     if creation_id:
                         st.caption(f"Creation ID: `{creation_id}`")
 
@@ -2906,7 +3049,7 @@ def main():
                     if current_prompt and api_key:
                         if st.button("🪄 Regenerate prompt", key=f"regen_prompt_{i}", use_container_width=True):
                             stored_style = result.get("style") or "texthook_broll"
-                            stored_duration = int(result.get("duration") or (8 if stored_style == "texthook_broll" else 15))
+                            stored_duration = int(result.get("duration") or resolved_style_duration(stored_style, 15))
                             with st.spinner("Writing a new prompt..."):
                                 regenerated_prompt = write_prompt(
                                     api_key=api_key,
@@ -2931,7 +3074,7 @@ def main():
                         video_button_label = "🎬 Generate video" if status == "prompt_only" else "🎬 Regenerate video"
                         if st.button(video_button_label, key=f"regen_{i}", use_container_width=True):
                             stored_style = result.get("style") or "texthook_broll"
-                            stored_duration = int(result.get("duration") or (8 if stored_style == "texthook_broll" else 15))
+                            stored_duration = int(result.get("duration") or resolved_style_duration(stored_style, 15))
                             with st.spinner("Sending the current prompt and references to Magnific..."):
                                 new_result = generate_video(
                                     api_key=api_key,
@@ -2954,6 +3097,7 @@ def main():
                             new_result["hook_options"] = result.get("hook_options", [])
                             new_result["caption"] = result.get("caption")
                             new_result["hashtags"] = result.get("hashtags")
+                            new_result["sound_tip"] = result.get("sound_tip")
                             new_result["generated_at"] = datetime.now().isoformat()
                             add_generation(new_result)
                             st.rerun()
@@ -3278,6 +3422,8 @@ def main():
                                 st.caption(f"Caption: {result['caption']}")
                             if result.get("hashtags"):
                                 st.caption(f"Hashtags: {result['hashtags']}")
+                            if result.get("sound_tip"):
+                                st.caption(f"Sound tip: {result['sound_tip']}")
 
         # Bulk downloads
         st.divider()
