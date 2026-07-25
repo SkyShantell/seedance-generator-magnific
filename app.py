@@ -1520,11 +1520,156 @@ VOICEOVER_SILENT = "## Audio:\nNO voiceover. Ambient sound only."
 VOICEOVER_WITH_SCRIPT = '## Voiceover:\nInclude this voiceover (warm excited woman, casual and friendly):\n"{script}"'
 
 
+
+LIFESTYLE_SCENES = {
+    "hand_bathroom": {
+        "label": "Held in hand — bathroom",
+        "setting": (
+            "held casually in one hand against a real bathroom background. "
+            "A bathroom mirror edge, toothbrush holder, folded towel, and maybe a skincare bottle "
+            "sit softly blurred behind it. Warm overhead vanity lighting with a slight yellow cast"
+        ),
+        "placement": "held in one hand against a bathroom background",
+        "background": "a blurred bathroom mirror edge, toothbrush holder, and folded towel",
+        "hand_present": True,
+    },
+    "hand_kitchen": {
+        "label": "Held in hand — kitchen",
+        "setting": (
+            "held in one hand over a real kitchen countertop. A water glass, coffee mug, cutting-board edge, "
+            "and maybe a fruit bowl appear softly out of focus. Morning window light comes from the side"
+        ),
+        "placement": "held in one hand over a kitchen countertop",
+        "background": "a water glass, coffee mug, and cutting-board edge, softly blurred",
+        "hand_present": True,
+    },
+    "counter_kitchen": {
+        "label": "On kitchen counter",
+        "setting": (
+            "placed casually on a kitchen countertop, slightly off-center. A coffee mug, phone, and paper towel roll "
+            "sit nearby. Natural window light comes from the left with one ordinary pendant light overhead"
+        ),
+        "placement": "standing upright on a kitchen countertop",
+        "background": "a coffee mug and paper towel roll, softly blurred, with natural window light",
+        "hand_present": False,
+    },
+    "nightstand": {
+        "label": "On nightstand",
+        "setting": (
+            "sitting on a nightstand beside a charging phone, half-empty water glass, and a small lamp that is turned on. "
+            "Rumpled bedsheets appear at the bottom edge. Warm low light"
+        ),
+        "placement": "standing on a nightstand",
+        "background": "a charging phone, water glass, and rumpled bedsheets, softly blurred",
+        "hand_present": False,
+    },
+    "bed_toss": {
+        "label": "Tossed on bed",
+        "setting": (
+            "resting casually on a rumpled white duvet with a pillow behind it and maybe a book or earbuds nearby. "
+            "Soft natural bedroom-window light, slightly overexposed"
+        ),
+        "placement": "resting on a rumpled bed duvet",
+        "background": "a pillow and small everyday bedroom items, softly blurred",
+        "hand_present": False,
+    },
+    "bag_peek": {
+        "label": "Inside a bag",
+        "setting": (
+            "peeking out of an open purse or gym bag with keys, a wallet, hair tie, and maybe a water bottle visible. "
+            "Shot from above as if someone just opened the bag"
+        ),
+        "placement": "peeking out of an open bag, shot from above",
+        "background": "keys, a wallet, and a hair tie inside the bag, softly blurred",
+        "hand_present": False,
+    },
+    "closeup_label": {
+        "label": "Close-up of label",
+        "setting": (
+            "shown in an extreme close-up with the product label and packaging details sharp and readable. "
+            "Shot from about six inches away with the background completely blurred"
+        ),
+        "placement": "positioned close to the camera with the label facing forward",
+        "background": "a softly blurred surface with no distinct background elements",
+        "hand_present": False,
+    },
+    "desk": {
+        "label": "On desk",
+        "setting": (
+            "sitting on a real desk beside the edge of a laptop, pen, sticky note, and water bottle. "
+            "Ordinary overhead light with a little screen glow"
+        ),
+        "placement": "sitting on a desk",
+        "background": "the edge of a laptop, pen, sticky note, and water bottle, softly blurred",
+        "hand_present": False,
+    },
+    "car_cupholder": {
+        "label": "In car",
+        "setting": (
+            "sitting in a car cupholder or on the passenger seat. A seatbelt and steering wheel appear blurred behind it. "
+            "Natural daylight enters through the windshield"
+        ),
+        "placement": "sitting in a car cupholder",
+        "background": "a blurred steering wheel and seatbelt with daylight through the windshield",
+        "hand_present": False,
+    },
+    "gym_bag": {
+        "label": "With gym gear",
+        "setting": (
+            "resting on a gym bench or locker-room shelf beside a water bottle and towel. "
+            "Slightly harsh fluorescent light with gym equipment blurred in the background"
+        ),
+        "placement": "resting on a gym bench",
+        "background": "a water bottle and towel, softly blurred, with fluorescent gym lighting",
+        "hand_present": False,
+    },
+}
+
+LIFESTYLE_IPHONE_STYLE = (
+    "Unedited iPhone 16 photo, raw HEIC-to-JPEG look, zero retouching. Vertical 9:16 handheld framing, "
+    "slightly imperfect crop, product sharp with natural background blur, subtle phone-camera grain, "
+    "realistic edge distortion, and natural shadows from one ordinary real light source. "
+    "No studio lighting, softboxes, ring light, commercial reflections, color grading, or polished ad composition. "
+)
+
+
+def build_lifestyle_image_prompt(product_name: str, scene_key: str) -> str:
+    scene = LIFESTYLE_SCENES.get(scene_key, LIFESTYLE_SCENES["hand_bathroom"])
+    return (
+        f"{LIFESTYLE_IPHONE_STYLE}A single {product_name}, {scene['setting']}. "
+        "Use all uploaded product images only as exact visual references for packaging, colors, logo placement, "
+        "label text, product count, shape, cap, material, and proportions. Keep the real product accurate and recognizable. "
+        "The environment should feel lived-in, casual, imperfect, and believable, like a quick TikTok Shop customer photo. "
+        "Do not make this look like AI, a 3D render, a brand shoot, or a floating product mockup. "
+        "No rendered captions, promotional text, prices, stickers, graphics, or watermarks. "
+        "Physical writing printed on the real package is allowed."
+    )
+
+
+def build_lifestyle_kling_prompt(product_name: str, product_details: str, scene_key: str) -> str:
+    scene = LIFESTYLE_SCENES.get(scene_key, LIFESTYLE_SCENES["hand_bathroom"])
+    hand_present = bool(scene["hand_present"])
+    subject = "the hand and product" if hand_present else "the product"
+    pronoun = "they" if hand_present else "it"
+    prompt = (
+        f"Use the approved lifestyle image as the exact source image. Create a realistic vertical TikTok Shop UGC video of "
+        f"{product_name} {scene['placement']}. {subject.capitalize()} remain completely stationary and fixed exactly as shown "
+        f"for the entire clip; {pronoun} must not lift, tilt, rotate, slide, bend, float, duplicate, melt, warp, or change shape. "
+        f"Strictly preserve these product details: {product_details}. Keep the same setting and lighting as the approved image: "
+        f"{scene['background']}. Only the handheld phone camera moves: use an iPhone 0.5x ultra-wide feel, a clear side-to-side "
+        "arc, a slight push-in, natural micro-shake, realistic parallax, contact shadows, reflections, and depth of field. "
+        f"Repeat: {subject} stay fixed while only the camera moves. No rendered text, captions, stickers, prices, particles, "
+        "new hands or people, flicker, broken shadows, hallucinated objects, or polished commercial styling. Sound off. 9:16."
+    )
+    return re.sub(r"\s+", " ", prompt).strip()[:2450]
+
+
 STYLE_LABELS = {
     "shoe_video": "👟 Shoe Video (feet-only)",
     "texthook_broll": "📱 Text-Hook B-Roll",
     "warehouse": "🏬 Warehouse",
     "pool": "🏝️ Pool",
+    "lifestyle_animation": "📸 Lifestyle Animation",
 }
 
 
@@ -1533,6 +1678,8 @@ def resolved_style_duration(style: str, selected_duration: int = 15) -> int:
         return 5
     if style in ("texthook_broll", "pool"):
         return 8
+    if style == "lifestyle_animation":
+        return int(selected_duration) if int(selected_duration) in (5, 10) else 5
     return int(selected_duration)
 
 
@@ -2116,6 +2263,158 @@ def generate_video(
         return {"creation_id": None, "status": "error", "error": str(e)}
 
 
+
+LIFESTYLE_IMAGE_GENERATE_SYSTEM = """You are an image production assistant with access to Magnific tools.
+
+Use the same Magnific account and MCP connection already configured by the app.
+1. Upload every supplied raw product/reference image with creations_upload_image.
+2. Generate ONE lifestyle image with the provided prompt.
+3. Use model slug gpt_image_2, aspect ratio 9:16, resolution 2k, and quality high.
+4. Attach every uploaded image only as a product appearance/reference input. Image 1 has highest accuracy priority.
+5. Do not use a raw product image as the literal scene background or composition.
+6. Return the resulting Magnific creation identifier.
+
+Return ONLY valid JSON (no markdown):
+{"creation_id": "the Magnific creation identifier", "status": "queued", "error": null}
+"""
+
+LIFESTYLE_KLING_GENERATE_SYSTEM = """You are a video production assistant with access to Magnific tools.
+
+Use the same Magnific account and MCP connection already configured by the app.
+1. Upload the ONE approved lifestyle image with creations_upload_image.
+2. Generate a video with video_generate using model slug kling2_6.
+3. Use the uploaded approved lifestyle image as Kling's source/start image.
+4. Use the provided prompt, aspect ratio 9:16, the requested 5- or 10-second duration, and sound off.
+5. Do not upload or use the original raw product references in this Kling step.
+6. Return the resulting Magnific creation identifier.
+
+This is Kling image-to-video, not Seedance. The approved lifestyle image is intentionally the source image.
+
+Return ONLY valid JSON (no markdown):
+{"creation_id": "the Magnific creation identifier", "status": "queued", "error": null}
+"""
+
+
+def _parse_magnific_creation_response(response) -> dict:
+    """Extract a creation identifier from the same MCP response format used by the working video flow."""
+    result = {"creation_id": None, "status": "unknown", "error": None}
+    for block in response.content:
+        if block.type == "text":
+            try:
+                cleaned = re.sub(r'```json\s*|```\s*', '', block.text)
+                j = cleaned.find("{")
+                k = cleaned.rfind("}") + 1
+                if j >= 0 and k > j:
+                    parsed = json.loads(cleaned[j:k])
+                    result.update({key: value for key, value in parsed.items() if value is not None})
+            except json.JSONDecodeError:
+                pass
+        elif block.type == "mcp_tool_result":
+            if hasattr(block, "content") and block.content:
+                for sub in block.content:
+                    if not hasattr(sub, "text"):
+                        continue
+                    try:
+                        tool_result = json.loads(sub.text)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    if not isinstance(tool_result, dict):
+                        continue
+                    candidates = tool_result.get("creations") if isinstance(tool_result.get("creations"), list) else [tool_result]
+                    for creation in candidates:
+                        if not isinstance(creation, dict):
+                            continue
+                        if creation.get("identifier"):
+                            result["creation_id"] = creation["identifier"]
+                            result["status"] = creation.get("status", "queued")
+                        for url_key in ("url", "imageUrl", "image_url", "videoUrl", "video_url", "previewUrl", "preview_url"):
+                            if creation.get(url_key):
+                                if "preview" in url_key.lower():
+                                    result["preview_url"] = creation[url_key]
+                                else:
+                                    result["url"] = creation[url_key]
+    return result
+
+
+def generate_lifestyle_image_magnific(
+    api_key: str,
+    magnific_token: str,
+    product_name: str,
+    reference_urls: list[str],
+    prompt: str,
+) -> dict:
+    """Generate the approval image through the existing Magnific MCP token flow."""
+    mcp_servers = [{
+        "type": "url",
+        "url": MAGNIFIC_MCP_URL,
+        "name": MAGNIFIC_MCP_NAME,
+    }]
+    if magnific_token:
+        mcp_servers[0]["authorization_token"] = magnific_token
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        refs = [url for url in reference_urls if url]
+        refs_text = "\n".join(f"Product reference {index + 1}: {url}" for index, url in enumerate(refs))
+        response = client.beta.messages.create(
+            model=MODEL,
+            max_tokens=2048,
+            system=LIFESTYLE_IMAGE_GENERATE_SYSTEM,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Generate one lifestyle image for: {product_name}.\n"
+                    "Upload every reference below and use all of them for product accuracy.\n"
+                    f"{refs_text}\n\nLifestyle prompt:\n{prompt}"
+                ),
+            }],
+            mcp_servers=mcp_servers,
+            tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
+            betas=[MCP_BETA],
+        )
+        return _parse_magnific_creation_response(response)
+    except Exception as exc:
+        return {"creation_id": None, "status": "error", "error": str(exc)}
+
+
+def generate_lifestyle_kling_magnific(
+    api_key: str,
+    magnific_token: str,
+    approved_image_url: str,
+    prompt: str,
+    duration: int,
+) -> dict:
+    """Animate an approved lifestyle still with Kling through the same Magnific MCP connection."""
+    mcp_servers = [{
+        "type": "url",
+        "url": MAGNIFIC_MCP_URL,
+        "name": MAGNIFIC_MCP_NAME,
+    }]
+    if magnific_token:
+        mcp_servers[0]["authorization_token"] = magnific_token
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.beta.messages.create(
+            model=MODEL,
+            max_tokens=2048,
+            system=LIFESTYLE_KLING_GENERATE_SYSTEM,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Approved lifestyle image: {approved_image_url}\n"
+                    f"Generate a {duration}-second Kling 2.6 video with sound off.\n\nKling prompt:\n{prompt}"
+                ),
+            }],
+            mcp_servers=mcp_servers,
+            tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
+            betas=[MCP_BETA],
+        )
+        return _parse_magnific_creation_response(response)
+    except Exception as exc:
+        return {"creation_id": None, "status": "error", "error": str(exc)}
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  STATUS CHECKER — polls Magnific for finished videos
 # ═══════════════════════════════════════════════════════════════════
@@ -2235,7 +2534,7 @@ def main():
 
         style = st.radio(
             "Video style",
-            options=["shoe_video", "texthook_broll", "warehouse", "pool"],
+            options=["shoe_video", "texthook_broll", "warehouse", "pool", "lifestyle_animation"],
             format_func=lambda value: STYLE_LABELS[value],
             key="main_video_style",
             horizontal=True,
@@ -2272,6 +2571,21 @@ def main():
                 "Pool is fixed at 8 seconds and silent: handheld poolside product close-up → patio table beauty shot → poolside close-up. "
                 "The chosen hook is added afterward with FFmpeg."
             )
+        elif style == "lifestyle_animation":
+            duration_col, info_col = st.columns([1, 3], vertical_alignment="top")
+            with duration_col:
+                duration = st.select_slider(
+                    "Kling duration",
+                    options=[5, 10],
+                    value=5,
+                    key="main_lifestyle_duration",
+                )
+            with info_col:
+                st.info(
+                    "Lifestyle Animation uses Magnific for both steps: generate a GPT Image 2 lifestyle photo, approve it, then animate that approved image with Kling 2.6. "
+                    "The selected hook is added afterward with FFmpeg."
+                )
+            voice_script = None
         else:
             duration = 8
             voice_script = None
@@ -2377,6 +2691,7 @@ def main():
         scraped_products = st.session_state["scraped"]
         selections = {}  # product_index → selected image URL list
         edited_names = {}
+        lifestyle_settings = {}
 
         for idx, product in enumerate(scraped_products):
             st.markdown("---")
@@ -2577,6 +2892,27 @@ def main():
                 selections[idx] = []
 
 
+            if style == "lifestyle_animation":
+                st.markdown("##### Lifestyle image setup")
+                scene_key = st.selectbox(
+                    "Lifestyle scene",
+                    options=list(LIFESTYLE_SCENES.keys()),
+                    format_func=lambda value: LIFESTYLE_SCENES[value]["label"],
+                    key=f"lifestyle_scene_{idx}",
+                )
+                appearance_details = st.text_area(
+                    "Product appearance details",
+                    placeholder="Example: white plastic bottle, navy label, gold logo, white flip-top cap",
+                    height=80,
+                    key=f"lifestyle_appearance_{idx}",
+                    help="Kling uses this after you approve the lifestyle image. Include the package color, cap, label, material, and logo placement.",
+                ).strip()
+                lifestyle_settings[idx] = {
+                    "scene_key": scene_key,
+                    "appearance_details": appearance_details or "the exact packaging, label, colors, cap, logo placement, material, and proportions shown in the approved image",
+                }
+
+
         # ════════════════════════════════════════════════════════════════
         #  STEP 3 — GENERATE OR GET PROMPTS
         # ════════════════════════════════════════════════════════════════
@@ -2589,12 +2925,25 @@ def main():
         final_products = []
         for idx, product in enumerate(scraped_products):
             selected_refs = selections.get(idx) or [product["images"][0]]
-            final_products.append({
+            product_entry = {
                 "name": product["name"],
                 "image_url": selected_refs[0],
                 "image_urls": selected_refs,
                 "source_url": product["source_url"],
-            })
+            }
+            if style == "lifestyle_animation":
+                scene_key = lifestyle_settings.get(idx, {}).get("scene_key", "hand_bathroom")
+                appearance_details = lifestyle_settings.get(idx, {}).get(
+                    "appearance_details",
+                    "the exact packaging, label, colors, cap, logo placement, material, and proportions shown in the approved image",
+                )
+                product_entry.update({
+                    "scene_key": scene_key,
+                    "appearance_details": appearance_details,
+                    "lifestyle_prompt": build_lifestyle_image_prompt(product["name"], scene_key),
+                    "kling_prompt": build_lifestyle_kling_prompt(product["name"], appearance_details, scene_key),
+                })
+            final_products.append(product_entry)
 
         # ── Pick hooks FIRST, then generate ──
         hooks_ready = False
@@ -2607,7 +2956,7 @@ def main():
 
         # All three styles use generated on-screen text hooks.
         # The selected hook is stored now and burned onto the finished video later with FFmpeg.
-        if style in ("texthook_broll", "shoe_video", "warehouse", "pool"):
+        if style in ("texthook_broll", "shoe_video", "warehouse", "pool", "lifestyle_animation"):
             hooks_ready = False
 
             # ── Step 3a: Generate hook options ──
@@ -2690,12 +3039,13 @@ def main():
             st.markdown("---")
             if has_token:
                 col1, col2 = st.columns(2)
-                auto_btn = col1.button("🎬 Step 2 — Auto-Generate Videos",
-                                        type="primary", use_container_width=True)
-                prompt_btn = col2.button("📝 Just Get Prompts", use_container_width=True)
+                auto_label = "🖼️ Step 2 — Generate Lifestyle Image" if style == "lifestyle_animation" else "🎬 Step 2 — Auto-Generate Videos"
+                prompt_label = "📝 Get Lifestyle + Kling Prompts" if style == "lifestyle_animation" else "📝 Just Get Prompts"
+                auto_btn = col1.button(auto_label, type="primary", use_container_width=True)
+                prompt_btn = col2.button(prompt_label, use_container_width=True)
             else:
-                prompt_btn = st.button("📝 Get Prompts + Images (generate manually in Magnific)",
-                                       type="primary", use_container_width=True)
+                prompt_label = "📝 Get Lifestyle + Kling Prompts" if style == "lifestyle_animation" else "📝 Get Prompts + Images (generate manually in Magnific)"
+                prompt_btn = st.button(prompt_label, type="primary", use_container_width=True)
 
         if (auto_btn or prompt_btn) and not api_key:
             st.error("❌ Anthropic API key is missing. Ask Sky to set it up.")
@@ -2723,20 +3073,28 @@ def main():
             # Get the accepted hook for texthook_broll style
             selected_hook = None
             hook_data_for_product = None
-            if style in ("texthook_broll", "shoe_video", "warehouse", "pool"):
+            if style in ("texthook_broll", "shoe_video", "warehouse", "pool", "lifestyle_animation"):
                 hook_data_for_product = st.session_state.get("product_hooks", {}).get(i)
                 if hook_data_for_product:
                     selected_hook = hook_data_for_product.get("accepted_hook")
 
             with st.spinner(f"Writing prompt for {product['name'][:30]}..."):
-                result = write_prompt(
-                    api_key=api_key,
-                    product_name=product["name"],
-                    style=style,
-                    duration=duration,
-                    voice_script=voice_script if voice_script else None,
-                    selected_hook=selected_hook,
-                )
+                if style == "lifestyle_animation":
+                    result = {
+                        "prompt": product["lifestyle_prompt"],
+                        "lifestyle_prompt": product["lifestyle_prompt"],
+                        "kling_prompt": product["kling_prompt"],
+                        "char_count": len(product["lifestyle_prompt"]),
+                    }
+                else:
+                    result = write_prompt(
+                        api_key=api_key,
+                        product_name=product["name"],
+                        style=style,
+                        duration=duration,
+                        voice_script=voice_script if voice_script else None,
+                        selected_hook=selected_hook,
+                    )
 
             # Carry over hook data into result for persistence
             if hook_data_for_product:
@@ -2766,7 +3124,21 @@ def main():
                 )
 
             with col_prompt:
-                if result.get("prompt"):
+                if style == "lifestyle_animation":
+                    st.text_area(
+                        "GPT Image 2 lifestyle prompt",
+                        value=result["lifestyle_prompt"],
+                        height=210,
+                        key=f"lifestyle_prompt_{i}",
+                    )
+                    st.text_area(
+                        "Kling 2.6 animation prompt",
+                        value=result["kling_prompt"],
+                        height=240,
+                        key=f"kling_prompt_{i}",
+                    )
+                    st.caption(f"Scene: {LIFESTYLE_SCENES[product['scene_key']]['label']} · Kling duration: {resolved_style_duration(style, duration)}s")
+                elif result.get("prompt"):
                     st.text_area(
                         "Seedance Prompt (copy this):",
                         value=result["prompt"],
@@ -2802,6 +3174,12 @@ def main():
             entry["voice_script"] = voice_script or ""
             entry["status"] = "prompt_only"
             entry["generated_at"] = datetime.now().isoformat()
+            if style == "lifestyle_animation":
+                entry["scene_key"] = fp.get("scene_key")
+                entry["appearance_details"] = fp.get("appearance_details")
+                entry["lifestyle_prompt"] = fp.get("lifestyle_prompt")
+                entry["kling_prompt"] = fp.get("kling_prompt")
+                entry["pipeline_stage"] = "prompt"
             add_generation(entry)
 
         # Manual generation instructions
@@ -2857,68 +3235,99 @@ def main():
             if token_expired:
                 break
 
-            progress.progress(i / len(final_products),
-                              text=f"Processing {i+1}/{len(final_products)}: {product['name'][:30]}...")
+            progress.progress(
+                i / len(final_products),
+                text=f"Processing {i+1}/{len(final_products)}: {product['name'][:30]}...",
+            )
 
-            # Step A: Write the prompt (cheap, no MCP)
             selected_hook = None
-            hook_data_for_product = None
-            if style in ("texthook_broll", "shoe_video", "warehouse", "pool"):
-                hook_data_for_product = st.session_state.get("product_hooks", {}).get(i)
-                if hook_data_for_product:
-                    selected_hook = hook_data_for_product.get("accepted_hook")
+            hook_data_for_product = st.session_state.get("product_hooks", {}).get(i)
+            if hook_data_for_product:
+                selected_hook = hook_data_for_product.get("accepted_hook")
 
-            with st.spinner(f"Writing prompt for {product['name'][:30]}..."):
-                prompt_result = write_prompt(
-                    api_key=api_key,
-                    product_name=product["name"],
-                    style=style,
-                    duration=duration,
-                    voice_script=voice_script if voice_script else None,
-                    selected_hook=selected_hook,
-                )
+            if style == "lifestyle_animation":
+                prompt_text = product["lifestyle_prompt"]
+                with st.spinner(f"Generating lifestyle image for {product['name'][:30]} through Magnific..."):
+                    gen_result = generate_lifestyle_image_magnific(
+                        api_key=api_key,
+                        magnific_token=magnific_token,
+                        product_name=product["name"],
+                        reference_urls=product.get("image_urls", [product["image_url"]]),
+                        prompt=prompt_text,
+                    )
 
-            if prompt_result.get("error") or not prompt_result.get("prompt"):
-                st.error(f"❌ **{product['name']}** — Prompt error: {prompt_result.get('error', 'No prompt')}")
-                results.append({"product_name": product["name"], "status": "error",
-                                "error": prompt_result.get("error"), "creation_id": None})
-                continue
-
-            prompt_text = prompt_result["prompt"]
-
-            # Step B: Generate via Magnific MCP
-            with st.spinner(f"Generating video for {product['name'][:30]}... (may take a minute)"):
-                gen_result = generate_video(
-                    api_key=api_key,
-                    magnific_token=magnific_token,
-                    image_url=product["image_url"],
-                    image_urls=product.get("image_urls"),
-                    prompt=prompt_text,
-                    duration=resolved_style_duration(style, duration),
-                )
-
-            gen_result["product_name"] = product["name"]
-            gen_result["prompt_used"] = prompt_text
-            results.append(gen_result)
-
-            if gen_result.get("creation_id") and gen_result["status"] == "queued":
-                st.success(f"✅ **{product['name']}** — Creation ID: `{gen_result['creation_id']}`")
-            elif gen_result["status"] == "error":
-                error_msg = gen_result.get("error", "")
-                st.error(f"❌ **{product['name']}** — {error_msg}")
-
-                if any(kw in error_msg.lower() for kw in ['401', 'unauthorized', 'auth', 'token', 'forbidden', '403']):
-                    st.warning("🔄 **Token expired.** Paste a fresh token in the API connection section and re-run.")
-                    token_expired = True
-
-                    # Show the prompt so they can still use it manually
-                    with st.expander(f"📝 Prompt for {product['name']} (use manually)"):
-                        st.code(prompt_text, language=None)
-                        st.text_input("Image URL:", value=product["image_url"], key=f"fallback_img_{i}")
+                gen_result["product_name"] = product["name"]
+                gen_result["prompt"] = prompt_text
+                gen_result["prompt_used"] = prompt_text
+                gen_result["lifestyle_prompt"] = prompt_text
+                gen_result["kling_prompt"] = product["kling_prompt"]
+                gen_result["scene_key"] = product["scene_key"]
+                gen_result["appearance_details"] = product["appearance_details"]
+                gen_result["pipeline_stage"] = "image"
+                gen_result["lifestyle_creation_id"] = gen_result.get("creation_id")
+                if gen_result.get("status") == "queued":
+                    gen_result["status"] = "image_queued"
+                    st.success(f"✅ **{product['name']}** — Lifestyle image queued: `{gen_result.get('creation_id')}`")
+                elif gen_result.get("status") == "processing":
+                    gen_result["status"] = "image_processing"
+                    st.success(f"✅ **{product['name']}** — Lifestyle image is processing")
+                elif gen_result.get("status") == "completed":
+                    gen_result["status"] = "image_completed"
+                    gen_result["lifestyle_image_url"] = gen_result.get("url") or gen_result.get("preview_url")
+                    st.success(f"✅ **{product['name']}** — Lifestyle image is ready for approval")
+                elif gen_result.get("status") == "error":
+                    error_msg = gen_result.get("error", "")
+                    st.error(f"❌ **{product['name']}** — {error_msg}")
+                    if any(keyword in error_msg.lower() for keyword in ['401', 'unauthorized', 'auth', 'token', 'forbidden', '403']):
+                        st.warning("🔄 Magnific authentication failed. Refresh the token using the same API section from the working app.")
+                        token_expired = True
+                else:
+                    st.warning(f"⚠️ **{product['name']}** — Status: {gen_result.get('status')}")
             else:
-                st.warning(f"⚠️ **{product['name']}** — Status: {gen_result['status']}")
+                with st.spinner(f"Writing prompt for {product['name'][:30]}..."):
+                    prompt_result = write_prompt(
+                        api_key=api_key,
+                        product_name=product["name"],
+                        style=style,
+                        duration=duration,
+                        voice_script=voice_script if voice_script else None,
+                        selected_hook=selected_hook,
+                    )
 
-            # Save the hook as the starting text for the completed-video editor
+                if prompt_result.get("error") or not prompt_result.get("prompt"):
+                    st.error(f"❌ **{product['name']}** — Prompt error: {prompt_result.get('error', 'No prompt')}")
+                    results.append({
+                        "product_name": product["name"],
+                        "status": "error",
+                        "error": prompt_result.get("error"),
+                        "creation_id": None,
+                    })
+                    continue
+
+                prompt_text = prompt_result["prompt"]
+                with st.spinner(f"Generating video for {product['name'][:30]}... (may take a minute)"):
+                    gen_result = generate_video(
+                        api_key=api_key,
+                        magnific_token=magnific_token,
+                        image_url=product["image_url"],
+                        image_urls=product.get("image_urls"),
+                        prompt=prompt_text,
+                        duration=resolved_style_duration(style, duration),
+                    )
+
+                gen_result["product_name"] = product["name"]
+                gen_result["prompt_used"] = prompt_text
+                if gen_result.get("creation_id") and gen_result.get("status") == "queued":
+                    st.success(f"✅ **{product['name']}** — Creation ID: `{gen_result['creation_id']}`")
+                elif gen_result.get("status") == "error":
+                    error_msg = gen_result.get("error", "")
+                    st.error(f"❌ **{product['name']}** — {error_msg}")
+                    if any(keyword in error_msg.lower() for keyword in ['401', 'unauthorized', 'auth', 'token', 'forbidden', '403']):
+                        st.warning("🔄 **Token expired.** Paste a fresh token in the API connection section and re-run.")
+                        token_expired = True
+                else:
+                    st.warning(f"⚠️ **{product['name']}** — Status: {gen_result.get('status')}")
+
             if hook_data_for_product:
                 gen_result["accepted_hook"] = selected_hook
                 gen_result["hook_options"] = hook_data_for_product.get("hook_options", [])
@@ -2927,13 +3336,8 @@ def main():
                 gen_result["sound_tip"] = hook_data_for_product.get("sound_tip")
                 if selected_hook:
                     st.info(f"📝 Hook saved for the text editor: {selected_hook}")
-                if hook_data_for_product.get("caption"):
-                    st.caption(f"Caption: {hook_data_for_product['caption']}")
-                if hook_data_for_product.get("hashtags"):
-                    st.caption(f"Hashtags: {hook_data_for_product['hashtags']}")
-                if hook_data_for_product.get("sound_tip"):
-                    st.caption(f"Sound tip: {hook_data_for_product['sound_tip']}")
 
+            results.append(gen_result)
             if i < len(final_products) - 1:
                 time.sleep(5)
 
@@ -2948,11 +3352,16 @@ def main():
             r["duration"] = resolved_style_duration(style, duration)
             r["voice_script"] = voice_script or ""
             r["generated_at"] = datetime.now().isoformat()
+            if style == "lifestyle_animation":
+                r["scene_key"] = fp.get("scene_key")
+                r["appearance_details"] = fp.get("appearance_details")
+                r["lifestyle_prompt"] = fp.get("lifestyle_prompt")
+                r["kling_prompt"] = fp.get("kling_prompt")
             add_generation(r)
 
         # Summary
         st.divider()
-        queued = sum(1 for r in results if r.get("status") == "queued")
+        queued = sum(1 for r in results if r.get("status") in ("queued", "image_queued", "image_processing"))
         errors = sum(1 for r in results if r.get("status") == "error")
 
         col1, col2, col3 = st.columns(3)
@@ -3111,16 +3520,34 @@ def main():
             for refresh_index, refresh_result in enumerate(saved_gens):
                 refresh_creation_id = refresh_result.get("creation_id")
                 refresh_status = refresh_result.get("status", "unknown")
-                if refresh_creation_id and refresh_status not in ("completed", "error"):
+                is_lifestyle_image = (
+                    refresh_result.get("style") == "lifestyle_animation"
+                    and refresh_result.get("pipeline_stage") == "image"
+                )
+                terminal_statuses = {"completed", "error", "prompt_only", "image_approved"}
+                if refresh_status == "image_completed" and refresh_result.get("lifestyle_image_url"):
+                    terminal_statuses.add("image_completed")
+                if refresh_creation_id and refresh_status not in terminal_statuses:
                     with st.spinner(f"Checking {refresh_result.get('product_name', 'video')}..."):
-                        status_result = check_creation_status(
-                            api_key, magnific_token, refresh_creation_id
-                        )
-                    saved_gens[refresh_index]["status"] = status_result.get("status", refresh_status)
-                    if status_result.get("url"):
-                        saved_gens[refresh_index]["url"] = status_result["url"]
-                    if status_result.get("preview_url"):
-                        saved_gens[refresh_index]["preview_url"] = status_result["preview_url"]
+                        status_result = check_creation_status(api_key, magnific_token, refresh_creation_id)
+                    if is_lifestyle_image:
+                        raw_status = status_result.get("status", refresh_status)
+                        mapped = {
+                            "queued": "image_queued",
+                            "processing": "image_processing",
+                            "completed": "image_completed",
+                            "error": "error",
+                        }.get(raw_status, raw_status)
+                        saved_gens[refresh_index]["status"] = mapped
+                        approved_image_url = status_result.get("url") or status_result.get("preview_url")
+                        if approved_image_url:
+                            saved_gens[refresh_index]["lifestyle_image_url"] = approved_image_url
+                    else:
+                        saved_gens[refresh_index]["status"] = status_result.get("status", refresh_status)
+                        if status_result.get("url"):
+                            saved_gens[refresh_index]["url"] = status_result["url"]
+                        if status_result.get("preview_url"):
+                            saved_gens[refresh_index]["preview_url"] = status_result["preview_url"]
                     refreshed_any = True
             if refreshed_any:
                 save_generations(saved_gens)
@@ -3184,6 +3611,10 @@ def main():
                         "completed": "🟢 Completed",
                         "error": "🔴 Error",
                         "prompt_only": "📝 Prompt only",
+                        "image_queued": "🟡 Image queued",
+                        "image_processing": "🟠 Image processing",
+                        "image_completed": "🖼️ Awaiting approval",
+                        "image_approved": "✅ Image approved",
                     }
                     list_badge = list_status_badges.get(list_status, f"⚪ {list_status}")
                     text_marker = " · ✍️ Text ready" if read_local_video(list_result.get("processed_path")) else ""
@@ -3227,6 +3658,10 @@ def main():
                     "completed": "🟢 Completed",
                     "error": "🔴 Error",
                     "prompt_only": "📝 Prompt Only",
+                    "image_queued": "🟡 Image queued",
+                    "image_processing": "🟠 Image processing",
+                    "image_completed": "🖼️ Awaiting approval",
+                    "image_approved": "✅ Image approved",
                 }
                 badge = status_badges.get(status, f"⚪ {status}")
 
@@ -3246,78 +3681,147 @@ def main():
                         st.caption(f"Creation ID: `{creation_id}`")
 
                 with header_actions:
-                    if creation_id and status not in ("completed", "error") and magnific_token and api_key:
+                    stored_style = result.get("style") or "texthook_broll"
+                    is_lifestyle = stored_style == "lifestyle_animation"
+                    is_lifestyle_image_stage = is_lifestyle and result.get("pipeline_stage") == "image"
+
+                    terminal_statuses = {"completed", "error", "prompt_only", "image_approved"}
+                    if status == "image_completed" and result.get("lifestyle_image_url"):
+                        terminal_statuses.add("image_completed")
+                    if creation_id and status not in terminal_statuses and magnific_token and api_key:
                         if st.button("🔄 Check status", key=f"chk_{i}", use_container_width=True):
                             with st.spinner("Checking..."):
-                                status_result = check_creation_status(
-                                    api_key, magnific_token, creation_id
-                                )
-                            saved_gens[i]["status"] = status_result.get("status", status)
-                            if status_result.get("url"):
-                                saved_gens[i]["url"] = status_result["url"]
-                            if status_result.get("preview_url"):
-                                saved_gens[i]["preview_url"] = status_result["preview_url"]
+                                status_result = check_creation_status(api_key, magnific_token, creation_id)
+                            if is_lifestyle_image_stage:
+                                raw_status = status_result.get("status", status)
+                                saved_gens[i]["status"] = {
+                                    "queued": "image_queued",
+                                    "processing": "image_processing",
+                                    "completed": "image_completed",
+                                    "error": "error",
+                                }.get(raw_status, raw_status)
+                                lifestyle_url = status_result.get("url") or status_result.get("preview_url")
+                                if lifestyle_url:
+                                    saved_gens[i]["lifestyle_image_url"] = lifestyle_url
+                            else:
+                                saved_gens[i]["status"] = status_result.get("status", status)
+                                if status_result.get("url"):
+                                    saved_gens[i]["url"] = status_result["url"]
+                                if status_result.get("preview_url"):
+                                    saved_gens[i]["preview_url"] = status_result["preview_url"]
                             save_generations(saved_gens)
                             st.rerun()
 
-                    current_prompt = result.get("prompt_used") or result.get("prompt")
-                    if current_prompt and api_key:
-                        if st.button("🪄 Regenerate prompt", key=f"regen_prompt_{i}", use_container_width=True):
-                            stored_style = result.get("style") or "texthook_broll"
-                            stored_duration = int(result.get("duration") or resolved_style_duration(stored_style, 15))
-                            with st.spinner("Writing a new prompt..."):
-                                regenerated_prompt = write_prompt(
-                                    api_key=api_key,
-                                    product_name=product_name,
-                                    style=stored_style,
-                                    duration=stored_duration,
-                                    voice_script=result.get("voice_script") or None,
-                                    selected_hook=result.get("accepted_hook") or None,
-                                )
-                            if regenerated_prompt.get("prompt"):
-                                result["prompt"] = regenerated_prompt["prompt"]
-                                result["prompt_used"] = regenerated_prompt["prompt"]
-                                result["prompt_regenerated_at"] = datetime.now().isoformat()
-                                saved_gens[i] = result
+                    if is_lifestyle:
+                        if status == "image_completed":
+                            if st.button("✅ Approve image", key=f"approve_lifestyle_{i}", type="primary", use_container_width=True):
+                                saved_gens[i]["status"] = "image_approved"
+                                saved_gens[i]["approved_at"] = datetime.now().isoformat()
                                 save_generations(saved_gens)
-                                st.success("New prompt saved. Use Generate/Regenerate video when ready.")
-                            else:
-                                st.error(regenerated_prompt.get("error", "The prompt could not be regenerated."))
+                                st.rerun()
 
-                    current_prompt = result.get("prompt_used") or result.get("prompt")
-                    if current_prompt and result.get("image_url") and magnific_token and api_key:
-                        video_button_label = "🎬 Generate video" if status == "prompt_only" else "🎬 Regenerate video"
-                        if st.button(video_button_label, key=f"regen_{i}", use_container_width=True):
-                            stored_style = result.get("style") or "texthook_broll"
-                            stored_duration = int(result.get("duration") or resolved_style_duration(stored_style, 15))
-                            with st.spinner("Sending the current prompt and references to Magnific..."):
-                                new_result = generate_video(
-                                    api_key=api_key,
-                                    magnific_token=magnific_token,
-                                    image_url=result["image_url"],
-                                    image_urls=result.get("image_urls", [result["image_url"]]),
-                                    prompt=current_prompt,
-                                    duration=stored_duration,
-                                )
-                            new_result["product_name"] = product_name
-                            new_result["prompt_used"] = current_prompt
-                            new_result["prompt"] = current_prompt
-                            new_result["image_url"] = result["image_url"]
-                            new_result["image_urls"] = result.get("image_urls", [result["image_url"]])
-                            new_result["source_url"] = result.get("source_url", "")
-                            new_result["style"] = stored_style
-                            new_result["duration"] = stored_duration
-                            new_result["voice_script"] = result.get("voice_script", "")
-                            new_result["accepted_hook"] = result.get("accepted_hook")
-                            new_result["hook_options"] = result.get("hook_options", [])
-                            new_result["caption"] = result.get("caption")
-                            new_result["hashtags"] = result.get("hashtags")
-                            new_result["sound_tip"] = result.get("sound_tip")
-                            new_result["generated_at"] = datetime.now().isoformat()
-                            add_generation(new_result)
-                            st.rerun()
+                        if status == "image_approved" and result.get("lifestyle_image_url") and magnific_token and api_key:
+                            if st.button("🎬 Generate Kling video", key=f"generate_kling_{i}", type="primary", use_container_width=True):
+                                with st.spinner("Animating the approved image with Kling through Magnific..."):
+                                    kling_result = generate_lifestyle_kling_magnific(
+                                        api_key=api_key,
+                                        magnific_token=magnific_token,
+                                        approved_image_url=result["lifestyle_image_url"],
+                                        prompt=result.get("kling_prompt") or "",
+                                        duration=int(result.get("duration") or 5),
+                                    )
+                                if kling_result.get("creation_id"):
+                                    saved_gens[i]["video_creation_id"] = kling_result["creation_id"]
+                                    saved_gens[i]["creation_id"] = kling_result["creation_id"]
+                                    saved_gens[i]["pipeline_stage"] = "video"
+                                    saved_gens[i]["status"] = kling_result.get("status", "queued")
+                                    saved_gens[i]["kling_started_at"] = datetime.now().isoformat()
+                                    save_generations(saved_gens)
+                                    st.rerun()
+                                else:
+                                    st.error(kling_result.get("error", "Magnific did not return a Kling creation ID."))
 
-                video_url = result.get("url") or result.get("preview_url")
+                        if status in ("image_completed", "image_approved"):
+                            if st.button("🖼️ Regenerate lifestyle image", key=f"regen_lifestyle_{i}", use_container_width=True):
+                                with st.spinner("Generating another lifestyle image through Magnific..."):
+                                    image_result = generate_lifestyle_image_magnific(
+                                        api_key=api_key,
+                                        magnific_token=magnific_token,
+                                        product_name=product_name,
+                                        reference_urls=result.get("image_urls", [result.get("image_url")]),
+                                        prompt=result.get("lifestyle_prompt") or result.get("prompt_used") or result.get("prompt") or "",
+                                    )
+                                if image_result.get("creation_id"):
+                                    saved_gens[i]["creation_id"] = image_result["creation_id"]
+                                    saved_gens[i]["lifestyle_creation_id"] = image_result["creation_id"]
+                                    saved_gens[i]["pipeline_stage"] = "image"
+                                    saved_gens[i]["status"] = "image_queued" if image_result.get("status") == "queued" else image_result.get("status", "image_queued")
+                                    saved_gens[i].pop("lifestyle_image_url", None)
+                                    saved_gens[i].pop("approved_at", None)
+                                    save_generations(saved_gens)
+                                    st.rerun()
+                                else:
+                                    st.error(image_result.get("error", "Magnific did not return an image creation ID."))
+                    else:
+                        current_prompt = result.get("prompt_used") or result.get("prompt")
+                        if current_prompt and api_key:
+                            if st.button("🪄 Regenerate prompt", key=f"regen_prompt_{i}", use_container_width=True):
+                                stored_duration = int(result.get("duration") or resolved_style_duration(stored_style, 15))
+                                with st.spinner("Writing a new prompt..."):
+                                    regenerated_prompt = write_prompt(
+                                        api_key=api_key,
+                                        product_name=product_name,
+                                        style=stored_style,
+                                        duration=stored_duration,
+                                        voice_script=result.get("voice_script") or None,
+                                        selected_hook=result.get("accepted_hook") or None,
+                                    )
+                                if regenerated_prompt.get("prompt"):
+                                    result["prompt"] = regenerated_prompt["prompt"]
+                                    result["prompt_used"] = regenerated_prompt["prompt"]
+                                    result["prompt_regenerated_at"] = datetime.now().isoformat()
+                                    saved_gens[i] = result
+                                    save_generations(saved_gens)
+                                    st.success("New prompt saved. Use Generate/Regenerate video when ready.")
+                                else:
+                                    st.error(regenerated_prompt.get("error", "The prompt could not be regenerated."))
+
+                        current_prompt = result.get("prompt_used") or result.get("prompt")
+                        if current_prompt and result.get("image_url") and magnific_token and api_key:
+                            video_button_label = "🎬 Generate video" if status == "prompt_only" else "🎬 Regenerate video"
+                            if st.button(video_button_label, key=f"regen_{i}", use_container_width=True):
+                                stored_duration = int(result.get("duration") or resolved_style_duration(stored_style, 15))
+                                with st.spinner("Sending the current prompt and references to Magnific..."):
+                                    new_result = generate_video(
+                                        api_key=api_key,
+                                        magnific_token=magnific_token,
+                                        image_url=result["image_url"],
+                                        image_urls=result.get("image_urls", [result["image_url"]]),
+                                        prompt=current_prompt,
+                                        duration=stored_duration,
+                                    )
+                                new_result["product_name"] = product_name
+                                new_result["prompt_used"] = current_prompt
+                                new_result["prompt"] = current_prompt
+                                new_result["image_url"] = result["image_url"]
+                                new_result["image_urls"] = result.get("image_urls", [result["image_url"]])
+                                new_result["source_url"] = result.get("source_url", "")
+                                new_result["style"] = stored_style
+                                new_result["duration"] = stored_duration
+                                new_result["voice_script"] = result.get("voice_script", "")
+                                new_result["accepted_hook"] = result.get("accepted_hook")
+                                new_result["hook_options"] = result.get("hook_options", [])
+                                new_result["caption"] = result.get("caption")
+                                new_result["hashtags"] = result.get("hashtags")
+                                new_result["sound_tip"] = result.get("sound_tip")
+                                new_result["generated_at"] = datetime.now().isoformat()
+                                add_generation(new_result)
+                                st.rerun()
+
+                is_lifestyle_result = result.get("style") == "lifestyle_animation"
+                is_image_stage = is_lifestyle_result and result.get("pipeline_stage") == "image"
+                video_url = result.get("url") or (None if is_image_stage else result.get("preview_url"))
+                lifestyle_image_url = result.get("lifestyle_image_url")
                 processed_bytes = read_local_video(result.get("processed_path"))
                 original_bytes = None
                 safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", product_name)[:40]
@@ -3356,6 +3860,23 @@ def main():
                             )
                         else:
                             st.info("Your edited text version will appear here after you click Apply text below.")
+                elif is_lifestyle_result and lifestyle_image_url:
+                    image_col, approval_col = st.columns([1.15, 1.35], gap="large")
+                    with image_col:
+                        st.markdown("#### Generated lifestyle image")
+                        st.image(lifestyle_image_url, use_container_width=True)
+                    with approval_col:
+                        if status == "image_completed":
+                            st.success("Review this image carefully. Click **Approve image** only when the product and scene look right.")
+                        elif status == "image_approved":
+                            st.success("Approved. You can now generate the Kling animation from this exact image.")
+                        else:
+                            st.info("The image step is still processing.")
+                        scene_key = result.get("scene_key")
+                        if scene_key in LIFESTYLE_SCENES:
+                            st.caption(f"Scene: {LIFESTYLE_SCENES[scene_key]['label']}")
+                        if result.get("appearance_details"):
+                            st.caption(f"Product details: {result['appearance_details']}")
                 elif result.get("image_url"):
                     preview_image_col, preview_message_col = st.columns([1, 1.5])
                     with preview_image_col:
@@ -3364,12 +3885,21 @@ def main():
                         except Exception:
                             pass
                     with preview_message_col:
-                        st.info("This generation is not finished yet. Check its status when Magnific is connected.")
+                        if is_lifestyle_result:
+                            st.info("The lifestyle image is not ready yet. Check its status when Magnific is connected.")
+                        else:
+                            st.info("This generation is not finished yet. Check its status when Magnific is connected.")
 
                 prompt_text_field = result.get("prompt_used") or result.get("prompt")
                 if prompt_text_field:
                     with st.expander("📋 Generation prompt", expanded=False):
-                        st.code(prompt_text_field, language=None)
+                        if is_lifestyle_result:
+                            st.markdown("**GPT Image 2 lifestyle prompt**")
+                            st.code(result.get("lifestyle_prompt") or prompt_text_field, language=None)
+                            st.markdown("**Kling 2.6 animation prompt**")
+                            st.code(result.get("kling_prompt") or "", language=None)
+                        else:
+                            st.code(prompt_text_field, language=None)
                         reference_urls = result.get("image_urls") or ([result.get("image_url")] if result.get("image_url") else [])
                         if reference_urls:
                             st.caption(f"Reference images: {len(reference_urls)}")
