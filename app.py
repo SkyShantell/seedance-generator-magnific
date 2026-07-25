@@ -1389,24 +1389,23 @@ Return ONLY valid JSON (no markdown, no backticks):
 {{"product_name": "...", "hook_options": ["hook 1", "hook 2", "hook 3", "hook 4", "hook 5"], "caption": "...", "hashtags": "#tag1 #tag2", "sound_tip": "..."}}"""
 
 WAREHOUSE_PROMPT_SYSTEM = """You are a TikTok Shop affiliate content producer. Write a
-Seedance 2.0 prompt for the Warehouse close walk-up deal-drop style.
+Seedance 2.0 prompt for the Warehouse beside-the-display deal-drop style.
 
 HARD RULES:
 - 9:16 vertical, exactly about 5 seconds, raw TikTok UGC phone footage.
 - COMPLETELY SILENT: no audio, no voiceover, no narration.
 - ONE continuous take with zero cuts, jumps, scene changes, montage, orbit, or dramatic camera moves.
 - Pure first-person shopper POV. No people, hands, face, body, characters, or animals.
-- Begin already close to the warehouse display, about 3-4 feet away or only 1-2 natural walking steps away.
-- In the opening frame, the full pallet/display is already easy to see and occupies roughly 55-70% of the frame.
-  This is NOT a distant establishing shot and must never begin 6-8 feet away.
-- Walk forward slowly for only 1-2 steps until the products occupy roughly 80-90% of the frame.
-- Slightly off-center aisle discovery at the start, then a subtle natural straighten toward the product.
-- Natural vertical gait bounce, tiny side-to-side drift, handheld micro-shake, and a gentle walking stop.
-  Chest-height phone perspective with a mildly wide phone lens; no polished gimbal movement.
-- Keep the product display centered in the lower/middle frame while some ceiling, racking, adjacent pallets,
-  and polished concrete remain visible for warehouse context.
-- Warehouse club environment: high industrial ceiling, exposed beams, fluorescent lighting, polished concrete,
-  orange/teal metal racking, and generic adjacent bulk merchandise.
+- The camera begins ALREADY STANDING DIRECTLY BESIDE the product display at arm's length.
+- NO aisle walk-up, NO approach from several feet away, NO multiple footsteps, and NO distant establishing shot.
+- In the opening frame, the product display already dominates roughly 75-85% of the frame.
+- The camera stays almost stationary. Use only a tiny natural handheld lean-in or half-step of about 6-12 inches,
+  just enough for the packaging to fill roughly 90-95% of the final frame.
+- Natural phone micro-shake and subtle body sway are allowed, but do not simulate walking or repeated gait bounce.
+- Start slightly off-center beside the display, then make a small natural reframe toward the hero products.
+- Chest-height handheld phone perspective with a mildly wide phone lens; no polished gimbal movement and no digital zoom.
+- Keep a narrow amount of warehouse context visible around the display: metal racking, fluorescent light,
+  concrete floor, pallet edges, and generic adjacent bulk merchandise.
 - Show abundant repeated units in a real pallet display, branded cardboard shipper, shelf, or wire bin. Match all
   supplied reference images exactly for packaging, colors, proportions, labels, finish, logo, and product shape.
 - ZERO rendered overlay text: no captions, subtitles, prices, sale signs, promotional graphics, or watermarks.
@@ -1414,11 +1413,12 @@ HARD RULES:
 - Prompt must be under 1,900 characters.
 
 Required structure inside the prompt:
-[00:00-00:02] Close aisle discovery: camera is already only a few feet from the complete display. The pallet or
-shipper fills most of the vertical frame while warehouse surroundings remain visible. Begin a slow 1-2 step approach.
-[00:02-00:05] Tight arrival: continue the short approach until repeated products and authentic packaging dominate
-the frame. Labels and product details are clear. End with a natural handheld walking stop, not a zoom.
-End with a NEGATIVE sentence repeating no people/hands/body, no cuts, no audio, no rendered overlay text, and no zoom.
+[00:00-00:02] Already beside the display: camera is stationary at arm's length with the complete product display
+already filling most of the frame. Hold briefly with natural handheld micro-shake and a small off-center angle.
+[00:02-00:05] Tiny close reveal: make one subtle 6-12 inch lean-in or half-step and gently reframe so repeated
+products and authentic packaging dominate the frame. End beside the display with a natural handheld hold.
+End with a NEGATIVE sentence repeating no people/hands/body, no walking sequence, no cuts, no audio,
+no rendered overlay text, no start-frame behavior, and no digital zoom.
 
 Return ONLY valid JSON (no markdown, no backticks):
 {{"product_name": "...", "prompt": "the full Seedance prompt under 1900 characters", "char_count": 123}}"""
