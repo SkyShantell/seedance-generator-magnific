@@ -1423,6 +1423,30 @@ no rendered overlay text, no start-frame behavior, and no digital zoom.
 Return ONLY valid JSON (no markdown, no backticks):
 {{"product_name": "...", "prompt": "the full Seedance prompt under 1900 characters", "char_count": 123}}"""
 
+POOL_PROMPT_SYSTEM = """You are a TikTok Shop affiliate content producer. Write a
+Seedance 2.0 video prompt for the Pool style.
+
+HARD RULES:
+- 9:16 vertical, exactly 8 seconds, realistic TikTok Shop UGC filmed on a handheld iPhone.
+- Bright natural summer daylight beside a residential backyard swimming pool.
+- The text hook is added later with FFmpeg, so render ZERO on-screen text, captions, stickers, graphics, or price labels.
+- Use the uploaded product images only as general visual references for exact packaging, colors, shape, logo placement, and proportions.
+- NEVER use any image as a start frame, first frame, end frame, keyframe, or start_image.
+- Silent video: no dialogue, no narration, no voiceover.
+- Casual amateur phone footage, not a polished commercial.
+- Keep one accurate product package throughout the entire video.
+- No warped hands, no extra fingers, no packaging changes, no invented words, no duplicate products, no studio lighting, and no digital zoom.
+- Prompt must stay under 1,900 characters.
+
+Required scene structure:
+[00:00-00:03] Handheld product close-up beside the pool. One natural hand holds the product upright over the textured pool edge with turquoise pool water visible beside it. The packaging faces the camera and fills about 65-75% of the frame. Slight natural wrist movement and casual phone micro-shake.
+[00:03-00:05.5] Quick clean cut. The product stands upright by itself on a small round mosaic patio table beside the pool. The camera makes a short casual half-orbit and subtle push-in around the package. Green backyard plants and trees remain softly visible behind it.
+[00:05.5-00:08] Quick clean cut. The product is held upright again beside the pool while the camera moves slowly along the pool edge. Only one or two small natural steps, not a long walking sequence. Keep the package centered and dominant while the blue pool water and concrete walkway move gently in the background.
+End with a NEGATIVE sentence repeating: no rendered text, no voiceover, no start-frame behavior, no packaging changes, no duplicate products, no digital zoom, and no polished commercial look.
+
+Return ONLY valid JSON (no markdown, no backticks):
+{{"product_name": "...", "prompt": "the full seedance prompt under 1900 chars", "char_count": 123}}"""
+
 TEXTHOOK_PROMPT_SYSTEM = """You are a TikTok Shop affiliate content producer. Write a
 Seedance 2.0 video prompt for a clean text-hook b-roll video.
 
@@ -1500,13 +1524,14 @@ STYLE_LABELS = {
     "shoe_video": "👟 Shoe Video (feet-only)",
     "texthook_broll": "📱 Text-Hook B-Roll",
     "warehouse": "🏬 Warehouse",
+    "pool": "🏝️ Pool",
 }
 
 
 def resolved_style_duration(style: str, selected_duration: int = 15) -> int:
     if style == "warehouse":
         return 5
-    if style == "texthook_broll":
+    if style in ("texthook_broll", "pool"):
         return 8
     return int(selected_duration)
 
@@ -1919,6 +1944,8 @@ def write_prompt(
         system = SHOE_VIDEO_SYSTEM.format(voiceover_instruction=vo)
     elif style == "warehouse":
         system = WAREHOUSE_PROMPT_SYSTEM
+    elif style == "pool":
+        system = POOL_PROMPT_SYSTEM
     else:
         # The selected hook is added after generation with FFmpeg.
         system = TEXTHOOK_PROMPT_SYSTEM
@@ -2208,7 +2235,7 @@ def main():
 
         style = st.radio(
             "Video style",
-            options=["shoe_video", "texthook_broll", "warehouse"],
+            options=["shoe_video", "texthook_broll", "warehouse", "pool"],
             format_func=lambda value: STYLE_LABELS[value],
             key="main_video_style",
             horizontal=True,
@@ -2235,8 +2262,15 @@ def main():
             duration = 5
             voice_script = None
             st.info(
-                "Warehouse is fixed at 5 seconds and silent: one continuous first-person walk-up "
-                "toward a bulk pallet display. No people, hands, cuts, or rendered text."
+                "Warehouse is fixed at 5 seconds and silent: one continuous first-person move beside a bulk pallet display. "
+                "No people, hands, cuts, or rendered text."
+            )
+        elif style == "pool":
+            duration = 8
+            voice_script = None
+            st.info(
+                "Pool is fixed at 8 seconds and silent: handheld poolside product close-up → patio table beauty shot → poolside close-up. "
+                "The chosen hook is added afterward with FFmpeg."
             )
         else:
             duration = 8
@@ -2573,7 +2607,7 @@ def main():
 
         # All three styles use generated on-screen text hooks.
         # The selected hook is stored now and burned onto the finished video later with FFmpeg.
-        if style in ("texthook_broll", "shoe_video", "warehouse"):
+        if style in ("texthook_broll", "shoe_video", "warehouse", "pool"):
             hooks_ready = False
 
             # ── Step 3a: Generate hook options ──
@@ -2689,7 +2723,7 @@ def main():
             # Get the accepted hook for texthook_broll style
             selected_hook = None
             hook_data_for_product = None
-            if style in ("texthook_broll", "shoe_video", "warehouse"):
+            if style in ("texthook_broll", "shoe_video", "warehouse", "pool"):
                 hook_data_for_product = st.session_state.get("product_hooks", {}).get(i)
                 if hook_data_for_product:
                     selected_hook = hook_data_for_product.get("accepted_hook")
@@ -2829,7 +2863,7 @@ def main():
             # Step A: Write the prompt (cheap, no MCP)
             selected_hook = None
             hook_data_for_product = None
-            if style in ("texthook_broll", "shoe_video", "warehouse"):
+            if style in ("texthook_broll", "shoe_video", "warehouse", "pool"):
                 hook_data_for_product = st.session_state.get("product_hooks", {}).get(i)
                 if hook_data_for_product:
                     selected_hook = hook_data_for_product.get("accepted_hook")
