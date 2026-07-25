@@ -1296,6 +1296,46 @@ def generations_zip_bytes(generations: list[dict]) -> tuple[bytes | None, int, l
 # ── Constants ───────────────────────────────────────────────────────
 MAGNIFIC_MCP_URL = "https://mcp.magnific.com"
 MAGNIFIC_MCP_NAME = "magnific"
+
+
+def normalize_magnific_token(value: str) -> str:
+    """Accept a raw token, Bearer token, Authorization header, or OAuth JSON."""
+    if value is None:
+        return ""
+    token = str(value).strip()
+    if not token:
+        return ""
+
+    if token.startswith("{"):
+        try:
+            parsed = json.loads(token)
+            token = str(parsed.get("access_token") or parsed.get("token") or "").strip()
+        except json.JSONDecodeError:
+            pass
+
+    token = re.sub(r"^Authorization\s*:\s*", "", token, flags=re.IGNORECASE)
+    token = re.sub(r"^Bearer\s+", "", token, flags=re.IGNORECASE)
+    token = token.strip().strip('"').strip("'")
+    return re.sub(r"\s+", "", token)
+
+
+def active_mcp_url() -> str:
+    """Magnific-only endpoint. Kept as a helper for connection diagnostics."""
+    return MAGNIFIC_MCP_URL
+
+
+def build_mcp_servers(magnific_token: str) -> list[dict]:
+    """Build the fixed Magnific MCP connection used by every generation stage."""
+    server = {
+        "type": "url",
+        "url": MAGNIFIC_MCP_URL,
+        "name": MAGNIFIC_MCP_NAME,
+    }
+    clean_token = normalize_magnific_token(magnific_token)
+    if clean_token:
+        server["authorization_token"] = clean_token
+    return [server]
+
 MODEL = "claude-sonnet-4-6"
 MCP_BETA = "mcp-client-2025-11-20"
 
@@ -2148,13 +2188,7 @@ def generate_video(
     image_urls: list[str] | None = None,
 ) -> dict:
     """Upload one or more reference images + generate video via Magnific MCP."""
-    mcp_servers = [{
-        "type": "url",
-        "url": MAGNIFIC_MCP_URL,
-        "name": MAGNIFIC_MCP_NAME,
-    }]
-    if magnific_token:
-        mcp_servers[0]["authorization_token"] = magnific_token
+    mcp_servers = build_mcp_servers(magnific_token)
 
     try:
         client = anthropic.Anthropic(api_key=api_key)
@@ -2257,9 +2291,7 @@ def generate_lifestyle_image_creation(
     prompt: str,
 ) -> dict:
     """Generate a single lifestyle image via Magnific MCP."""
-    mcp_servers = [{"type": "url", "url": MAGNIFIC_MCP_URL, "name": MAGNIFIC_MCP_NAME}]
-    if magnific_token:
-        mcp_servers[0]["authorization_token"] = magnific_token
+    mcp_servers = build_mcp_servers(magnific_token)
     try:
         client = anthropic.Anthropic(api_key=api_key)
         refs = [u for u in reference_urls if u]
@@ -2323,9 +2355,7 @@ def generate_kling_video(
     duration: int,
 ) -> dict:
     """Generate a Kling video from an approved lifestyle image."""
-    mcp_servers = [{"type": "url", "url": MAGNIFIC_MCP_URL, "name": MAGNIFIC_MCP_NAME}]
-    if magnific_token:
-        mcp_servers[0]["authorization_token"] = magnific_token
+    mcp_servers = build_mcp_servers(magnific_token)
     try:
         client = anthropic.Anthropic(api_key=api_key)
         response = client.beta.messages.create(
@@ -2377,6 +2407,37 @@ def generate_kling_video(
         return {"creation_id": None, "status": "error", "error": str(e)}
 
 
+def test_mcp_connection(api_key: str, magnific_token: str) -> dict:
+    """Verify MCP authentication without starting an image or video generation."""
+    if not api_key:
+        return {"ok": False, "error": "Anthropic API key is missing."}
+    clean_token = normalize_magnific_token(magnific_token)
+    if not clean_token:
+        return {"ok": False, "error": "Magnific authorization token is missing."}
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        client.beta.messages.create(
+            model=MODEL,
+            max_tokens=80,
+            system=(
+                "Verify that the configured Magnific MCP server is reachable and authenticated. "
+                "Do not create, upload, modify, or generate anything. Reply only with CONNECTED."
+            ),
+            messages=[{"role": "user", "content": "Check the MCP connection only. Do not run a generation."}],
+            mcp_servers=build_mcp_servers(clean_token),
+            tools=[{
+                "type": "mcp_toolset",
+                "mcp_server_name": MAGNIFIC_MCP_NAME,
+                "default_config": {"enabled": True, "defer_loading": False},
+            }],
+            betas=[MCP_BETA],
+        )
+        return {"ok": True, "endpoint": active_mcp_url()}
+    except Exception as exc:
+        return {"ok": False, "endpoint": active_mcp_url(), "error": str(exc)}
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  STATUS CHECKER — polls Magnific for finished videos
 # ═══════════════════════════════════════════════════════════════════
@@ -2393,13 +2454,7 @@ Extract URLs from the creation data — look for fields like url, videoUrl, prev
 
 def check_creation_status(api_key: str, magnific_token: str, creation_id: str) -> dict:
     """Check a Magnific creation's status via MCP."""
-    mcp_servers = [{
-        "type": "url",
-        "url": MAGNIFIC_MCP_URL,
-        "name": MAGNIFIC_MCP_NAME,
-    }]
-    if magnific_token:
-        mcp_servers[0]["authorization_token"] = magnific_token
+    mcp_servers = build_mcp_servers(magnific_token)
 
     try:
         client = anthropic.Anthropic(api_key=api_key)
@@ -2483,7 +2538,7 @@ def main():
 
     # ── Always-visible video setup ──
     api_key_from_secrets = get_secret("ANTHROPIC_API_KEY")
-    token_from_secrets = get_secret("MAGNIFIC_AUTH_TOKEN")
+    token_from_secrets = normalize_magnific_token(get_secret("MAGNIFIC_AUTH_TOKEN"))
 
     if "runtime_anthropic_api_key" not in st.session_state:
         st.session_state["runtime_anthropic_api_key"] = api_key_from_secrets
@@ -2574,6 +2629,8 @@ def main():
         status_col_3.info(f"{STYLE_LABELS[style]} · {resolved_style_duration(style, duration)}s")
 
         with st.expander("API connection", expanded=not bool(api_key and magnific_token)):
+            st.caption(f"Magnific MCP endpoint: `{MAGNIFIC_MCP_URL}`")
+
             if api_key_from_secrets:
                 st.success("Anthropic API key loaded from Streamlit secrets.")
             else:
@@ -2592,9 +2649,11 @@ def main():
                     else:
                         st.warning("Paste a key first.")
 
-            if token_from_secrets and st.session_state.get("runtime_magnific_token") == token_from_secrets:
+            active_saved_token = normalize_magnific_token(token_from_secrets)
+            active_runtime_token = normalize_magnific_token(st.session_state.get("runtime_magnific_token"))
+            if active_saved_token and active_runtime_token == active_saved_token:
                 st.success("Magnific token loaded from Streamlit secrets.")
-            elif st.session_state.get("runtime_magnific_token"):
+            elif active_runtime_token:
                 st.success("Magnific token override is active for this app session.")
             else:
                 st.warning("No Magnific token is currently active.")
@@ -2604,14 +2663,15 @@ def main():
                 type="password",
                 value="",
                 key="magnific_token_candidate",
-                placeholder="Leave blank to keep using the saved token",
-                help="This field never overwrites the working token unless you click Use new token.",
+                placeholder="Leave blank to keep using the saved Magnific token",
+                help="This field never overwrites the active token unless you click Use new token.",
             )
             token_action_col1, token_action_col2 = st.columns(2)
             with token_action_col1:
                 if st.button("Use new token", key="apply_magnific_token", type="primary", use_container_width=True):
-                    if magnific_candidate.strip():
-                        st.session_state["runtime_magnific_token"] = magnific_candidate.strip()
+                    clean_candidate = normalize_magnific_token(magnific_candidate)
+                    if clean_candidate:
+                        st.session_state["runtime_magnific_token"] = clean_candidate
                         st.success("Magnific token updated for this app session.")
                         st.rerun()
                     else:
@@ -2620,24 +2680,29 @@ def main():
                 if st.button(
                     "Restore saved secret",
                     key="restore_magnific_secret",
-                    disabled=not bool(token_from_secrets),
+                    disabled=not bool(active_saved_token),
                     use_container_width=True,
                 ):
-                    st.session_state["runtime_magnific_token"] = token_from_secrets
+                    st.session_state["runtime_magnific_token"] = active_saved_token
                     st.success("Restored the Magnific token from Streamlit secrets.")
                     st.rerun()
 
-            magnific_token = st.session_state.get("runtime_magnific_token") or token_from_secrets
+            magnific_token = normalize_magnific_token(
+                st.session_state.get("runtime_magnific_token") or token_from_secrets
+            )
             api_key = st.session_state.get("runtime_anthropic_api_key") or api_key_from_secrets
 
-            st.markdown("**How to refresh the Magnific token**")
-            st.markdown("""
-1. Run `npx @modelcontextprotocol/inspector` on a computer with Node.js.
-2. Set **Transport Type** to `Streamable HTTP`.
-3. Set the URL to `https://mcp.magnific.com`.
-4. Connect, open Auth Settings, and complete the Quick OAuth Flow.
-5. Copy the `access_token` and paste it above.
-            """)
+            if st.button("Test Magnific connection", key="test_mcp_connection", use_container_width=True):
+                with st.spinner("Testing Magnific authentication without starting a generation..."):
+                    connection_test = test_mcp_connection(api_key, magnific_token)
+                if connection_test.get("ok"):
+                    st.success("Magnific MCP authentication succeeded.")
+                else:
+                    st.error(connection_test.get("error", "The Magnific MCP connection failed."))
+
+            st.caption(
+                "All Seedance, GPT Image 2, Kling, uploads, and status checks in this app use the same Magnific MCP endpoint and Magnific token."
+            )
 
     # ════════════════════════════════════════════════════════════════
     #  STEP 1 — PASTE LINKS
@@ -3245,7 +3310,7 @@ def main():
                     error_msg = gen_result.get("error", "")
                     st.error(f"❌ **{product['name']}** — {error_msg}")
                     if any(kw in error_msg.lower() for kw in ['401', 'unauthorized', 'auth', 'token', 'forbidden', '403']):
-                        st.warning("🔄 **Token expired.** Paste a fresh token in the API connection section and re-run.")
+                        st.warning("🔐 **Magnific authentication failed.** Open API connection, restore the saved Magnific secret or paste a valid Magnific token, then run Test Magnific connection before trying again.")
                         token_expired = True
                 else:
                     st.warning(f"⚠️ **{product['name']}** — Status: {gen_result.get('status')}")
@@ -3283,7 +3348,7 @@ def main():
                     error_msg = gen_result.get("error", "")
                     st.error(f"❌ **{product['name']}** — {error_msg}")
                     if any(kw in error_msg.lower() for kw in ['401', 'unauthorized', 'auth', 'token', 'forbidden', '403']):
-                        st.warning("🔄 **Token expired.** Paste a fresh token in the API connection section and re-run.")
+                        st.warning("🔐 **Magnific authentication failed.** Open API connection, restore the saved Magnific secret or paste a valid Magnific token, then run Test Magnific connection before trying again.")
                         token_expired = True
                         with st.expander(f"📝 Prompt for {product['name']} (use manually)"):
                             st.code(prompt_text, language=None)
