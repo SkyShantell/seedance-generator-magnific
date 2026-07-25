@@ -729,6 +729,30 @@ def fetch_video_bytes(video_url: str) -> bytes | None:
         return None
 
 
+@st.cache_data(show_spinner=False, ttl=3600)
+def inspect_remote_image(image_url: str) -> tuple[int | None, int | None, str | None]:
+    """Return remote image dimensions so Lifestyle approval can enforce portrait 9:16."""
+    if not image_url or not PIL_AVAILABLE:
+        return None, None, "Image dimensions could not be checked."
+    try:
+        response = requests.get(image_url, timeout=60)
+        response.raise_for_status()
+        with Image.open(io.BytesIO(response.content)) as image:
+            width, height = image.size
+        return int(width), int(height), None
+    except Exception as exc:
+        return None, None, f"Image dimensions could not be checked: {exc}"
+
+
+def is_vertical_nine_sixteen(width: int | None, height: int | None) -> bool:
+    """Allow normal generator rounding while rejecting square, landscape, 4:5, and 3:4 outputs."""
+    if not width or not height or height <= width:
+        return False
+    actual_ratio = width / height
+    target_ratio = 9 / 16
+    return abs(actual_ratio - target_ratio) <= 0.035
+
+
 def get_ffmpeg_executable() -> str | None:
     """Find FFmpeg from the OS, with imageio-ffmpeg as an optional fallback."""
     ffmpeg_path = shutil.which("ffmpeg")
@@ -1626,7 +1650,8 @@ LIFESTYLE_SCENES = {
 }
 
 LIFESTYLE_IPHONE_STYLE = (
-    "Unedited iPhone 16 photo, raw HEIC-to-JPEG look, zero retouching. Vertical 9:16 handheld framing, "
+    "Unedited iPhone 16 photo, raw HEIC-to-JPEG look, zero retouching. TRUE PORTRAIT 9:16 canvas (1080x1920 or equivalent), "
+    "with the full composition designed natively for vertical video. Never square, landscape, 4:5, or 3:4. "
     "slightly imperfect crop, product sharp with natural background blur, subtle phone-camera grain, "
     "realistic edge distortion, and natural shadows from one ordinary real light source. "
     "No studio lighting, softboxes, ring light, commercial reflections, color grading, or polished ad composition. "
@@ -2269,10 +2294,11 @@ LIFESTYLE_IMAGE_GENERATE_SYSTEM = """You are an image production assistant with 
 Use the same Magnific account and MCP connection already configured by the app.
 1. Upload every supplied raw product/reference image with creations_upload_image.
 2. Generate ONE lifestyle image with the provided prompt.
-3. Use model slug gpt_image_2, aspect ratio 9:16, resolution 2k, and quality high.
-4. Attach every uploaded image only as a product appearance/reference input. Image 1 has highest accuracy priority.
-5. Do not use a raw product image as the literal scene background or composition.
-6. Return the resulting Magnific creation identifier.
+3. Use model slug gpt_image_2, resolution 2k, and quality high.
+4. Set the image-generation tool's aspect ratio parameter EXACTLY to 9:16 portrait. Generate a native vertical canvas such as 1080x1920 or its 2K equivalent. Never use 1:1, 16:9, 4:5, or 3:4.
+5. Attach every uploaded image only as a product appearance/reference input. Image 1 has highest accuracy priority.
+6. Do not use a raw product image as the literal scene background or composition.
+7. Return the resulting Magnific creation identifier.
 
 Return ONLY valid JSON (no markdown):
 {"creation_id": "the Magnific creation identifier", "status": "queued", "error": null}
@@ -3714,9 +3740,22 @@ def main():
 
                     if is_lifestyle:
                         if status == "image_completed":
-                            if st.button("✅ Approve image", key=f"approve_lifestyle_{i}", type="primary", use_container_width=True):
+                            lifestyle_url_for_check = result.get("lifestyle_image_url")
+                            check_width, check_height, _check_error = inspect_remote_image(lifestyle_url_for_check)
+                            ratio_is_valid = is_vertical_nine_sixteen(check_width, check_height)
+                            ratio_is_known = bool(check_width and check_height)
+                            if st.button(
+                                "✅ Approve image",
+                                key=f"approve_lifestyle_{i}",
+                                type="primary",
+                                use_container_width=True,
+                                disabled=ratio_is_known and not ratio_is_valid,
+                                help="Approval is disabled when the generated image is not vertical 9:16.",
+                            ):
                                 saved_gens[i]["status"] = "image_approved"
                                 saved_gens[i]["approved_at"] = datetime.now().isoformat()
+                                saved_gens[i]["lifestyle_image_width"] = check_width
+                                saved_gens[i]["lifestyle_image_height"] = check_height
                                 save_generations(saved_gens)
                                 st.rerun()
 
@@ -3861,15 +3900,27 @@ def main():
                         else:
                             st.info("Your edited text version will appear here after you click Apply text below.")
                 elif is_lifestyle_result and lifestyle_image_url:
+                    image_width, image_height, image_dimension_error = inspect_remote_image(lifestyle_image_url)
+                    lifestyle_ratio_valid = is_vertical_nine_sixteen(image_width, image_height)
                     image_col, approval_col = st.columns([1.15, 1.35], gap="large")
                     with image_col:
                         st.markdown("#### Generated lifestyle image")
                         st.image(lifestyle_image_url, use_container_width=True)
+                        if image_width and image_height:
+                            st.caption(f"Image size: {image_width} × {image_height} · required: vertical 9:16")
                     with approval_col:
                         if status == "image_completed":
-                            st.success("Review this image carefully. Click **Approve image** only when the product and scene look right.")
+                            if lifestyle_ratio_valid:
+                                st.success("This image is vertical 9:16. Review the product and scene, then approve it for Kling.")
+                            elif image_width and image_height:
+                                st.error(
+                                    f"This image is {image_width} × {image_height}, not vertical 9:16. "
+                                    "Regenerate the lifestyle image before sending it to Kling."
+                                )
+                            else:
+                                st.warning(image_dimension_error or "The image ratio could not be verified. Regenerate if it does not look vertical 9:16.")
                         elif status == "image_approved":
-                            st.success("Approved. You can now generate the Kling animation from this exact image.")
+                            st.success("Approved. You can now generate the Kling animation from this exact vertical image.")
                         else:
                             st.info("The image step is still processing.")
                         scene_key = result.get("scene_key")
