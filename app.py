@@ -15,6 +15,7 @@ import json
 import os
 import re
 import time
+import random
 import requests
 import shutil
 import subprocess
@@ -47,7 +48,9 @@ SAVE_FILE = Path("generations.json")
 PRESETS_FILE = Path("text_presets.json")
 PROCESSED_DIR = Path("processed_videos")
 EMOJI_ASSET_DIR = Path("emoji_assets")
+AUDIO_TRACK_DIR = Path("audio_tracks")
 PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+AUDIO_TRACK_DIR.mkdir(parents=True, exist_ok=True)
 
 # Apple-style transparent PNG files created by MakeAppleEmojis.swift.
 EMOJI_ASSET_MAP = {
@@ -66,6 +69,7 @@ EMOJI_ASSET_MAP = {
 }
 
 FONT_FILES = {
+    "TikTok Sans Medium": ["TikTokSans-Medium.ttf", "/mnt/data/TikTokSans-Medium.ttf"],
     "TikTok Sans": ["TikTokSans.ttf", "/mnt/data/TikTokSans.ttf"],
     "DejaVu Sans Bold": ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"],
     "Liberation Sans Bold": ["/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"],
@@ -73,6 +77,8 @@ FONT_FILES = {
 }
 
 FONT_CANDIDATES = [
+    "TikTokSans-Medium.ttf",
+    "/mnt/data/TikTokSans-Medium.ttf",
     "TikTokSans.ttf",
     "/mnt/data/TikTokSans.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -1007,9 +1013,57 @@ def create_hook_overlay_png(
     return True, warning
 
 
-def processed_video_path(creation_id: str | None, hook: str, settings: dict) -> Path:
-    """Create a stable output filename based on the video and editor settings."""
-    key_data = json.dumps({"hook": hook, "settings": settings}, sort_keys=True, ensure_ascii=False)
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
+
+
+def available_audio_tracks() -> list[Path]:
+    """Return soundtrack files placed in the repository's audio_tracks folder."""
+    try:
+        return sorted(
+            [path for path in AUDIO_TRACK_DIR.iterdir() if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS],
+            key=lambda path: path.name.lower(),
+        )
+    except Exception:
+        return []
+
+
+def resolve_audio_track(track_name: str | None) -> Path | None:
+    """Resolve a stored soundtrack filename safely inside audio_tracks/."""
+    if not track_name:
+        return None
+    candidate = AUDIO_TRACK_DIR / Path(track_name).name
+    if candidate.exists() and candidate.is_file() and candidate.suffix.lower() in AUDIO_EXTENSIONS:
+        return candidate
+    return None
+
+
+def choose_random_audio_track(exclude: str | None = None) -> str:
+    """Choose one soundtrack filename, avoiding the previous one when possible."""
+    tracks = available_audio_tracks()
+    if not tracks:
+        return ""
+    choices = [track for track in tracks if track.name != exclude] or tracks
+    return random.SystemRandom().choice(choices).name
+
+
+def processed_video_path(
+    creation_id: str | None,
+    hook: str,
+    settings: dict,
+    audio_track: str | None = None,
+    audio_volume_pct: int = 100,
+) -> Path:
+    """Create a stable output filename based on text and soundtrack settings."""
+    key_data = json.dumps(
+        {
+            "hook": hook,
+            "settings": settings,
+            "audio_track": audio_track or "",
+            "audio_volume_pct": int(audio_volume_pct),
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
     digest = hashlib.sha256(key_data.encode("utf-8")).hexdigest()[:12]
     safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", creation_id or "video")[:60]
     return PROCESSED_DIR / f"{safe_id}_{digest}.mp4"
@@ -1020,12 +1074,14 @@ def apply_text_with_ffmpeg(
     creation_id: str | None,
     hook: str,
     settings: dict,
+    audio_track: str | None = None,
+    audio_volume_pct: int = 100,
 ) -> tuple[Path | None, str | None]:
-    """Apply the user-configured text only after they click the editor button."""
+    """Apply text and an optional looping soundtrack to a generated video."""
     if not video_url:
         return None, "No completed video URL is available."
     if not hook.strip():
-        return None, "Enter text before applying the overlay."
+        return None, "Enter text before creating the final video."
 
     ffmpeg_path = get_ffmpeg_executable()
     if not ffmpeg_path:
@@ -1035,7 +1091,14 @@ def apply_text_with_ffmpeg(
     if not source_bytes:
         return None, "The original video could not be downloaded from Magnific."
 
-    final_path = processed_video_path(creation_id, hook, settings)
+    selected_audio_path = resolve_audio_track(audio_track)
+    final_path = processed_video_path(
+        creation_id,
+        hook,
+        settings,
+        audio_track=selected_audio_path.name if selected_audio_path else None,
+        audio_volume_pct=audio_volume_pct,
+    )
     if final_path.exists() and final_path.stat().st_size > 0:
         return final_path, None
 
@@ -1056,28 +1119,56 @@ def apply_text_with_ffmpeg(
             if not overlay_ok:
                 return None, overlay_warning or "Could not build the text overlay."
 
-            command = [
-                ffmpeg_path,
-                "-hide_banner",
-                "-loglevel", "error",
-                "-y",
-                "-i", str(input_path),
-                "-loop", "1",
-                "-framerate", "30",
-                "-i", str(overlay_path),
-                "-filter_complex", "[0:v][1:v]overlay=0:0:format=auto:shortest=1[v]",
-                "-map", "[v]",
-                "-map", "0:a?",
-                "-c:v", "libx264",
-                "-preset", "veryfast",
-                "-crf", "18",
-                "-pix_fmt", "yuv420p",
-                "-c:a", "aac",
-                "-b:a", "192k",
-                "-movflags", "+faststart",
-                "-shortest",
-                str(final_path),
-            ]
+            if selected_audio_path:
+                volume_factor = max(0.0, min(2.0, int(audio_volume_pct) / 100.0))
+                command = [
+                    ffmpeg_path,
+                    "-hide_banner",
+                    "-loglevel", "error",
+                    "-y",
+                    "-i", str(input_path),
+                    "-loop", "1",
+                    "-framerate", "30",
+                    "-i", str(overlay_path),
+                    "-stream_loop", "-1",
+                    "-i", str(selected_audio_path),
+                    "-filter_complex",
+                    f"[0:v][1:v]overlay=0:0:format=auto:shortest=1[v];[2:a]volume={volume_factor:.3f}[a]",
+                    "-map", "[v]",
+                    "-map", "[a]",
+                    "-c:v", "libx264",
+                    "-preset", "veryfast",
+                    "-crf", "18",
+                    "-pix_fmt", "yuv420p",
+                    "-c:a", "aac",
+                    "-b:a", "192k",
+                    "-movflags", "+faststart",
+                    "-shortest",
+                    str(final_path),
+                ]
+            else:
+                command = [
+                    ffmpeg_path,
+                    "-hide_banner",
+                    "-loglevel", "error",
+                    "-y",
+                    "-i", str(input_path),
+                    "-loop", "1",
+                    "-framerate", "30",
+                    "-i", str(overlay_path),
+                    "-filter_complex", "[0:v][1:v]overlay=0:0:format=auto:shortest=1[v]",
+                    "-map", "[v]",
+                    "-map", "0:a?",
+                    "-c:v", "libx264",
+                    "-preset", "veryfast",
+                    "-crf", "18",
+                    "-pix_fmt", "yuv420p",
+                    "-c:a", "aac",
+                    "-b:a", "192k",
+                    "-movflags", "+faststart",
+                    "-shortest",
+                    str(final_path),
+                ]
 
             completed = subprocess.run(
                 command,
@@ -1092,14 +1183,17 @@ def apply_text_with_ffmpeg(
                 details = (completed.stderr or "Unknown FFmpeg error").strip().splitlines()
                 return None, details[-1] if details else "Unknown FFmpeg error"
 
-            return final_path, overlay_warning
+            warnings = [warning for warning in [overlay_warning] if warning]
+            if not selected_audio_path and available_audio_tracks():
+                warnings.append("No soundtrack was selected, so the original audio was preserved.")
+            return final_path, " ".join(warnings) or None
 
     except subprocess.TimeoutExpired:
         final_path.unlink(missing_ok=True)
-        return None, "FFmpeg timed out while applying the text."
+        return None, "FFmpeg timed out while creating the final video."
     except Exception as exc:
         final_path.unlink(missing_ok=True)
-        return None, f"FFmpeg editor failed: {exc}"
+        return None, f"FFmpeg finalizer failed: {exc}"
 
 
 def read_local_video(path_value: str | None) -> bytes | None:
@@ -1129,6 +1223,8 @@ def generation_export_rows(generations: list[dict]) -> list[dict]:
             "caption": caption,
             "hashtags": hashtags,
             "sound_tip": item.get("sound_tip", ""),
+            "audio_track": item.get("audio_track", ""),
+            "audio_volume_pct": item.get("audio_volume_pct", 100),
             "full_caption": full_caption,
             "on_screen_text": item.get("accepted_hook", ""),
             "video_url": video_url,
@@ -1146,7 +1242,7 @@ def generations_csv_bytes(generations: list[dict]) -> bytes:
     rows = generation_export_rows(generations)
     buffer = io.StringIO()
     fieldnames = [
-        "product_name", "product_link", "caption", "hashtags", "sound_tip", "full_caption",
+        "product_name", "product_link", "caption", "hashtags", "sound_tip", "audio_track", "audio_volume_pct", "full_caption",
         "on_screen_text", "video_url", "processed_video_file", "style",
         "status", "creation_id", "generated_at",
     ]
@@ -3339,6 +3435,10 @@ def main():
                 else:
                     st.warning(f"⚠️ **{product['name']}** — Status: {gen_result.get('status')}")
 
+            if available_audio_tracks() and not gen_result.get("audio_track"):
+                gen_result["audio_track"] = choose_random_audio_track()
+                gen_result["audio_volume_pct"] = 100
+
             if hook_data_for_product:
                 gen_result["accepted_hook"] = selected_hook
                 gen_result["hook_options"] = hook_data_for_product.get("hook_options", [])
@@ -3748,7 +3848,12 @@ def main():
                                     saved_gens[i]["creation_id"] = kling_result["creation_id"]
                                     saved_gens[i]["pipeline_stage"] = "video"
                                     saved_gens[i]["status"] = kling_result.get("status", "queued")
+                                    saved_gens[i]["audio_track"] = choose_random_audio_track(
+                                        exclude=result.get("audio_track")
+                                    ) or result.get("audio_track", "")
+                                    saved_gens[i]["audio_volume_pct"] = 100
                                     saved_gens[i]["kling_started_at"] = datetime.now().isoformat()
+                                    st.session_state["selected_generation_key"] = str(kling_result["creation_id"])
                                     save_generations(saved_gens)
                                     st.rerun()
                                 else:
@@ -3771,6 +3876,7 @@ def main():
                                     saved_gens[i]["status"] = "image_queued" if image_result.get("status") == "queued" else image_result.get("status", "image_queued")
                                     saved_gens[i].pop("lifestyle_image_url", None)
                                     saved_gens[i].pop("approved_at", None)
+                                    st.session_state["selected_generation_key"] = str(image_result["creation_id"])
                                     save_generations(saved_gens)
                                     st.rerun()
                                 else:
@@ -3827,8 +3933,16 @@ def main():
                                 new_result["caption"] = result.get("caption")
                                 new_result["hashtags"] = result.get("hashtags")
                                 new_result["sound_tip"] = result.get("sound_tip")
+                                new_result["audio_track"] = choose_random_audio_track(
+                                    exclude=result.get("audio_track")
+                                ) or result.get("audio_track", "")
+                                new_result["audio_volume_pct"] = 100
                                 new_result["generated_at"] = datetime.now().isoformat()
+                                new_generation_key = str(
+                                    new_result.get("creation_id") or new_result["generated_at"]
+                                )
                                 add_generation(new_result)
+                                st.session_state["selected_generation_key"] = new_generation_key
                                 st.rerun()
 
                 is_lifestyle_result = result.get("style") == "lifestyle_animation"
@@ -3929,7 +4043,7 @@ def main():
 
                     with st.expander(editor_title, expanded=True):
                         st.caption(
-                            "The original stays untouched. The updated version appears beside it in the Text version panel."
+                            "The original stays untouched. The final version combines your hook styling with the assigned soundtrack."
                         )
 
                         presets, preset_data = all_text_presets()
@@ -4118,8 +4232,64 @@ def main():
                             f"Apple-style emoji PNGs found: {available_assets}/{len(EMOJI_ASSET_MAP)}."
                         )
 
+                        st.markdown('<span class="preset-pill">RANDOM SOUNDTRACK</span>', unsafe_allow_html=True)
+                        soundtrack_files = available_audio_tracks()
+                        selected_audio_track = ""
+                        audio_volume_pct = int(result.get("audio_volume_pct", 100) or 100)
+                        if soundtrack_files:
+                            soundtrack_names = [track.name for track in soundtrack_files]
+                            stored_audio_track = result.get("audio_track")
+                            if stored_audio_track not in soundtrack_names:
+                                stored_audio_track = choose_random_audio_track()
+                                saved_gens[i]["audio_track"] = stored_audio_track
+                                saved_gens[i]["audio_volume_pct"] = audio_volume_pct
+                                save_generations(saved_gens)
+
+                            audio_widget_key = f"audio_track_select_{i}"
+                            if st.session_state.get(audio_widget_key) not in soundtrack_names:
+                                st.session_state[audio_widget_key] = stored_audio_track
+
+                            audio_track_col, audio_random_col, audio_volume_col = st.columns([2.5, 1, 1.25])
+                            with audio_track_col:
+                                selected_audio_track = st.selectbox(
+                                    "Audio track",
+                                    options=soundtrack_names,
+                                    key=audio_widget_key,
+                                )
+                            with audio_random_col:
+                                st.write("")
+                                if st.button("🎲 Randomize", key=f"random_audio_{i}", use_container_width=True):
+                                    new_audio_track = choose_random_audio_track(exclude=selected_audio_track)
+                                    if new_audio_track:
+                                        saved_gens[i]["audio_track"] = new_audio_track
+                                        saved_gens[i]["audio_volume_pct"] = 100
+                                        save_generations(saved_gens)
+                                        st.session_state[audio_widget_key] = new_audio_track
+                                        st.rerun()
+                            with audio_volume_col:
+                                audio_volume_key = f"audio_volume_{i}"
+                                if audio_volume_key not in st.session_state:
+                                    st.session_state[audio_volume_key] = audio_volume_pct
+                                audio_volume_pct = st.slider(
+                                    "Volume",
+                                    min_value=0,
+                                    max_value=100,
+                                    step=5,
+                                    key=audio_volume_key,
+                                )
+
+                            selected_audio_path = resolve_audio_track(selected_audio_track)
+                            if selected_audio_path:
+                                try:
+                                    st.audio(selected_audio_path.read_bytes())
+                                except Exception:
+                                    st.caption(f"Selected soundtrack: {selected_audio_track}")
+                            st.caption(f"{len(soundtrack_files)} soundtrack(s) found. A random track is assigned to each new or regenerated video.")
+                        else:
+                            st.warning("No audio tracks found. Add your 14 files to the `audio_tracks/` folder in GitHub.")
+
                         apply_col, remove_col = st.columns([1.5, 1])
-                        apply_label = "🎨 Update text version" if has_processed_version else "🎨 Apply text"
+                        apply_label = "🎬 Update final video" if has_processed_version else "🎬 Create final video"
 
                         if apply_col.button(
                             apply_label,
@@ -4133,6 +4303,8 @@ def main():
                                     creation_id=creation_id,
                                     hook=edited_hook.strip(),
                                     settings=editor_settings,
+                                    audio_track=selected_audio_track or None,
+                                    audio_volume_pct=audio_volume_pct,
                                 )
 
                             if output_path:
@@ -4146,6 +4318,8 @@ def main():
                                 saved_gens[i]["accepted_hook"] = edited_hook.strip()
                                 saved_gens[i]["text_settings"] = editor_settings
                                 saved_gens[i]["text_preset_name"] = selected_preset
+                                saved_gens[i]["audio_track"] = selected_audio_track
+                                saved_gens[i]["audio_volume_pct"] = audio_volume_pct
                                 saved_gens[i]["processed_path"] = str(output_path)
                                 saved_gens[i]["processed_at"] = datetime.now().isoformat()
                                 save_generations(saved_gens)
