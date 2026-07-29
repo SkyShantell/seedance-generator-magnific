@@ -1290,8 +1290,10 @@ def apply_text_to_uploaded_video(
     original_filename: str,
     hook: str,
     settings: dict,
+    audio_track: str | None = None,
+    audio_volume_pct: int = 100,
 ) -> tuple[Path | None, str | None]:
-    """Apply an overlay to a user-uploaded MP4 using the same renderer as generated videos."""
+    """Apply an overlay and optional soundtrack to a user-uploaded MP4 using the same renderer as generated videos."""
     if not video_bytes:
         return None, "Upload a video first."
     if not hook.strip():
@@ -1301,8 +1303,15 @@ def apply_text_to_uploaded_video(
     if not ffmpeg_path:
         return None, "FFmpeg is not installed. Keep `ffmpeg` in packages.txt."
 
-    digest_data = video_bytes[:1048576] + hook.encode("utf-8") + json.dumps(
-        settings, sort_keys=True, ensure_ascii=False
+    selected_audio_path = resolve_audio_track(audio_track)
+    digest_payload = {
+        "settings": settings,
+        "hook": hook,
+        "audio_track": selected_audio_path.name if selected_audio_path else "",
+        "audio_volume_pct": int(audio_volume_pct),
+    }
+    digest_data = video_bytes[:1048576] + json.dumps(
+        digest_payload, sort_keys=True, ensure_ascii=False
     ).encode("utf-8")
     digest = hashlib.sha256(digest_data).hexdigest()[:14]
     safe_stem = safe_export_filename(Path(original_filename or "uploaded_video").stem, "uploaded_video")
@@ -1324,22 +1333,38 @@ def apply_text_to_uploaded_video(
             if not overlay_ok:
                 return None, overlay_warning or "Could not build the text overlay."
 
-            command = [
-                ffmpeg_path, "-hide_banner", "-loglevel", "error", "-y",
-                "-i", str(input_path), "-loop", "1", "-framerate", "30",
-                "-i", str(overlay_path),
-                "-filter_complex", "[0:v][1:v]overlay=0:0:format=auto:shortest=1[v]",
-                "-map", "[v]", "-map", "0:a?", "-c:v", "libx264",
-                "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
-                "-shortest", str(final_path),
-            ]
+            if selected_audio_path:
+                volume_factor = max(0.0, min(2.0, int(audio_volume_pct) / 100.0))
+                command = [
+                    ffmpeg_path, "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", str(input_path), "-loop", "1", "-framerate", "30",
+                    "-i", str(overlay_path), "-stream_loop", "-1", "-i", str(selected_audio_path),
+                    "-filter_complex", f"[0:v][1:v]overlay=0:0:format=auto:shortest=1[v];[2:a]volume={volume_factor:.3f}[a]",
+                    "-map", "[v]", "-map", "[a]", "-c:v", "libx264",
+                    "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
+                    "-shortest", str(final_path),
+                ]
+            else:
+                command = [
+                    ffmpeg_path, "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", str(input_path), "-loop", "1", "-framerate", "30",
+                    "-i", str(overlay_path),
+                    "-filter_complex", "[0:v][1:v]overlay=0:0:format=auto:shortest=1[v]",
+                    "-map", "[v]", "-map", "0:a?", "-c:v", "libx264",
+                    "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
+                    "-shortest", str(final_path),
+                ]
             completed = subprocess.run(command, capture_output=True, text=True, timeout=300, check=False)
             if completed.returncode != 0 or not final_path.exists():
                 final_path.unlink(missing_ok=True)
                 details = (completed.stderr or "Unknown FFmpeg error").strip().splitlines()
                 return None, details[-1] if details else "Unknown FFmpeg error"
-            return final_path, overlay_warning
+            warnings = [warning for warning in [overlay_warning] if warning]
+            if not selected_audio_path and available_audio_tracks():
+                warnings.append("No soundtrack was selected, so the original audio was preserved.")
+            return final_path, " ".join(warnings) or None
     except subprocess.TimeoutExpired:
         final_path.unlink(missing_ok=True)
         return None, "FFmpeg timed out while applying the text."
@@ -1454,7 +1479,7 @@ Return ONLY valid JSON (no markdown, no backticks):
 {{"product_name": "...", "hook_options": ["hook 1", "hook 2", "hook 3", "hook 4", "hook 5"], "caption": "tiktok caption (NOT the hook — a separate short caption for the post)", "hashtags": "#tag1 #tag2..."}}"""
 
 WAREHOUSE_HOOKS_SYSTEM = """You are a TikTok Shop affiliate content producer. Generate 5
-on-screen text hooks for a silent warehouse walk-up deal video.
+on-screen deal/FOMO text hooks. This same hook library is used for Warehouse, Pool, and Text-Hook B-Roll videos.
 
 Use the product name exactly where [product] appears. Select five DIFFERENT angles from this
 proven library; preserve each template's casual wording and emoji pattern:
@@ -1477,9 +1502,10 @@ Rules:
 - No link in bio and no formal CTA.
 - Do not claim an exact price or percentage unless the template already uses broad sale wording.
 - The render is silent; this hook is burned in later with FFmpeg.
-- Caption: one short warehouse-find line in the same voice.
-- Hashtags: 8-12 tags including #tiktokshop #tiktokmademebuyit #costcofinds #warehousedeals plus product/category tags.
-- Sound tip: short reminder to add an upbeat trending TikTok sound in-app.
+- Caption: one short deal-find line in the same voice.
+- Hashtags: 8-12 tags including #tiktokshop and #tiktokmademebuyit plus product/category tags.
+  Add #costcofinds and #warehousedeals only when the user message says the style is warehouse.
+- Sound tip: short reminder that the app assigns a random soundtrack after generation.
 
 Return ONLY valid JSON (no markdown, no backticks):
 {{"product_name": "...", "hook_options": ["hook 1", "hook 2", "hook 3", "hook 4", "hook 5"], "caption": "...", "hashtags": "#tag1 #tag2", "sound_tip": "..."}}"""
@@ -1543,43 +1569,58 @@ End with a NEGATIVE sentence repeating: no rendered text, no voiceover, no start
 Return ONLY valid JSON (no markdown, no backticks):
 {{"product_name": "...", "prompt": "the full seedance prompt under 1900 chars", "char_count": 123}}"""
 
+BROLL_OPENING_SCENES = [
+    "Cars pass through a sunlit city intersection while the camera remains still on the sidewalk; no walking POV",
+    "Ocean waves roll onto a quiet beach while the phone drifts slightly from left to right",
+    "A dog trots several feet ahead on a leash through a public park, filmed from behind without showing the owner",
+    "Dry leaves blow across an almost-empty parking lot in bright afternoon light",
+    "A commuter train passes through an outdoor station while the camera waits beside the platform railing",
+    "Small boats move slowly across a marina while sunlight flickers on the water",
+    "A crosswalk signal changes and a distant crowd crosses the street; camera stays planted at the corner",
+    "Palm-tree shadows move across a concrete walkway in a light breeze; no people in frame",
+    "A cyclist rides past on a park trail while the camera casually follows for one second",
+    "A city bus pulls up to an outdoor stop and opens its doors, filmed from several feet away",
+    "Pigeons scatter near a park bench when a bicycle passes in the background",
+    "Water sprays from a public fountain with trees and pedestrians softly blurred far behind",
+    "Traffic flows beneath an overpass at golden hour, filmed from a safe stationary viewpoint",
+    "A skateboarder rolls across the far side of an outdoor plaza, seen only from the knees down",
+    "A red traffic light changes to green above a busy road while cars begin moving",
+    "Sunlight flickers through tree branches onto an empty park path; camera tilts gently upward",
+    "A ferry moves across open water in the distance while birds cross the sky",
+    "A row of parked cars reflects moving clouds as the phone makes a small sideways pan",
+    "A beach umbrella flutters in the wind beside an empty stretch of sand",
+    "A basketball bounces across an outdoor court after rolling out of frame; no player is shown",
+    "A delivery truck turns slowly into a commercial parking lot while the camera remains stationary",
+    "A public escalator rises toward an outdoor train entrance with only distant anonymous commuters visible",
+    "A flag moves in the wind above a neighborhood storefront while cars pass below",
+    "Ripples spread across a park pond as ducks swim through the middle distance",
+]
+
+
+def choose_broll_scene(previous_scene: str | None = None) -> str:
+    """Choose a concrete scene in Python and avoid the previous one on regeneration."""
+    choices = [scene for scene in BROLL_OPENING_SCENES if scene != previous_scene]
+    return random.SystemRandom().choice(choices or BROLL_OPENING_SCENES)
+
+
 TEXTHOOK_PROMPT_SYSTEM = """You are a TikTok Shop affiliate content producer. Write a
 Seedance 2.0 video prompt for a clean text-hook b-roll video.
 
 HARD RULES:
 - SILENT video — NO audio, NO voiceover
 - ABSOLUTELY NO on-screen text, captions, subtitles, overlays, signs, watermarks, or logos
-- No face, no person, no character — only a hand in the reveal shot
-- Two acts: random b-roll (~3s) → hard cut to product reveal (~5s)
+- No identifiable face or featured character; only a hand in the product reveal shot
+- Two acts: unrelated opening b-roll (~3s) → hard cut to product reveal (~5s)
 - ~8 seconds total, 9:16 vertical
 - Under 1,900 characters
 
-CRITICAL — B-ROLL RULES:
-The opening b-roll must be a RANDOM outdoor real-life scene that has absolutely nothing
-to do with the product. The scene should usually take place on a street, sidewalk, park,
-beach, boardwalk, parking lot, or another casual public outdoor location.
-
-Pick ONE scene at random from examples like:
-- First-person view of someone walking down a sidewalk
-- Feet walking along a park path
-- Cars passing on a city street
-- Cars driving on a highway at golden hour
-- A quiet neighborhood street filmed while walking
-- People walking through a public park
-- A dog trotting ahead on a leash, filmed from behind
-- Waves rolling onto a beach
-- Someone walking along a beach or boardwalk
-- Palm trees moving slightly in the wind
-- A crosswalk signal changing while people cross
-- A city intersection filmed from the sidewalk
-- Leaves blowing across a parking lot
-- Sunlight moving through trees in a park
-- A distant train passing through an outdoor station
-- Boats moving slowly across the water
-- A casual view from a moving car window
-- People walking through an outdoor shopping area
-- Sneakers walking across pavement
-- A bike rider passing on a park trail
+CRITICAL OPENING-SCENE RULE:
+- The user message supplies one exact MANDATORY OPENING B-ROLL SCENE selected by the app.
+- Use that exact scene faithfully. Do not choose another scene and do not replace it with a generic walking shot.
+- Unless the supplied scene explicitly includes walking, do NOT show first-person walking, feet walking, sneakers walking,
+  a sidewalk walking POV, a park-path walking POV, or repeated step/bounce motion.
+- The opening must remain completely unrelated to the product.
+- Casual handheld iPhone footage with natural micro-shake; ordinary daylight; not cinematic or polished.
 
 HARD EXCLUSIONS:
 - No rain droplets on windows
@@ -1587,27 +1628,15 @@ HARD EXCLUSIONS:
 - No laundry, dryers, washing machines, or household chores
 - No coffee pouring or close-up drink shots
 - No kitchens, bedrooms, bathrooms, or indoor home scenes
-- No desk shots or hands using unrelated objects
-- No product-related locations
-- No b-roll that visually hints at the product
-- No dramatic cinematic scene
-- No staged or polished commercial footage
+- No product-related location or visual hint
+- No dramatic commercial footage
 
-The b-roll should feel casual, slightly imperfect, and filmed on a phone by a normal
-person. The more unrelated it is to the product, the better.
-
-Prompt template:
-9:16 vertical, TikTok UGC aesthetic, silent, no audio, no voiceover. Handheld phone-camera
-feel with natural micro-shake. Warm bright daylight, slightly saturated. No face, no person,
-no character — only a hand in the second half. No text or graphics anywhere in the video.
-
-[00:00-00:03] Establishing b-roll: first-person POV of one random mundane scene that is
-completely unrelated to the product. Casual handheld drift. No product on screen.
-
-[00:03-00:08] Hard cut to an outdoor or casual real-life surface. A single
-medium-brown-skinned hand holds up [PRODUCT + visual detail] toward camera, slowly rotating
-and tilting so the detail catches warm light. Hand fills the lower half. Soft blurred
-background. No face. No person above the wrist.
+Required structure:
+9:16 vertical TikTok UGC, silent, no audio, no voiceover, no rendered text or graphics.
+[00:00-00:03] Show the exact mandatory opening scene supplied by the app. Keep it unrelated to the product.
+[00:03-00:08] Hard cut to an outdoor or casual real-life surface. One medium-brown-skinned hand holds up
+[PRODUCT + accurate visual detail], slowly rotating and tilting it in warm natural light. Hand fills the lower half.
+Soft blurred background. No face or person above the wrist.
 
 Return ONLY valid JSON (no markdown, no backticks):
 {{"product_name": "...", "prompt": "the full seedance prompt under 1900 chars", "char_count": 123}}"""
@@ -2154,10 +2183,12 @@ def _extract_json_object(raw_text: str) -> dict | None:
 
 def write_hooks(api_key: str, product_name: str, style: str = "texthook_broll") -> dict:
     """Generate five style-matched hook options for a product. Cheap/fast — no MCP."""
-    system = WAREHOUSE_HOOKS_SYSTEM if style == "warehouse" else TEXTHOOK_HOOKS_SYSTEM
+    shared_deal_hook_styles = {"warehouse", "pool", "texthook_broll"}
+    system = WAREHOUSE_HOOKS_SYSTEM if style in shared_deal_hook_styles else TEXTHOOK_HOOKS_SYSTEM
     task = (
-        f"Write 5 warehouse deal-drop text hooks for this product: {product_name}"
-        if style == "warehouse"
+        f"Write 5 deal-drop/FOMO text hooks for this product: {product_name}. "
+        f"The video style is {style}; use the same proven hook library used for Warehouse and Pool."
+        if style in shared_deal_hook_styles
         else f"Write 5 text hook options for this product: {product_name}"
     )
     try:
@@ -2183,6 +2214,7 @@ def write_prompt(
     duration: int = 15,
     voice_script: str | None = None,
     selected_hook: str | None = None,
+    broll_scene: str | None = None,
 ) -> dict:
     """Use Claude to write the Seedance prompt. No MCP, no Magnific."""
     if style == "shoe_video":
@@ -2197,10 +2229,19 @@ def write_prompt(
         system = TEXTHOOK_PROMPT_SYSTEM
 
     dur = resolved_style_duration(style, duration)
-    user_task = (
-        f"Write a {dur}-second Seedance 2.0 prompt for this product: {product_name}. "
-        "The generator will receive the selected reference images separately, so instruct it to match them exactly."
-    )
+    if style == "texthook_broll":
+        chosen_broll_scene = broll_scene or choose_broll_scene()
+        user_task = (
+            f"Write a {dur}-second Seedance 2.0 prompt for this product: {product_name}. "
+            "The generator will receive the selected reference images separately, so instruct it to match them exactly.\n\n"
+            f"MANDATORY OPENING B-ROLL SCENE — USE THIS EXACT SCENE, DO NOT SUBSTITUTE WALKING:\n{chosen_broll_scene}"
+        )
+    else:
+        chosen_broll_scene = None
+        user_task = (
+            f"Write a {dur}-second Seedance 2.0 prompt for this product: {product_name}. "
+            "The generator will receive the selected reference images separately, so instruct it to match them exactly."
+        )
 
     try:
         client = anthropic.Anthropic(api_key=api_key)
@@ -2251,6 +2292,8 @@ def write_prompt(
                 "char_count": len(prompt_text),
             }
 
+        if chosen_broll_scene:
+            parsed["broll_scene"] = chosen_broll_scene
         return parsed
 
     except Exception as e:
@@ -2695,7 +2738,7 @@ def main():
         else:
             duration = 8
             voice_script = None
-            st.info("Text-Hook B-Roll is fixed at 8 seconds and silent. The chosen hook is added afterward with FFmpeg.")
+            st.info("Text-Hook B-Roll is fixed at 8 seconds and silent. Python selects a concrete unrelated opening scene for every generation, and regeneration avoids the previous scene. B-Roll now uses the same deal/FOMO hook library as Warehouse and Pool.")
 
         api_key = st.session_state.get("runtime_anthropic_api_key", "")
         magnific_token = st.session_state.get("runtime_magnific_token", "")
@@ -3193,6 +3236,7 @@ def main():
                         "char_count": len(product["lifestyle_prompt"]),
                     }
                 else:
+                    selected_broll_scene = choose_broll_scene() if style == "texthook_broll" else None
                     result = write_prompt(
                         api_key=api_key,
                         product_name=product["name"],
@@ -3200,6 +3244,7 @@ def main():
                         duration=duration,
                         voice_script=voice_script if voice_script else None,
                         selected_hook=selected_hook,
+                        broll_scene=selected_broll_scene,
                     )
 
             # Carry over hook data into result for persistence
@@ -3254,6 +3299,8 @@ def main():
                     )
                     char_count = result.get("char_count", len(result["prompt"]))
                     st.caption(f"Characters: {char_count}")
+                    if style == "texthook_broll" and result.get("broll_scene"):
+                        st.info(f"Random opening scene: {result['broll_scene']}")
                 elif result.get("error"):
                     st.error(f"Error: {result['error']}")
 
@@ -3391,6 +3438,7 @@ def main():
                 else:
                     st.warning(f"⚠️ **{product['name']}** — Status: {gen_result.get('status')}")
             else:
+                selected_broll_scene = choose_broll_scene() if style == "texthook_broll" else None
                 with st.spinner(f"Writing prompt for {product['name'][:30]}..."):
                     prompt_result = write_prompt(
                         api_key=api_key,
@@ -3399,6 +3447,7 @@ def main():
                         duration=duration,
                         voice_script=voice_script if voice_script else None,
                         selected_hook=selected_hook,
+                        broll_scene=selected_broll_scene,
                     )
 
                 if prompt_result.get("error") or not prompt_result.get("prompt"):
@@ -3424,6 +3473,8 @@ def main():
 
                 gen_result["product_name"] = product["name"]
                 gen_result["prompt_used"] = prompt_text
+                if style == "texthook_broll":
+                    gen_result["broll_scene"] = prompt_result.get("broll_scene") or selected_broll_scene
                 if gen_result.get("creation_id") and gen_result.get("status") == "queued":
                     st.success(f"✅ **{product['name']}** — Creation ID: `{gen_result['creation_id']}`")
                 elif gen_result.get("status") == "error":
@@ -3499,6 +3550,10 @@ def main():
         if st.session_state.get("uploaded_video_signature") != uploaded_signature:
             st.session_state["uploaded_video_signature"] = uploaded_signature
             st.session_state.pop("uploaded_text_output", None)
+            random_uploaded_track = choose_random_audio_track()
+            if random_uploaded_track:
+                st.session_state["upload_audio_track_select"] = random_uploaded_track
+            st.session_state["upload_audio_volume"] = 100
 
         uploaded_output_path = st.session_state.get("uploaded_text_output")
         uploaded_output_bytes = read_local_video(uploaded_output_path)
@@ -3581,6 +3636,49 @@ def main():
                 "emoji_size_px": up_emoji,
             })
 
+            st.markdown('<span class="preset-pill">RANDOM SOUNDTRACK</span>', unsafe_allow_html=True)
+            uploaded_soundtrack_files = available_audio_tracks()
+            upload_selected_audio_track = ""
+            upload_audio_volume_pct = int(st.session_state.get("upload_audio_volume", 100) or 100)
+            if uploaded_soundtrack_files:
+                uploaded_soundtrack_names = [track.name for track in uploaded_soundtrack_files]
+                if st.session_state.get("upload_audio_track_select") not in uploaded_soundtrack_names:
+                    st.session_state["upload_audio_track_select"] = choose_random_audio_track()
+
+                up_audio_col, up_random_col, up_volume_col = st.columns([2.5, 1, 1.25])
+                with up_audio_col:
+                    upload_selected_audio_track = st.selectbox(
+                        "Audio track",
+                        options=uploaded_soundtrack_names,
+                        key="upload_audio_track_select",
+                    )
+                with up_random_col:
+                    st.write("")
+                    if st.button("🎲 Randomize", key="upload_random_audio", use_container_width=True):
+                        new_upload_audio_track = choose_random_audio_track(exclude=upload_selected_audio_track)
+                        if new_upload_audio_track:
+                            st.session_state["upload_audio_track_select"] = new_upload_audio_track
+                            st.session_state["upload_audio_volume"] = 100
+                            st.rerun()
+                with up_volume_col:
+                    upload_audio_volume_pct = st.slider(
+                        "Volume",
+                        min_value=0,
+                        max_value=100,
+                        step=5,
+                        key="upload_audio_volume",
+                    )
+
+                upload_selected_audio_path = resolve_audio_track(upload_selected_audio_track)
+                if upload_selected_audio_path:
+                    try:
+                        st.audio(upload_selected_audio_path.read_bytes())
+                    except Exception:
+                        st.caption(f"Selected soundtrack: {upload_selected_audio_track}")
+                st.caption(f"{len(uploaded_soundtrack_files)} soundtrack(s) found. A random track is assigned when you upload a video.")
+            else:
+                st.warning("No audio tracks found. Add your 14 files to the `audio_tracks/` folder in GitHub.")
+
             if st.button("🎨 Add / Update Text", type="primary", use_container_width=True, key="process_uploaded_video"):
                 with st.spinner("Applying text with FFmpeg..."):
                     upload_output, upload_warning = apply_text_to_uploaded_video(
@@ -3588,6 +3686,8 @@ def main():
                         original_filename=uploaded_video.name,
                         hook=upload_hook.strip(),
                         settings=upload_settings,
+                        audio_track=upload_selected_audio_track,
+                        audio_volume_pct=upload_audio_volume_pct,
                     )
                 if upload_output:
                     st.session_state["uploaded_text_output"] = str(upload_output)
@@ -3886,6 +3986,11 @@ def main():
                         if current_prompt and api_key:
                             if st.button("🪄 Regenerate prompt", key=f"regen_prompt_{i}", use_container_width=True):
                                 stored_duration = int(result.get("duration") or resolved_style_duration(stored_style, 15))
+                                regenerated_broll_scene = (
+                                    choose_broll_scene(result.get("broll_scene"))
+                                    if stored_style == "texthook_broll"
+                                    else None
+                                )
                                 with st.spinner("Writing a new prompt..."):
                                     regenerated_prompt = write_prompt(
                                         api_key=api_key,
@@ -3894,10 +3999,13 @@ def main():
                                         duration=stored_duration,
                                         voice_script=result.get("voice_script") or None,
                                         selected_hook=result.get("accepted_hook") or None,
+                                        broll_scene=regenerated_broll_scene,
                                     )
                                 if regenerated_prompt.get("prompt"):
                                     result["prompt"] = regenerated_prompt["prompt"]
                                     result["prompt_used"] = regenerated_prompt["prompt"]
+                                    if stored_style == "texthook_broll":
+                                        result["broll_scene"] = regenerated_prompt.get("broll_scene") or regenerated_broll_scene
                                     result["prompt_regenerated_at"] = datetime.now().isoformat()
                                     saved_gens[i] = result
                                     save_generations(saved_gens)
@@ -3910,18 +4018,41 @@ def main():
                             video_button_label = "🎬 Generate video" if status == "prompt_only" else "🎬 Regenerate video"
                             if st.button(video_button_label, key=f"regen_{i}", use_container_width=True):
                                 stored_duration = int(result.get("duration") or resolved_style_duration(stored_style, 15))
-                                with st.spinner("Sending the current prompt and references to Magnific..."):
+                                prompt_for_regeneration = current_prompt
+                                regenerated_broll_scene = result.get("broll_scene")
+
+                                if stored_style == "texthook_broll":
+                                    regenerated_broll_scene = choose_broll_scene(result.get("broll_scene"))
+                                    with st.spinner("Choosing a different opening scene and writing a fresh B-roll prompt..."):
+                                        refreshed_prompt = write_prompt(
+                                            api_key=api_key,
+                                            product_name=product_name,
+                                            style=stored_style,
+                                            duration=stored_duration,
+                                            voice_script=result.get("voice_script") or None,
+                                            selected_hook=result.get("accepted_hook") or None,
+                                            broll_scene=regenerated_broll_scene,
+                                        )
+                                    if not refreshed_prompt.get("prompt"):
+                                        st.error(refreshed_prompt.get("error", "Could not create a new B-roll prompt."))
+                                        st.stop()
+                                    prompt_for_regeneration = refreshed_prompt["prompt"]
+                                    regenerated_broll_scene = refreshed_prompt.get("broll_scene") or regenerated_broll_scene
+
+                                with st.spinner("Sending the updated prompt and references to Magnific..."):
                                     new_result = generate_video(
                                         api_key=api_key,
                                         magnific_token=magnific_token,
                                         image_url=result["image_url"],
                                         image_urls=result.get("image_urls", [result["image_url"]]),
-                                        prompt=current_prompt,
+                                        prompt=prompt_for_regeneration,
                                         duration=stored_duration,
                                     )
                                 new_result["product_name"] = product_name
-                                new_result["prompt_used"] = current_prompt
-                                new_result["prompt"] = current_prompt
+                                new_result["prompt_used"] = prompt_for_regeneration
+                                new_result["prompt"] = prompt_for_regeneration
+                                if stored_style == "texthook_broll":
+                                    new_result["broll_scene"] = regenerated_broll_scene
                                 new_result["image_url"] = result["image_url"]
                                 new_result["image_urls"] = result.get("image_urls", [result["image_url"]])
                                 new_result["source_url"] = result.get("source_url", "")
@@ -4027,6 +4158,8 @@ def main():
                             st.code(result.get("kling_prompt") or "", language=None)
                         else:
                             st.code(prompt_text_field, language=None)
+                            if result.get("style") == "texthook_broll" and result.get("broll_scene"):
+                                st.caption(f"Opening scene selected by app: {result['broll_scene']}")
                         reference_urls = result.get("image_urls") or ([result.get("image_url")] if result.get("image_url") else [])
                         if reference_urls:
                             st.caption(f"Reference images: {len(reference_urls)}")
