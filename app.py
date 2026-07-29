@@ -66,6 +66,10 @@ EMOJI_ASSET_MAP = {
     "😮‍💨": "face_exhaling.png",
     "🫠": "melting_face.png",
     "🙃": "upside_down_face.png",
+    "🤯": "exploding_head.png",
+    "😱": "face_screaming_in_fear.png",
+    "🤑": "money_mouth_face.png",
+    "😅": "grinning_face_with_sweat.png",
 }
 
 FONT_FILES = {
