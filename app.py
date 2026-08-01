@@ -1501,7 +1501,8 @@ Return ONLY valid JSON (no markdown, no backticks):
 {{"product_name": "...", "hook_options": ["hook 1", "hook 2", "hook 3", "hook 4", "hook 5"], "caption": "tiktok caption (NOT the hook — a separate short caption for the post)", "hashtags": "#tag1 #tag2..."}}"""
 
 WAREHOUSE_HOOKS_SYSTEM = """You are a TikTok Shop affiliate content producer. Generate 5
-on-screen deal/FOMO text hooks. This same hook library is used for Warehouse, Pool, Text-Hook B-Roll, and Lifestyle Animation videos.
+on-screen deal/FOMO text hooks. This same hook library is used for EVERY workflow: Shoe,
+Text-Hook B-Roll, Warehouse, Pool, and Lifestyle Animation.
 
 Use the product name exactly where [product] appears. Select five DIFFERENT angles from this
 proven library; preserve each template's casual wording and emoji pattern:
@@ -1518,12 +1519,30 @@ proven library; preserve each template's casual wording and emoji pattern:
 11. Someone fcked up at TikTok cus today the [product] is violently low right now
 12. Apparently if your TikTok account is old enough you can get the [product] on a mega discount… its only for today though
 13. Anyone else grabbing a boatload of the [product] or am I just stupid
+14. I am so sorry if you already grabbed a [product], because the discount is huge today.
+15. Before you ask...No it's not a typo. Yes the [product] is literal Pennie's today..😱😅
+16. This is your sign to finally grab the [product].
+17. Do NOT scroll past the [product] if it has been sitting in your cart.
+18. POV: you found the [product] before everyone else did.
+19. If you have been waiting on the [product], now is the time.
+20. Run, do not walk, to grab the [product].
+21. The [product] everyone has been asking me about is finally back.
+22. Stop overthinking the [product] and just tap the cart.
+23. Me telling you to grab the [product] before it sells out again.
+24. Your future self will thank you for grabbing the [product] today.
+25. Adding the [product] to my cart before I change my mind.
+26. The [product] is about to be everywhere. Get it first.
+27. I can not believe how good the [product] is for the price.
+28. Consider this your reminder to grab the [product] you keep eyeing.
+29. Trust me, you want the [product] in your cart today.
 
 Rules:
+- Select exactly five hooks from different angles. Do not return five near-duplicates.
 - Casual, chaotic, sassy deal-drop/FOMO voice; never polished corporate copy.
-- No link in bio and no formal CTA.
-- Do not claim an exact price or percentage unless the template already uses broad sale wording.
-- The render is silent; this hook is burned in later with FFmpeg.
+- Preserve the wording and punctuation of the selected templates as closely as possible while replacing [product].
+- No link in bio.
+- Do not invent an exact price or percentage unless the selected template already uses broad sale wording.
+- The hook is burned into the finished video later with FFmpeg.
 - Caption: one short deal-find line in the same voice.
 - Hashtags: 8-12 tags including #tiktokshop and #tiktokmademebuyit plus product/category tags.
   Add #costcofinds and #warehousedeals only when the user message says the style is warehouse.
@@ -2638,14 +2657,11 @@ def _extract_json_object(raw_text: str) -> dict | None:
 
 
 def write_hooks(api_key: str, product_name: str, style: str = "texthook_broll") -> dict:
-    """Generate five style-matched hook options for a product. Cheap/fast — no MCP."""
-    shared_deal_hook_styles = {"warehouse", "pool", "texthook_broll", "lifestyle_animation"}
-    system = WAREHOUSE_HOOKS_SYSTEM if style in shared_deal_hook_styles else TEXTHOOK_HOOKS_SYSTEM
+    """Generate five hooks from the shared library used by every workflow. Cheap/fast — no MCP."""
+    system = WAREHOUSE_HOOKS_SYSTEM
     task = (
         f"Write 5 deal-drop/FOMO text hooks for this product: {product_name}. "
-        f"The video style is {style}; use the same proven hook library used for Warehouse, Pool, B-Roll, and Lifestyle Animation."
-        if style in shared_deal_hook_styles
-        else f"Write 5 text hook options for this product: {product_name}"
+        f"The video style is {style}. Use the shared hook library for every workflow and choose five different angles."
     )
     try:
         client = anthropic.Anthropic(api_key=api_key)
