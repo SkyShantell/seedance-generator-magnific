@@ -93,47 +93,17 @@ FONT_CANDIDATES = [
 
 DEFAULT_TEXT_SETTINGS = {
     "font_name": "TikTok Sans",
-    "font_size": 28,
-    "max_width_pct": 78,
-    "vertical_position_pct": 22,
-    "outline_width": 2,
-    "line_spacing_pct": 112,
-    "emoji_size_px": 38,
+    "font_size": 48,
+    "max_width_pct": 89,
+    "vertical_position_pct": 12,
+    "outline_width": 4,
+    "line_spacing_pct": 99,
+    "emoji_size_px": 50,
 }
 
+# One built-in text style only. All previous built-in presets were removed.
 BUILT_IN_TEXT_PRESETS = {
-    "Apple Compact": {
-        "font_size": 26,
-        "max_width_pct": 82,
-        "vertical_position_pct": 20,
-        "outline_width": 2,
-        "line_spacing_pct": 108,
-        "emoji_size_px": 34,
-    },
-    "TikTok Clean": {
-        "font_size": 30,
-        "max_width_pct": 76,
-        "vertical_position_pct": 21,
-        "outline_width": 2,
-        "line_spacing_pct": 112,
-        "emoji_size_px": 40,
-    },
-    "Minimal Small": {
-        "font_size": 23,
-        "max_width_pct": 86,
-        "vertical_position_pct": 24,
-        "outline_width": 1,
-        "line_spacing_pct": 106,
-        "emoji_size_px": 30,
-    },
-    "Bold Center": {
-        "font_size": 34,
-        "max_width_pct": 72,
-        "vertical_position_pct": 26,
-        "outline_width": 3,
-        "line_spacing_pct": 116,
-        "emoji_size_px": 46,
-    },
+    "Default": dict(DEFAULT_TEXT_SETTINGS),
 }
 
 
@@ -638,7 +608,7 @@ def normalize_text_settings(settings: dict | None) -> dict:
 
 def load_text_presets_data() -> dict:
     """Load custom text presets and the user's preferred default preset."""
-    data = {"default": "Apple Compact", "presets": {}}
+    data = {"default": "Default", "presets": {}}
     if PRESETS_FILE.exists():
         try:
             loaded = json.loads(PRESETS_FILE.read_text(encoding="utf-8"))
@@ -659,7 +629,7 @@ def load_text_presets_data() -> dict:
 def save_text_presets_data(data: dict):
     """Persist custom presets and the selected default preset."""
     payload = {
-        "default": data.get("default") or "Apple Compact",
+        "default": "Default",
         "presets": data.get("presets") or {},
     }
     try:
@@ -672,20 +642,14 @@ def save_text_presets_data(data: dict):
 
 
 def all_text_presets() -> tuple[dict, dict]:
-    """Return merged presets plus the raw persistent preset data."""
-    data = load_text_presets_data()
-    merged = {name: normalize_text_settings(value) for name, value in BUILT_IN_TEXT_PRESETS.items()}
-    merged.update(data.get("presets") or {})
-    return merged, data
+    """Return the single built-in default text style."""
+    data = {"default": "Default", "presets": {}}
+    return {"Default": dict(DEFAULT_TEXT_SETTINGS)}, data
 
 
 def default_text_settings_from_presets() -> tuple[dict, str]:
-    """Return settings for the global default preset."""
-    presets, data = all_text_presets()
-    default_name = data.get("default") or "Apple Compact"
-    if default_name not in presets:
-        default_name = "Apple Compact"
-    return dict(presets[default_name]), default_name
+    """Return the fixed global default text style."""
+    return dict(DEFAULT_TEXT_SETTINGS), "Default"
 
 
 def set_editor_widget_values(index: int, settings: dict):
@@ -4095,15 +4059,8 @@ def main():
                 st.info("Your finished version will appear here after you apply the hook.")
 
         with st.expander("✍️ Text editor", expanded=True):
-            upload_presets, _upload_preset_data = all_text_presets()
-            upload_default_settings, upload_default_name = default_text_settings_from_presets()
-            upload_preset_name = st.selectbox(
-                "Text preset",
-                options=list(upload_presets.keys()),
-                index=list(upload_presets.keys()).index(upload_default_name),
-                key="upload_text_preset",
-            )
-            upload_base = normalize_text_settings(upload_presets[upload_preset_name])
+            upload_base = dict(DEFAULT_TEXT_SETTINGS)
+            st.caption("Default text style: size 48 · width 89 · position 12 · outline 4 · spacing 99 · emoji 50")
             upload_font_options = available_overlay_fonts()
             upload_default_font = upload_base.get("font_name", "TikTok Sans")
             if upload_default_font not in upload_font_options:
@@ -4699,17 +4656,12 @@ def main():
                             "The original stays untouched. The final version combines your hook styling with the assigned soundtrack."
                         )
 
-                        presets, preset_data = all_text_presets()
-                        default_preset_settings, default_preset_name = default_text_settings_from_presets()
-
-                        if result.get("text_settings"):
+                        # Unedited videos always open with the fixed default style.
+                        # Existing processed versions keep their saved settings until changed.
+                        if has_processed_version and result.get("text_settings"):
                             stored_settings = normalize_text_settings(result.get("text_settings"))
                         else:
-                            stored_settings = dict(default_preset_settings)
-
-                        active_preset_name = result.get("text_preset_name") or default_preset_name
-                        if active_preset_name not in presets:
-                            active_preset_name = default_preset_name
+                            stored_settings = dict(DEFAULT_TEXT_SETTINGS)
 
                         widget_keys = [
                             f"editor_font_{i}",
@@ -4723,32 +4675,7 @@ def main():
                         if not any(key in st.session_state for key in widget_keys):
                             set_editor_widget_values(i, stored_settings)
 
-                        st.markdown('<span class="preset-pill">TEXT STYLE PRESETS</span>', unsafe_allow_html=True)
-                        preset_col, load_col, default_col = st.columns([2.5, 1, 1.35])
-                        with preset_col:
-                            selected_preset = st.selectbox(
-                                "Preset",
-                                options=list(presets.keys()),
-                                index=list(presets.keys()).index(active_preset_name),
-                                key=f"preset_select_{i}",
-                            )
-                        with load_col:
-                            st.write("")
-                            if st.button("Load", key=f"load_preset_{i}", use_container_width=True):
-                                set_editor_widget_values(i, presets[selected_preset])
-                                saved_gens[i]["text_preset_name"] = selected_preset
-                                save_generations(saved_gens)
-                                st.rerun()
-                        with default_col:
-                            st.write("")
-                            if st.button(
-                                "Set default",
-                                key=f"default_preset_{i}",
-                                use_container_width=True,
-                            ):
-                                preset_data["default"] = selected_preset
-                                save_text_presets_data(preset_data)
-                                st.success(f"{selected_preset} is now your default preset.")
+                        st.caption("Default text style: size 48 · width 89 · position 12 · outline 4 · spacing 99 · emoji 50")
 
                         editor_font_options = available_overlay_fonts()
                         editor_default_font = stored_settings.get("font_name", "TikTok Sans")
@@ -4832,50 +4759,6 @@ def main():
                             "line_spacing_pct": line_spacing_pct,
                             "emoji_size_px": emoji_size_px,
                         })
-
-                        st.markdown('<span class="preset-pill">SAVE THIS STYLE</span>', unsafe_allow_html=True)
-                        preset_name_col, preset_save_col, preset_delete_col = st.columns([2.2, 1, 1])
-                        with preset_name_col:
-                            custom_preset_name = st.text_input(
-                                "Preset name",
-                                placeholder="My favorite style",
-                                key=f"custom_preset_name_{i}",
-                                label_visibility="collapsed",
-                            )
-                        with preset_save_col:
-                            if st.button(
-                                "Save preset",
-                                key=f"save_preset_{i}",
-                                type="primary",
-                                use_container_width=True,
-                            ):
-                                cleaned_name = custom_preset_name.strip()
-                                if not cleaned_name:
-                                    st.error("Enter a preset name first.")
-                                elif cleaned_name in BUILT_IN_TEXT_PRESETS:
-                                    st.error("Built-in presets cannot be overwritten.")
-                                else:
-                                    preset_data.setdefault("presets", {})[cleaned_name] = editor_settings
-                                    save_text_presets_data(preset_data)
-                                    saved_gens[i]["text_preset_name"] = cleaned_name
-                                    save_generations(saved_gens)
-                                    st.success(f"Saved preset: {cleaned_name}")
-                                    st.rerun()
-                        with preset_delete_col:
-                            can_delete_preset = selected_preset not in BUILT_IN_TEXT_PRESETS
-                            if st.button(
-                                "Delete preset",
-                                key=f"delete_preset_{i}",
-                                disabled=not can_delete_preset,
-                                use_container_width=True,
-                            ):
-                                preset_data.get("presets", {}).pop(selected_preset, None)
-                                if preset_data.get("default") == selected_preset:
-                                    preset_data["default"] = "Apple Compact"
-                                save_text_presets_data(preset_data)
-                                saved_gens[i]["text_preset_name"] = "Apple Compact"
-                                save_generations(saved_gens)
-                                st.rerun()
 
                         available_assets = sum(
                             1 for filename in EMOJI_ASSET_MAP.values()
@@ -4970,7 +4853,7 @@ def main():
 
                                 saved_gens[i]["accepted_hook"] = edited_hook.strip()
                                 saved_gens[i]["text_settings"] = editor_settings
-                                saved_gens[i]["text_preset_name"] = selected_preset
+                                saved_gens[i]["text_preset_name"] = "Default"
                                 saved_gens[i]["audio_track"] = selected_audio_track
                                 saved_gens[i]["audio_volume_pct"] = audio_volume_pct
                                 saved_gens[i]["processed_path"] = str(output_path)
