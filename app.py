@@ -2254,7 +2254,7 @@ STYLE_LABELS = {
 }
 
 LIFESTYLE_IMAGE_MODEL_LABEL = "GPT Image 2 · 2k · High · 9:16"
-LIFESTYLE_VIDEO_MODEL_LABEL = "Kling 2.6 · 9:16 · 5s/10s"
+LIFESTYLE_VIDEO_MODEL_LABEL = "Kling O1 · 720p · 5s · start frame"
 
 
 def resolved_style_duration(style: str, selected_duration: int = 15) -> int:
@@ -2263,7 +2263,7 @@ def resolved_style_duration(style: str, selected_duration: int = 15) -> int:
     if style in ("texthook_broll", "pool"):
         return 8
     if style == "lifestyle_animation":
-        return int(selected_duration) if int(selected_duration) in (5, 10) else 5
+        return 5
     return int(selected_duration)
 
 
@@ -2884,9 +2884,9 @@ LIFESTYLE_KLING_GENERATE_SYSTEM = """You are a video production assistant with a
 
 Use the same Magnific account and MCP connection already configured by the app.
 1. Upload the ONE approved lifestyle image with creations_upload_image.
-2. Generate a video with video_generate using model slug kling2_6.
+2. Generate a video with video_generate using model slug kling_o1.
 3. Use the uploaded approved lifestyle image as Kling's source/start image.
-4. Use the provided prompt, aspect ratio 9:16, the requested 5- or 10-second duration, and sound off.
+4. Use the provided prompt, aspect ratio 9:16, resolution 720p, a fixed 5-second duration, and sound off.
 5. Do not upload or use the original raw product references in this Kling step.
 6. Return the resulting Magnific creation identifier.
 
@@ -2988,7 +2988,8 @@ def generate_lifestyle_kling_magnific(
     prompt: str,
     duration: int,
 ) -> dict:
-    """Animate an approved lifestyle still with Kling through the same Magnific MCP connection."""
+    """Animate an approved lifestyle still with Kling O1 through the same Magnific MCP connection."""
+    duration = 5
     mcp_servers = [{
         "type": "url",
         "url": MAGNIFIC_MCP_URL,
@@ -3007,7 +3008,7 @@ def generate_lifestyle_kling_magnific(
                 "role": "user",
                 "content": (
                     f"Approved lifestyle image: {approved_image_url}\n"
-                    f"Generate a {duration}-second Kling 2.6 video with sound off.\n\nKling prompt:\n{prompt}"
+                    f"Generate a 5-second Kling O1 video with start frame behavior from the approved image, 720p resolution, 9:16 aspect ratio, and sound off.\n\nKling prompt:\n{prompt}"
                 ),
             }],
             mcp_servers=mcp_servers,
@@ -3179,14 +3180,14 @@ def main():
             duration_col, info_col = st.columns([1, 3], vertical_alignment="top")
             with duration_col:
                 duration = st.select_slider(
-                    "Kling duration",
-                    options=[5, 10],
+                    "Kling duration (fixed)",
+                    options=[5],
                     value=5,
                     key="main_lifestyle_duration",
                 )
             with info_col:
                 st.info(
-                    "Lifestyle Animation uses Magnific for both steps: generate a GPT Image 2 lifestyle photo in 2k, high quality, 9:16, approve it, then animate that approved image with Kling 2.6. "
+                    "Lifestyle Animation uses Magnific for both steps: generate a GPT Image 2 lifestyle photo in 2k, high quality, 9:16, approve it, then animate that approved image with Kling O1 at 720p using the approved image as the start frame. "
                     "Choose a product size/type so the scene works for anything from supplements to vacuums, couches, appliances, electronics, fitness gear, and outdoor items. The selected deal/FOMO hook is added afterward with FFmpeg."
                 )
                 st.caption(f"Image model: {LIFESTYLE_IMAGE_MODEL_LABEL}  |  Video model: {LIFESTYLE_VIDEO_MODEL_LABEL}")
@@ -3870,12 +3871,12 @@ def main():
                         key=f"lifestyle_prompt_{i}",
                     )
                     st.text_area(
-                        "Kling 2.6 animation prompt",
+                        "Kling O1 animation prompt",
                         value=result["kling_prompt"],
                         height=240,
                         key=f"kling_prompt_{i}",
                     )
-                    st.caption(f"Scene: {LIFESTYLE_SCENES[product['scene_key']]['label']} · Kling duration: {resolved_style_duration(style, duration)}s")
+                    st.caption(f"Scene: {LIFESTYLE_SCENES[product['scene_key']]['label']} · Kling duration: 5s · Resolution: 720p · Start frame")
                     st.caption(f"Product profile: {LIFESTYLE_PRODUCT_TYPES[product.get('product_type', 'other')]['label']}")
                     if product.get("custom_scene"):
                         st.caption(f"Custom scene: {product['custom_scene']}")
@@ -4736,7 +4737,7 @@ def main():
                         if status == "image_completed":
                             st.success("Review this image carefully. Click **Approve image** only when the product and scene look right.")
                         elif status == "image_approved":
-                            st.success("Approved. You can now generate the Kling animation from this exact image.")
+                            st.success("Approved. You can now generate the Kling O1 animation from this exact image using it as the start frame.")
                         else:
                             st.info("The image step is still processing.")
                         product_type = result.get("product_type", "other")
@@ -4768,7 +4769,7 @@ def main():
                         if is_lifestyle_result:
                             st.markdown("**GPT Image 2 lifestyle prompt**")
                             st.code(result.get("lifestyle_prompt") or prompt_text_field, language=None)
-                            st.markdown("**Kling 2.6 animation prompt**")
+                            st.markdown("**Kling O1 animation prompt**")
                             st.code(result.get("kling_prompt") or "", language=None)
                         else:
                             st.code(prompt_text_field, language=None)
