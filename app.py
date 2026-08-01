@@ -1483,7 +1483,7 @@ Return ONLY valid JSON (no markdown, no backticks):
 {{"product_name": "...", "hook_options": ["hook 1", "hook 2", "hook 3", "hook 4", "hook 5"], "caption": "tiktok caption (NOT the hook — a separate short caption for the post)", "hashtags": "#tag1 #tag2..."}}"""
 
 WAREHOUSE_HOOKS_SYSTEM = """You are a TikTok Shop affiliate content producer. Generate 5
-on-screen deal/FOMO text hooks. This same hook library is used for Warehouse, Pool, and Text-Hook B-Roll videos.
+on-screen deal/FOMO text hooks. This same hook library is used for Warehouse, Pool, Text-Hook B-Roll, and Lifestyle Animation videos.
 
 Use the product name exactly where [product] appears. Select five DIFFERENT angles from this
 proven library; preserve each template's casual wording and emoji pattern:
@@ -1650,147 +1650,581 @@ VOICEOVER_WITH_SCRIPT = '## Voiceover:\nInclude this voiceover (warm excited wom
 
 
 
-LIFESTYLE_SCENES = {
-    "hand_bathroom": {
-        "label": "Held in hand — bathroom",
-        "setting": (
-            "held casually in one hand against a real bathroom background. "
-            "A bathroom mirror edge, toothbrush holder, folded towel, and maybe a skincare bottle "
-            "sit softly blurred behind it. Warm overhead vanity lighting with a slight yellow cast"
-        ),
-        "placement": "held in one hand against a bathroom background",
-        "background": "a blurred bathroom mirror edge, toothbrush holder, and folded towel",
-        "hand_present": True,
+LIFESTYLE_PRODUCT_TYPES = {
+    "small_handheld": {
+        "label": "Small / handheld — supplements, beauty, personal care",
+        "description": "a small handheld product such as a bottle, jar, box, spray, cosmetic, supplement, accessory, or personal-care item",
+        "framing": "Use a close phone-camera composition where the product fills roughly 45-75% of the frame without looking oversized.",
+        "appearance_help": "Include packaging color, label, cap, logo placement, count, material, and proportions.",
     },
-    "hand_kitchen": {
-        "label": "Held in hand — kitchen",
-        "setting": (
-            "held in one hand over a real kitchen countertop. A water glass, coffee mug, cutting-board edge, "
-            "and maybe a fruit bowl appear softly out of focus. Morning window light comes from the side"
-        ),
-        "placement": "held in one hand over a kitchen countertop",
-        "background": "a water glass, coffee mug, and cutting-board edge, softly blurred",
-        "hand_present": True,
+    "countertop_appliance": {
+        "label": "Countertop appliance — air fryer, blender, coffee maker",
+        "description": "a medium countertop appliance or home device",
+        "framing": "Show the complete appliance at believable real-world scale, filling roughly 45-70% of the vertical frame with enough counter and room context to prove its size.",
+        "appearance_help": "Include body color, finish, controls, display, lid, basket, cord, attachments, logo, and proportions.",
     },
-    "counter_kitchen": {
-        "label": "On kitchen counter",
-        "setting": (
-            "placed casually on a kitchen countertop, slightly off-center. A coffee mug, phone, and paper towel roll "
-            "sit nearby. Natural window light comes from the left with one ordinary pendant light overhead"
-        ),
-        "placement": "standing upright on a kitchen countertop",
-        "background": "a coffee mug and paper towel roll, softly blurred, with natural window light",
-        "hand_present": False,
+    "floor_cleaning": {
+        "label": "Floor-care / cleaning — vacuum, mop, carpet cleaner",
+        "description": "a full-size floor-care or cleaning product",
+        "framing": "Show the complete product from floor level to handle at believable scale. Do not crop away the cleaner head, body, hose, tank, or handle unless the references show a compact model.",
+        "appearance_help": "Include floor head, handle, tank/bin, hose, attachments, controls, color blocking, logo, and proportions.",
     },
-    "nightstand": {
-        "label": "On nightstand",
-        "setting": (
-            "sitting on a nightstand beside a charging phone, half-empty water glass, and a small lamp that is turned on. "
-            "Rumpled bedsheets appear at the bottom edge. Warm low light"
-        ),
-        "placement": "standing on a nightstand",
-        "background": "a charging phone, water glass, and rumpled bedsheets, softly blurred",
-        "hand_present": False,
+    "furniture_large": {
+        "label": "Furniture / large home item — couch, chair, table, mattress",
+        "description": "a room-scale furniture piece or large home item",
+        "framing": "Use a wider vertical room composition. Show the entire furniture item at correct human-scale proportions, occupying roughly 50-80% of the frame with visible floor and surrounding room context.",
+        "appearance_help": "Include dimensions, silhouette, upholstery/material, legs, cushions, seams, color, texture, hardware, and included pieces.",
     },
-    "bed_toss": {
-        "label": "Tossed on bed",
-        "setting": (
-            "resting casually on a rumpled white duvet with a pillow behind it and maybe a book or earbuds nearby. "
-            "Soft natural bedroom-window light, slightly overexposed"
-        ),
-        "placement": "resting on a rumpled bed duvet",
-        "background": "a pillow and small everyday bedroom items, softly blurred",
-        "hand_present": False,
+    "electronics": {
+        "label": "Electronics / office — TV, monitor, speaker, printer",
+        "description": "a consumer electronic or office product",
+        "framing": "Show the complete device at realistic scale with its stand, ports, controls, screen/bezel, cables, or accessories visible where appropriate.",
+        "appearance_help": "Include finish, screen/bezel, buttons, ports, stand, cables, accessories, logo, and proportions.",
     },
-    "bag_peek": {
-        "label": "Inside a bag",
-        "setting": (
-            "peeking out of an open purse or gym bag with keys, a wallet, hair tie, and maybe a water bottle visible. "
-            "Shot from above as if someone just opened the bag"
-        ),
-        "placement": "peeking out of an open bag, shot from above",
-        "background": "keys, a wallet, and a hair tie inside the bag, softly blurred",
-        "hand_present": False,
+    "fitness_large": {
+        "label": "Fitness equipment — treadmill, bike, bench, weights",
+        "description": "a medium or large fitness product",
+        "framing": "Show the full equipment footprint at realistic scale with enough floor and room context to establish size. Do not miniaturize or crop off key frames, pedals, rails, handles, or consoles.",
+        "appearance_help": "Include frame shape, padding, console, handles, pedals, rails, weights, attachments, finish, logo, and proportions.",
     },
-    "closeup_label": {
-        "label": "Close-up of label",
-        "setting": (
-            "shown in an extreme close-up with the product label and packaging details sharp and readable. "
-            "Shot from about six inches away with the background completely blurred"
-        ),
-        "placement": "positioned close to the camera with the label facing forward",
-        "background": "a softly blurred surface with no distinct background elements",
-        "hand_present": False,
+    "outdoor_large": {
+        "label": "Outdoor / patio — grill, canopy, garden, pool item",
+        "description": "an outdoor, patio, garden, or recreation product",
+        "framing": "Show the complete product at believable outdoor scale with patio, yard, driveway, deck, or garden context. Preserve weather-resistant materials and all structural parts.",
+        "appearance_help": "Include frame, fabric, wheels, handles, shelves, canopy, hardware, finish, accessories, logo, and proportions.",
     },
-    "desk": {
-        "label": "On desk",
-        "setting": (
-            "sitting on a real desk beside the edge of a laptop, pen, sticky note, and water bottle. "
-            "Ordinary overhead light with a little screen glow"
-        ),
-        "placement": "sitting on a desk",
-        "background": "the edge of a laptop, pen, sticky note, and water bottle, softly blurred",
-        "hand_present": False,
-    },
-    "car_cupholder": {
-        "label": "In car",
-        "setting": (
-            "sitting in a car cupholder or on the passenger seat. A seatbelt and steering wheel appear blurred behind it. "
-            "Natural daylight enters through the windshield"
-        ),
-        "placement": "sitting in a car cupholder",
-        "background": "a blurred steering wheel and seatbelt with daylight through the windshield",
-        "hand_present": False,
-    },
-    "gym_bag": {
-        "label": "With gym gear",
-        "setting": (
-            "resting on a gym bench or locker-room shelf beside a water bottle and towel. "
-            "Slightly harsh fluorescent light with gym equipment blurred in the background"
-        ),
-        "placement": "resting on a gym bench",
-        "background": "a water bottle and towel, softly blurred, with fluorescent gym lighting",
-        "hand_present": False,
+    "other": {
+        "label": "Other / mixed-size item",
+        "description": "a product whose size and category should be inferred from the references",
+        "framing": "Infer the true real-world size from the references and show the complete product with enough environmental context to make that scale unmistakable.",
+        "appearance_help": "Describe the real size, construction, materials, colors, controls, accessories, branding, and proportions.",
     },
 }
 
+LIFESTYLE_PRODUCT_TYPE_OPTIONS = ["auto"] + list(LIFESTYLE_PRODUCT_TYPES.keys())
+LIFESTYLE_PRODUCT_TYPE_LABELS = {
+    "auto": "Auto-detect from product name",
+    **{key: value["label"] for key, value in LIFESTYLE_PRODUCT_TYPES.items()},
+}
+
+LIFESTYLE_TYPE_KEYWORDS = {
+    "furniture_large": (
+        "couch", "sofa", "loveseat", "recliner", "armchair", "accent chair", "ottoman", "coffee table",
+        "dining table", "desk", "dresser", "nightstand", "cabinet", "bookshelf", "shelf", "bed frame",
+        "mattress", "headboard", "bench", "bar stool", "stool", "storage chest", "tv stand",
+    ),
+    "floor_cleaning": (
+        "vacuum", "carpet cleaner", "floor cleaner", "floor washer", "steam mop", "mop", "broom",
+        "spot cleaner", "scrubber", "wet dry vac", "shop vac", "dustbuster",
+    ),
+    "countertop_appliance": (
+        "air fryer", "blender", "coffee maker", "espresso", "toaster", "kettle", "juicer", "mixer",
+        "food processor", "rice cooker", "slow cooker", "pressure cooker", "ice maker", "microwave",
+        "waffle maker", "griddle", "countertop oven", "creami",
+    ),
+    "fitness_large": (
+        "treadmill", "walking pad", "exercise bike", "stationary bike", "rowing machine", "rower",
+        "elliptical", "weight bench", "power rack", "squat rack", "home gym", "dumbbell set",
+        "kettlebell", "stepper", "pilates reformer", "vibration plate",
+    ),
+    "outdoor_large": (
+        "patio", "grill", "barbecue", "smoker", "canopy", "gazebo", "tent", "garden", "lawn",
+        "outdoor chair", "outdoor table", "pool", "cooler", "fire pit", "umbrella", "hammock",
+        "pressure washer", "leaf blower", "lawn mower", "hose reel",
+    ),
+    "electronics": (
+        "television", " tv ", "smart tv", "monitor", "speaker", "soundbar", "printer", "projector",
+        "laptop", "tablet", "keyboard", "microphone", "camera", "router", "gaming chair", "headphones",
+        "earbuds", "charging station", "computer", "scanner",
+    ),
+    "small_handheld": (
+        "gummies", "capsules", "supplement", "vitamin", "serum", "cream", "lotion", "perfume", "spray",
+        "toner", "cleanser", "shampoo", "conditioner", "makeup", "lip", "mask", "powder", "drink mix",
+        "bottle", "jar", "drops", "soap", "deodorant", "toothpaste", "mouthwash", "earplugs", "wallet",
+    ),
+}
+
+
+def infer_lifestyle_product_type(product_name: str) -> str:
+    """Infer a practical product-size profile from the product title; the user can override it."""
+    normalized = f" {re.sub(r'[^a-z0-9]+', ' ', (product_name or '').lower()).strip()} "
+    for type_key in (
+        "furniture_large", "floor_cleaning", "countertop_appliance", "fitness_large",
+        "outdoor_large", "electronics", "small_handheld",
+    ):
+        if any(keyword in normalized for keyword in LIFESTYLE_TYPE_KEYWORDS[type_key]):
+            return type_key
+    return "other"
+
+
+def infer_lifestyle_default_scene(product_name: str, product_type: str) -> str:
+    """Pick a sensible first scene for the product while still allowing manual scene selection."""
+    normalized = f" {re.sub(r'[^a-z0-9]+', ' ', (product_name or '').lower()).strip()} "
+    if product_type == "electronics":
+        if any(word in normalized for word in (" tv ", "television", "soundbar", "speaker", "projector")):
+            return "living_room_electronics"
+        return "home_office_device"
+    if product_type == "furniture_large":
+        if any(word in normalized for word in ("mattress", "bed frame", "headboard", "nightstand", "dresser")):
+            return "bedroom_large_item"
+        if any(word in normalized for word in ("desk", "bookshelf", "shelf", "cabinet")):
+            return "furniture_room_corner"
+        return "living_room_furniture"
+    if product_type == "floor_cleaning":
+        if any(word in normalized for word in ("shop vac", "wet dry vac", "pressure washer")):
+            return "garage_storage"
+        return "vacuum_living_room"
+    if product_type == "countertop_appliance":
+        if any(word in normalized for word in ("coffee", "espresso", "kettle")):
+            return "appliance_coffee_corner"
+        return "kitchen_appliance"
+    if product_type == "fitness_large":
+        if any(word in normalized for word in ("walking pad", "stepper", "vibration plate", "dumbbell", "kettlebell")):
+            return "fitness_living_space"
+        return "home_gym_equipment"
+    if product_type == "outdoor_large":
+        if any(word in normalized for word in ("lawn", "blower", "mower", "pressure washer", "hose", "driveway")):
+            return "yard_driveway_product"
+        return "patio_product"
+    if product_type == "small_handheld":
+        if any(word in normalized for word in ("gummies", "capsules", "supplement", "vitamin", "drink mix", "powder")):
+            return "hand_kitchen"
+        if any(word in normalized for word in ("perfume", "sleep", "earplugs", "eye mask")):
+            return "nightstand"
+        return "hand_bathroom"
+    return "custom"
+
+
+LIFESTYLE_SCENES = {
+    # Small / handheld products
+    "hand_bathroom": {
+        "label": "Held in hand — bathroom",
+        "types": ["small_handheld", "other"],
+        "setting": (
+            "held casually in one hand against a real bathroom background. A bathroom mirror edge, toothbrush holder, "
+            "folded towel, and one ordinary personal-care item sit softly blurred behind it. Warm overhead vanity light"
+        ),
+        "placement": "held in one hand against a bathroom background",
+        "background": "a bathroom mirror edge, toothbrush holder, and folded towel",
+        "hand_present": True,
+        "camera_motion": "a small side-to-side handheld arc and slight push-in",
+    },
+    "hand_kitchen": {
+        "label": "Held in hand — kitchen",
+        "types": ["small_handheld", "other"],
+        "setting": (
+            "held in one hand over a real kitchen countertop. A water glass, coffee mug, cutting-board edge, and fruit bowl "
+            "appear softly out of focus. Morning window light comes from the side"
+        ),
+        "placement": "held in one hand over a kitchen countertop",
+        "background": "a water glass, coffee mug, cutting-board edge, and normal kitchen counter",
+        "hand_present": True,
+        "camera_motion": "a gentle handheld reframe and tiny push-in",
+    },
+    "counter_kitchen": {
+        "label": "On kitchen counter",
+        "types": ["small_handheld", "countertop_appliance", "electronics", "other"],
+        "setting": (
+            "placed naturally on a lived-in kitchen countertop, slightly off-center. A coffee mug, phone, dish towel, and "
+            "paper towel roll sit nearby. Natural window light comes from one side"
+        ),
+        "placement": "positioned naturally on a kitchen countertop",
+        "background": "a lived-in kitchen counter with a mug, dish towel, and ordinary kitchen details",
+        "hand_present": False,
+        "camera_motion": "a slow phone-camera half-arc with mild parallax",
+    },
+    "nightstand": {
+        "label": "On nightstand",
+        "types": ["small_handheld", "electronics", "other"],
+        "setting": (
+            "sitting on a nightstand beside a charging phone, half-empty water glass, and a small lamp that is turned on. "
+            "Rumpled bedsheets appear at the lower edge. Warm low light"
+        ),
+        "placement": "positioned on a nightstand",
+        "background": "a charging phone, water glass, lamp, and rumpled bedsheets",
+        "hand_present": False,
+        "camera_motion": "a subtle bedside push-in and short lateral drift",
+    },
+    "bed_toss": {
+        "label": "Tossed on bed",
+        "types": ["small_handheld", "electronics", "other"],
+        "setting": (
+            "resting casually on a rumpled duvet with a pillow behind it and a book or earbuds nearby. Soft natural "
+            "bedroom-window light, slightly imperfect exposure"
+        ),
+        "placement": "resting naturally on a rumpled bed duvet",
+        "background": "a pillow, duvet folds, and small everyday bedroom items",
+        "hand_present": False,
+        "camera_motion": "a short top-down drift with natural phone shake",
+    },
+    "bag_peek": {
+        "label": "Inside a bag",
+        "types": ["small_handheld", "electronics"],
+        "setting": (
+            "peeking out of an open purse, tote, or gym bag with keys, a wallet, hair tie, and water bottle visible. "
+            "Shot from above as if someone just opened the bag"
+        ),
+        "placement": "peeking out of an open everyday bag",
+        "background": "keys, a wallet, hair tie, and other normal bag contents",
+        "hand_present": False,
+        "camera_motion": "a slight top-down lean-in and natural wrist movement",
+    },
+    "closeup_label": {
+        "label": "Close-up product detail",
+        "types": ["small_handheld", "countertop_appliance", "electronics", "floor_cleaning", "other"],
+        "setting": (
+            "shown in a close product-detail composition with its branding, controls, materials, or key construction details "
+            "sharp and recognizable while the background falls softly out of focus"
+        ),
+        "placement": "positioned close to the camera with its main identifying details facing forward",
+        "background": "a softly blurred real-life surface and room context",
+        "hand_present": False,
+        "camera_motion": "a very small detail-oriented side drift and push-in",
+    },
+    "desk": {
+        "label": "On desk / home office",
+        "types": ["small_handheld", "electronics", "countertop_appliance", "other"],
+        "setting": (
+            "placed on a real home-office desk beside the edge of a laptop or monitor, pen, sticky note, charging cable, "
+            "and water bottle. Ordinary overhead light with a little screen glow"
+        ),
+        "placement": "positioned on a lived-in home-office desk",
+        "background": "a laptop or monitor edge, pen, sticky notes, cable, and water bottle",
+        "hand_present": False,
+        "camera_motion": "a casual desk-height slide and slight push-in",
+    },
+    "car_cupholder": {
+        "label": "In car",
+        "types": ["small_handheld", "electronics"],
+        "setting": (
+            "sitting in a car cupholder or securely on the passenger seat. A seatbelt, console, and steering wheel appear "
+            "blurred behind it. Natural daylight enters through the windshield"
+        ),
+        "placement": "sitting securely in a car cupholder or on the passenger seat",
+        "background": "a car console, blurred steering wheel, and seatbelt",
+        "hand_present": False,
+        "camera_motion": "a small handheld reframe from the passenger-seat angle",
+    },
+    "gym_bag": {
+        "label": "With gym gear",
+        "types": ["small_handheld", "fitness_large", "other"],
+        "setting": (
+            "placed naturally beside gym gear on a bench or locker-room shelf. A water bottle and towel sit nearby with "
+            "real gym equipment softly blurred in the background"
+        ),
+        "placement": "positioned beside normal gym gear",
+        "background": "a water bottle, towel, bench, and softly blurred gym equipment",
+        "hand_present": False,
+        "camera_motion": "a short bench-height arc and subtle push-in",
+    },
+
+    # Countertop appliances
+    "kitchen_appliance": {
+        "label": "Countertop appliance — real kitchen",
+        "types": ["countertop_appliance", "electronics", "other"],
+        "setting": (
+            "installed naturally on a real kitchen counter with correct clearance around it. Its complete body, controls, "
+            "lid or basket, cord, and included attachments are visible. Nearby are a dish towel, cutting board, and mug; "
+            "the kitchen is casual rather than staged"
+        ),
+        "placement": "sitting at full real-world scale on a kitchen countertop",
+        "background": "a lived-in kitchen with cabinets, counter items, and natural side light",
+        "hand_present": False,
+        "camera_motion": "a slow counter-height half-orbit that reveals the front and one side",
+    },
+    "appliance_coffee_corner": {
+        "label": "Appliance — coffee / breakfast corner",
+        "types": ["countertop_appliance", "electronics"],
+        "setting": (
+            "placed in a believable breakfast or coffee corner with a mug, small tray, paper towel roll, and wall outlet. "
+            "The full appliance remains visible at correct scale with natural morning light"
+        ),
+        "placement": "positioned in a real breakfast or coffee-station corner",
+        "background": "a mug, tray, outlet, backsplash, and normal kitchen details",
+        "hand_present": False,
+        "camera_motion": "a gentle front-to-side arc with realistic reflections",
+    },
+
+    # Vacuums and floor-care products
+    "vacuum_living_room": {
+        "label": "Vacuum / floor cleaner — living room",
+        "types": ["floor_cleaning", "other"],
+        "setting": (
+            "standing naturally on a real living-room floor beside a sofa and low table. The complete cleaner head, body, "
+            "tank or bin, handle, hose, and attachments are visible at accurate scale. The room has ordinary lived-in details"
+        ),
+        "placement": "standing upright at full scale on a living-room floor",
+        "background": "a sofa, low table, rug edge, baseboard, and normal living-room clutter",
+        "hand_present": False,
+        "camera_motion": "a low handheld side-to-side arc from floor-head height up toward the handle",
+    },
+    "vacuum_hallway": {
+        "label": "Vacuum / floor cleaner — hallway",
+        "types": ["floor_cleaning"],
+        "setting": (
+            "parked naturally in a hallway or entryway with its full floor head and handle visible. A runner rug, shoes, "
+            "doorframe, and baseboards establish believable scale and household use"
+        ),
+        "placement": "standing at full scale in a hallway or entryway",
+        "background": "a runner rug, shoes, doorframe, baseboards, and ordinary entryway details",
+        "hand_present": False,
+        "camera_motion": "a slow low-angle push-in with a small side reveal",
+    },
+    "cleaner_storage": {
+        "label": "Cleaning product — laundry / utility area",
+        "types": ["floor_cleaning", "countertop_appliance", "other"],
+        "setting": (
+            "positioned in a real laundry or utility area beside a shelf, basket, cleaning cloths, and wall outlet. The full "
+            "product and all major attachments are visible with slightly harsh household lighting"
+        ),
+        "placement": "positioned at full scale in a laundry or utility area",
+        "background": "a shelf, laundry basket, cleaning cloths, outlet, and utility-room details",
+        "hand_present": False,
+        "camera_motion": "a casual utility-room reframe and small push-in",
+    },
+
+    # Furniture and room-scale products
+    "living_room_furniture": {
+        "label": "Furniture — lived-in living room",
+        "types": ["furniture_large", "other"],
+        "setting": (
+            "installed naturally in a lived-in living room. Show the entire furniture piece at correct room scale, including "
+            "all cushions, legs, arms, seams, panels, and included sections. A rug, side table, lamp, and ordinary decor prove its size"
+        ),
+        "placement": "installed at full human scale in a lived-in living room",
+        "background": "a rug, side table, lamp, wall, windows, and ordinary living-room decor",
+        "hand_present": False,
+        "camera_motion": "a wide iPhone 0.5x room-level arc that reveals the front and one side",
+    },
+    "furniture_room_corner": {
+        "label": "Furniture — room corner / apartment",
+        "types": ["furniture_large", "electronics", "other"],
+        "setting": (
+            "placed in a believable apartment or bedroom corner with enough wall, floor, doorway, and nearby furniture visible "
+            "to establish real dimensions. The complete product remains unobstructed and accurately proportioned"
+        ),
+        "placement": "placed at full scale in a believable apartment room corner",
+        "background": "visible walls, floor, doorway, window light, and nearby everyday furniture",
+        "hand_present": False,
+        "camera_motion": "a slow wide-angle corner-to-front reveal with natural handheld sway",
+    },
+    "bedroom_large_item": {
+        "label": "Large item — bedroom",
+        "types": ["furniture_large", "fitness_large", "other"],
+        "setting": (
+            "positioned naturally in a bedroom with the complete product visible at correct scale. Bedside furniture, a rug, "
+            "curtains, and doorway provide believable size reference without making the room look staged"
+        ),
+        "placement": "positioned at full scale in a real bedroom",
+        "background": "a bed or bedside furniture, rug, curtains, doorway, and natural window light",
+        "hand_present": False,
+        "camera_motion": "a wide room-level side drift and gentle push-in",
+    },
+
+    # Electronics and office items
+    "home_office_device": {
+        "label": "Electronics — home office setup",
+        "types": ["electronics", "countertop_appliance", "other"],
+        "setting": (
+            "set up naturally in a real home office with its complete stand, cables, ports, controls, screen or output area, "
+            "and included accessories visible. A keyboard, notebook, chair, and wall outlet establish realistic use"
+        ),
+        "placement": "set up at correct scale in a home-office workspace",
+        "background": "a desk, keyboard, notebook, chair, cables, outlet, and ordinary office details",
+        "hand_present": False,
+        "camera_motion": "a desk-height front-to-side arc with subtle screen or material reflections",
+    },
+    "living_room_electronics": {
+        "label": "Electronics — living room console",
+        "types": ["electronics", "other"],
+        "setting": (
+            "installed naturally on or above a living-room media console. Show the entire device, stand, bezel, speakers, "
+            "cables, remote, and accessories at correct scale with casual home decor around it"
+        ),
+        "placement": "installed at realistic scale in a living-room media area",
+        "background": "a media console, remote, cables, wall, lamp, and ordinary living-room decor",
+        "hand_present": False,
+        "camera_motion": "a slow wide-angle media-console reveal with a small push-in",
+    },
+
+    # Fitness equipment
+    "home_gym_equipment": {
+        "label": "Fitness equipment — home gym",
+        "types": ["fitness_large", "other"],
+        "setting": (
+            "assembled naturally in a real home gym or spare room. Show the complete frame, base, handles, pedals, rails, "
+            "console, padding, attachments, and footprint at correct scale. A mat, water bottle, and small rack provide context"
+        ),
+        "placement": "assembled at full scale in a home-gym or spare-room setting",
+        "background": "a floor mat, water bottle, small weight rack, wall, doorway, and ordinary home-gym details",
+        "hand_present": False,
+        "camera_motion": "a wide low-to-mid-height arc that reveals the full footprint and controls",
+    },
+    "fitness_living_space": {
+        "label": "Fitness equipment — living space",
+        "types": ["fitness_large", "other"],
+        "setting": (
+            "positioned in a realistic apartment living area as someone would actually store and use it. The whole product, "
+            "floor contact points, moving parts, controls, and accessories remain visible with furniture nearby for scale"
+        ),
+        "placement": "positioned at full scale in a realistic apartment living area",
+        "background": "a sofa or chair, floor mat, wall outlet, window, and normal apartment details",
+        "hand_present": False,
+        "camera_motion": "a wide handheld side reveal with natural parallax",
+    },
+
+    # Outdoor and patio products
+    "patio_product": {
+        "label": "Outdoor product — patio / deck",
+        "types": ["outdoor_large", "furniture_large", "other"],
+        "setting": (
+            "placed naturally on a real patio or deck at correct outdoor scale. Show the full frame, fabric, shelves, wheels, "
+            "handles, canopy, hardware, or included parts. Patio furniture, a fence, and plants provide believable context"
+        ),
+        "placement": "positioned at full scale on a real patio or deck",
+        "background": "patio furniture, deck boards or concrete, fence, plants, and daylight",
+        "hand_present": False,
+        "camera_motion": "a wide outdoor half-orbit with gentle handheld movement",
+    },
+    "yard_driveway_product": {
+        "label": "Outdoor product — yard / driveway",
+        "types": ["outdoor_large", "floor_cleaning", "fitness_large", "other"],
+        "setting": (
+            "positioned naturally in a real yard or driveway with the complete product visible at accurate scale. Grass, concrete, "
+            "garage edge, hose, tools, or outdoor storage provide casual real-life context"
+        ),
+        "placement": "positioned at full scale in a real yard or driveway",
+        "background": "grass or concrete, a garage edge, outdoor tools, fence, and natural daylight",
+        "hand_present": False,
+        "camera_motion": "a practical wide-angle walk-around arc without dramatic movement",
+    },
+
+    # Universal fallback
+    "garage_storage": {
+        "label": "Large / mixed item — garage or storage area",
+        "types": ["floor_cleaning", "fitness_large", "outdoor_large", "furniture_large", "other"],
+        "setting": (
+            "positioned naturally in a real garage, utility room, or storage area. Show the complete item and all important parts "
+            "at accurate scale with shelves, boxes, tools, and floor markings providing real-world context"
+        ),
+        "placement": "positioned at full scale in a real garage or storage area",
+        "background": "storage shelves, boxes, tools, concrete floor, and ordinary utility details",
+        "hand_present": False,
+        "camera_motion": "a wide practical side-to-front reveal with mild phone shake",
+    },
+    "custom": {
+        "label": "Custom scene",
+        "types": list(LIFESTYLE_PRODUCT_TYPES.keys()),
+        "setting": "placed in the exact custom real-life scene supplied by the user",
+        "placement": "positioned naturally in the custom scene supplied by the user",
+        "background": "the user-supplied custom environment",
+        "hand_present": False,
+        "camera_motion": "a natural phone-camera move appropriate for the product size and custom scene",
+    },
+}
+
+DEFAULT_LIFESTYLE_SCENE_BY_TYPE = {
+    "small_handheld": "hand_bathroom",
+    "countertop_appliance": "kitchen_appliance",
+    "floor_cleaning": "vacuum_living_room",
+    "furniture_large": "living_room_furniture",
+    "electronics": "home_office_device",
+    "fitness_large": "home_gym_equipment",
+    "outdoor_large": "patio_product",
+    "other": "custom",
+}
+
+
+def lifestyle_scene_options(product_type: str) -> list[str]:
+    """Return scenes that make physical sense for the resolved product type."""
+    resolved_type = product_type if product_type in LIFESTYLE_PRODUCT_TYPES else "other"
+    options = [
+        scene_key for scene_key, scene in LIFESTYLE_SCENES.items()
+        if resolved_type in scene.get("types", [])
+    ]
+    default_scene = DEFAULT_LIFESTYLE_SCENE_BY_TYPE.get(resolved_type, "custom")
+    if default_scene in options:
+        options.remove(default_scene)
+        options.insert(0, default_scene)
+    if "custom" not in options:
+        options.append("custom")
+    return options
+
+
+def resolve_lifestyle_scene(scene_key: str, custom_scene: str = "") -> dict:
+    """Resolve a standard scene or turn the user's free-text scene into a complete scene profile."""
+    scene = dict(LIFESTYLE_SCENES.get(scene_key, LIFESTYLE_SCENES["custom"]))
+    custom_scene = re.sub(r"\s+", " ", (custom_scene or "").strip())
+    if scene_key == "custom" and custom_scene:
+        scene.update({
+            "setting": (
+                f"placed naturally in this exact real-life scene: {custom_scene}. The environment must be believable, "
+                "lived-in, correctly scaled, and photographed casually rather than staged"
+            ),
+            "placement": f"positioned naturally in this exact scene: {custom_scene}",
+            "background": custom_scene,
+            "camera_motion": "a natural handheld arc, push-in, or wide reveal appropriate for the product's real size",
+        })
+    return scene
+
+
 LIFESTYLE_IPHONE_STYLE = (
-    "Unedited iPhone 16 photo, raw HEIC-to-JPEG look, zero retouching. Vertical 9:16 handheld framing, "
-    "slightly imperfect crop, product sharp with natural background blur, subtle phone-camera grain, "
-    "realistic edge distortion, and natural shadows from one ordinary real light source. "
+    "Unedited iPhone 16 photo, raw HEIC-to-JPEG look, zero retouching. True vertical 9:16 framing, 2k high quality, "
+    "slightly imperfect crop, subtle phone-camera grain, realistic edge distortion, and natural shadows from ordinary real light. "
     "No studio lighting, softboxes, ring light, commercial reflections, color grading, or polished ad composition. "
 )
 
 
-def build_lifestyle_image_prompt(product_name: str, scene_key: str) -> str:
-    scene = LIFESTYLE_SCENES.get(scene_key, LIFESTYLE_SCENES["hand_bathroom"])
+def build_lifestyle_image_prompt(
+    product_name: str,
+    scene_key: str,
+    product_type: str = "other",
+    custom_scene: str = "",
+) -> str:
+    scene = resolve_lifestyle_scene(scene_key, custom_scene)
+    profile = LIFESTYLE_PRODUCT_TYPES.get(product_type, LIFESTYLE_PRODUCT_TYPES["other"])
+    hand_rule = (
+        "Show one natural hand only, with correct fingers and a believable grip; the hand must not hide the product. "
+        if scene.get("hand_present")
+        else "Do not add a person or hand unless it is essential to the user-supplied custom scene. "
+    )
     return (
-        f"{LIFESTYLE_IPHONE_STYLE}A single {product_name}, {scene['setting']}. "
-        "Use all uploaded product images only as exact visual references for packaging, colors, logo placement, "
-        "label text, product count, shape, cap, material, and proportions. Keep the real product accurate and recognizable. "
-        "The environment should feel lived-in, casual, imperfect, and believable, like a quick TikTok Shop customer photo. "
-        "Do not make this look like AI, a 3D render, a brand shoot, or a floating product mockup. "
-        "No rendered captions, promotional text, prices, stickers, graphics, or watermarks. "
-        "Physical writing printed on the real package is allowed."
+        f"{LIFESTYLE_IPHONE_STYLE}Photograph the exact {product_name} as {profile['description']}, {scene['setting']}. "
+        f"{profile['framing']} {hand_rule}Use all uploaded images as strict visual references for the real product: preserve its "
+        "true dimensions, silhouette, colors, materials, texture, seams, controls, attachments, accessories, logo placement, "
+        "physical label text where applicable, and exact proportions. Do not turn a large item into a miniature and do not enlarge "
+        "a small item unnaturally. Show only the correct number of products and included parts. The environment should feel lived-in, "
+        "casual, slightly imperfect, and believable, like a quick TikTok Shop customer photo. Do not make it look like AI, a 3D render, "
+        "a catalog cutout, a floating mockup, a showroom, or a polished brand shoot. No rendered captions, promotional text, prices, "
+        "stickers, graphics, or watermarks. Physical writing printed on the real product is allowed."
     )
 
 
-def build_lifestyle_kling_prompt(product_name: str, product_details: str, scene_key: str) -> str:
-    scene = LIFESTYLE_SCENES.get(scene_key, LIFESTYLE_SCENES["hand_bathroom"])
-    hand_present = bool(scene["hand_present"])
+def build_lifestyle_kling_prompt(
+    product_name: str,
+    product_details: str,
+    scene_key: str,
+    product_type: str = "other",
+    custom_scene: str = "",
+) -> str:
+    scene = resolve_lifestyle_scene(scene_key, custom_scene)
+    profile = LIFESTYLE_PRODUCT_TYPES.get(product_type, LIFESTYLE_PRODUCT_TYPES["other"])
+    hand_present = bool(scene.get("hand_present"))
     subject = "the hand and product" if hand_present else "the product"
     pronoun = "they" if hand_present else "it"
     prompt = (
         f"Use the approved lifestyle image as the exact source image. Create a realistic vertical TikTok Shop UGC video of "
-        f"{product_name} {scene['placement']}. {subject.capitalize()} remain completely stationary and fixed exactly as shown "
-        f"for the entire clip; {pronoun} must not lift, tilt, rotate, slide, bend, float, duplicate, melt, warp, or change shape. "
-        f"Strictly preserve these product details: {product_details}. Keep the same setting and lighting as the approved image: "
-        f"{scene['background']}. Only the handheld phone camera moves: use an iPhone 0.5x ultra-wide feel, a clear side-to-side "
-        "arc, a slight push-in, natural micro-shake, realistic parallax, contact shadows, reflections, and depth of field. "
-        f"Repeat: {subject} stay fixed while only the camera moves. No rendered text, captions, stickers, prices, particles, "
-        "new hands or people, flicker, broken shadows, hallucinated objects, or polished commercial styling. Sound off. 9:16."
+        f"{product_name} {scene['placement']}. Treat it as {profile['description']} at the exact real-world scale shown in the approved image. "
+        f"{subject.capitalize()} remain completely stationary and fixed for the entire clip; {pronoun} must not lift, rotate, slide, bend, "
+        "float, duplicate, shrink, grow, melt, warp, open, close, or change shape. Strictly preserve these details: "
+        f"{product_details}. Keep the same environment and lighting: {scene['background']}. Only the handheld phone camera moves: "
+        f"{scene.get('camera_motion', 'a natural side-to-side arc and slight push-in')}, with realistic parallax, contact shadows, reflections, "
+        "depth of field, and small phone micro-shake. For furniture, appliances, vacuums, electronics, fitness equipment, and outdoor products, "
+        "keep the full footprint and major parts visible and correctly attached. Repeat: the product stays fixed while only the camera moves. "
+        "No rendered text, captions, stickers, prices, particles, new people or hands, flicker, broken shadows, hallucinated accessories, "
+        "miniaturization, scale changes, or polished commercial styling. Sound off. True 9:16."
     )
-    return re.sub(r"\s+", " ", prompt).strip()[:2450]
+    return re.sub(r"\s+", " ", prompt).strip()[:2800]
 
 
 STYLE_LABELS = {
@@ -2187,11 +2621,11 @@ def _extract_json_object(raw_text: str) -> dict | None:
 
 def write_hooks(api_key: str, product_name: str, style: str = "texthook_broll") -> dict:
     """Generate five style-matched hook options for a product. Cheap/fast — no MCP."""
-    shared_deal_hook_styles = {"warehouse", "pool", "texthook_broll"}
+    shared_deal_hook_styles = {"warehouse", "pool", "texthook_broll", "lifestyle_animation"}
     system = WAREHOUSE_HOOKS_SYSTEM if style in shared_deal_hook_styles else TEXTHOOK_HOOKS_SYSTEM
     task = (
         f"Write 5 deal-drop/FOMO text hooks for this product: {product_name}. "
-        f"The video style is {style}; use the same proven hook library used for Warehouse and Pool."
+        f"The video style is {style}; use the same proven hook library used for Warehouse, Pool, B-Roll, and Lifestyle Animation."
         if style in shared_deal_hook_styles
         else f"Write 5 text hook options for this product: {product_name}"
     )
@@ -2735,7 +3169,7 @@ def main():
             with info_col:
                 st.info(
                     "Lifestyle Animation uses Magnific for both steps: generate a GPT Image 2 lifestyle photo in 2k, high quality, 9:16, approve it, then animate that approved image with Kling 2.6. "
-                    "The selected hook is added afterward with FFmpeg."
+                    "Choose a product size/type so the scene works for anything from supplements to vacuums, couches, appliances, electronics, fitness gear, and outdoor items. The selected deal/FOMO hook is added afterward with FFmpeg."
                 )
                 st.caption(f"Image model: {LIFESTYLE_IMAGE_MODEL_LABEL}  |  Video model: {LIFESTYLE_VIDEO_MODEL_LABEL}")
             voice_script = None
@@ -3047,22 +3481,71 @@ def main():
 
             if style == "lifestyle_animation":
                 st.markdown("##### Lifestyle image setup")
+                inferred_product_type = infer_lifestyle_product_type(edited_name)
+                type_widget_key = f"lifestyle_product_type_{idx}"
+                if type_widget_key not in st.session_state:
+                    st.session_state[type_widget_key] = "auto"
+
+                product_type_choice = st.selectbox(
+                    "Product size / type",
+                    options=LIFESTYLE_PRODUCT_TYPE_OPTIONS,
+                    format_func=lambda value: LIFESTYLE_PRODUCT_TYPE_LABELS[value],
+                    key=type_widget_key,
+                    help="Auto-detect works from the product name, but you can override it for couches, vacuums, appliances, electronics, fitness gear, outdoor items, and other products.",
+                )
+                resolved_product_type = (
+                    inferred_product_type if product_type_choice == "auto" else product_type_choice
+                )
+                st.caption(
+                    f"Using profile: {LIFESTYLE_PRODUCT_TYPES[resolved_product_type]['label']}"
+                    + (" · detected automatically" if product_type_choice == "auto" else " · manual override")
+                )
+
+                scene_options = lifestyle_scene_options(resolved_product_type)
+                preferred_scene = infer_lifestyle_default_scene(edited_name, resolved_product_type)
+                if preferred_scene in scene_options:
+                    scene_options.remove(preferred_scene)
+                    scene_options.insert(0, preferred_scene)
+                scene_widget_key = f"lifestyle_scene_{idx}"
+                if st.session_state.get(scene_widget_key) not in scene_options:
+                    st.session_state[scene_widget_key] = scene_options[0]
                 scene_key = st.selectbox(
                     "Lifestyle scene",
-                    options=list(LIFESTYLE_SCENES.keys()),
+                    options=scene_options,
                     format_func=lambda value: LIFESTYLE_SCENES[value]["label"],
-                    key=f"lifestyle_scene_{idx}",
+                    key=scene_widget_key,
+                    help="The scene list changes to match the selected product size/type.",
                 )
+
+                custom_scene = ""
+                if scene_key == "custom":
+                    custom_scene = st.text_area(
+                        "Custom lifestyle scene",
+                        placeholder="Example: a cream sectional couch in a small lived-in apartment living room beside a rug and floor lamp",
+                        height=90,
+                        key=f"lifestyle_custom_scene_{idx}",
+                        help="Describe where the product should realistically be placed. Include the room or outdoor setting and useful scale references.",
+                    ).strip()
+                    if not custom_scene:
+                        st.info("Describe the custom scene before generating so GPT Image 2 knows the correct environment and scale.")
+
                 appearance_details = st.text_area(
-                    "Product appearance details",
-                    placeholder="Example: white plastic bottle, navy label, gold logo, white flip-top cap",
-                    height=80,
+                    "Product appearance and scale details",
+                    placeholder=LIFESTYLE_PRODUCT_TYPES[resolved_product_type]["appearance_help"],
+                    height=92,
                     key=f"lifestyle_appearance_{idx}",
-                    help="Kling uses this after you approve the lifestyle image. Include the package color, cap, label, material, and logo placement.",
+                    help="Kling uses this after image approval. Include every feature that must stay unchanged, especially overall size, materials, controls, accessories, and proportions.",
                 ).strip()
+                default_appearance = (
+                    "the exact real-world size, silhouette, construction, colors, materials, controls, accessories, branding, "
+                    "and proportions shown in the approved image"
+                )
                 lifestyle_settings[idx] = {
+                    "product_type_choice": product_type_choice,
+                    "product_type": resolved_product_type,
                     "scene_key": scene_key,
-                    "appearance_details": appearance_details or "the exact packaging, label, colors, cap, logo placement, material, and proportions shown in the approved image",
+                    "custom_scene": custom_scene,
+                    "appearance_details": appearance_details or default_appearance,
                 }
 
 
@@ -3085,16 +3568,32 @@ def main():
                 "source_url": product["source_url"],
             }
             if style == "lifestyle_animation":
-                scene_key = lifestyle_settings.get(idx, {}).get("scene_key", "hand_bathroom")
-                appearance_details = lifestyle_settings.get(idx, {}).get(
+                lifestyle_config = lifestyle_settings.get(idx, {})
+                product_type = lifestyle_config.get(
+                    "product_type",
+                    infer_lifestyle_product_type(product["name"]),
+                )
+                scene_key = lifestyle_config.get(
+                    "scene_key",
+                    infer_lifestyle_default_scene(product["name"], product_type),
+                )
+                custom_scene = lifestyle_config.get("custom_scene", "")
+                appearance_details = lifestyle_config.get(
                     "appearance_details",
-                    "the exact packaging, label, colors, cap, logo placement, material, and proportions shown in the approved image",
+                    "the exact real-world size, silhouette, construction, colors, materials, controls, accessories, branding, and proportions shown in the approved image",
                 )
                 product_entry.update({
+                    "product_type_choice": lifestyle_config.get("product_type_choice", "auto"),
+                    "product_type": product_type,
                     "scene_key": scene_key,
+                    "custom_scene": custom_scene,
                     "appearance_details": appearance_details,
-                    "lifestyle_prompt": build_lifestyle_image_prompt(product["name"], scene_key),
-                    "kling_prompt": build_lifestyle_kling_prompt(product["name"], appearance_details, scene_key),
+                    "lifestyle_prompt": build_lifestyle_image_prompt(
+                        product["name"], scene_key, product_type, custom_scene
+                    ),
+                    "kling_prompt": build_lifestyle_kling_prompt(
+                        product["name"], appearance_details, scene_key, product_type, custom_scene
+                    ),
                 })
             final_products.append(product_entry)
 
@@ -3293,6 +3792,9 @@ def main():
                         key=f"kling_prompt_{i}",
                     )
                     st.caption(f"Scene: {LIFESTYLE_SCENES[product['scene_key']]['label']} · Kling duration: {resolved_style_duration(style, duration)}s")
+                    st.caption(f"Product profile: {LIFESTYLE_PRODUCT_TYPES[product.get('product_type', 'other')]['label']}")
+                    if product.get("custom_scene"):
+                        st.caption(f"Custom scene: {product['custom_scene']}")
                     st.caption(f"Image model: {LIFESTYLE_IMAGE_MODEL_LABEL}  |  Video model: {LIFESTYLE_VIDEO_MODEL_LABEL}")
                 elif result.get("prompt"):
                     st.text_area(
@@ -3333,7 +3835,10 @@ def main():
             entry["status"] = "prompt_only"
             entry["generated_at"] = datetime.now().isoformat()
             if style == "lifestyle_animation":
+                entry["product_type_choice"] = fp.get("product_type_choice", "auto")
+                entry["product_type"] = fp.get("product_type", "other")
                 entry["scene_key"] = fp.get("scene_key")
+                entry["custom_scene"] = fp.get("custom_scene", "")
                 entry["appearance_details"] = fp.get("appearance_details")
                 entry["lifestyle_prompt"] = fp.get("lifestyle_prompt")
                 entry["kling_prompt"] = fp.get("kling_prompt")
@@ -3419,7 +3924,10 @@ def main():
                 gen_result["prompt_used"] = prompt_text
                 gen_result["lifestyle_prompt"] = prompt_text
                 gen_result["kling_prompt"] = product["kling_prompt"]
+                gen_result["product_type_choice"] = product.get("product_type_choice", "auto")
+                gen_result["product_type"] = product.get("product_type", "other")
                 gen_result["scene_key"] = product["scene_key"]
+                gen_result["custom_scene"] = product.get("custom_scene", "")
                 gen_result["appearance_details"] = product["appearance_details"]
                 gen_result["pipeline_stage"] = "image"
                 gen_result["lifestyle_creation_id"] = gen_result.get("creation_id")
@@ -3519,7 +4027,10 @@ def main():
             r["voice_script"] = voice_script or ""
             r["generated_at"] = datetime.now().isoformat()
             if style == "lifestyle_animation":
+                r["product_type_choice"] = fp.get("product_type_choice", "auto")
+                r["product_type"] = fp.get("product_type", "other")
                 r["scene_key"] = fp.get("scene_key")
+                r["custom_scene"] = fp.get("custom_scene", "")
                 r["appearance_details"] = fp.get("appearance_details")
                 r["lifestyle_prompt"] = fp.get("lifestyle_prompt")
                 r["kling_prompt"] = fp.get("kling_prompt")
@@ -4134,9 +4645,14 @@ def main():
                             st.success("Approved. You can now generate the Kling animation from this exact image.")
                         else:
                             st.info("The image step is still processing.")
+                        product_type = result.get("product_type", "other")
+                        if product_type in LIFESTYLE_PRODUCT_TYPES:
+                            st.caption(f"Product profile: {LIFESTYLE_PRODUCT_TYPES[product_type]['label']}")
                         scene_key = result.get("scene_key")
                         if scene_key in LIFESTYLE_SCENES:
                             st.caption(f"Scene: {LIFESTYLE_SCENES[scene_key]['label']}")
+                        if result.get("custom_scene"):
+                            st.caption(f"Custom scene: {result['custom_scene']}")
                         if result.get("appearance_details"):
                             st.caption(f"Product details: {result['appearance_details']}")
                 elif result.get("image_url"):
