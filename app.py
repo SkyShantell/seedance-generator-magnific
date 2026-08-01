@@ -703,6 +703,18 @@ def fetch_video_bytes(video_url: str) -> bytes | None:
         return None
 
 
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_image_bytes(image_url: str) -> tuple[bytes | None, str | None]:
+    """Download image bytes and return the detected content type for Streamlit reruns."""
+    try:
+        resp = requests.get(image_url, timeout=90)
+        resp.raise_for_status()
+        content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip() or None
+        return resp.content, content_type
+    except Exception:
+        return None, None
+
+
 def get_ffmpeg_executable() -> str | None:
     """Find FFmpeg from the OS, with imageio-ffmpeg as an optional fallback."""
     ffmpeg_path = shutil.which("ffmpeg")
@@ -1378,6 +1390,48 @@ def generations_zip_bytes(generations: list[dict]) -> tuple[bytes | None, int, l
                 added += 1
             else:
                 skipped.append(product_name)
+
+    return output.getvalue(), added, skipped
+
+
+def lifestyle_images_zip_bytes(generations: list[dict]) -> tuple[bytes | None, int, list[str]]:
+    """Build one ZIP with available generated lifestyle images."""
+    output = io.BytesIO()
+    added = 0
+    skipped = []
+
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        used_names = set()
+        for index, item in enumerate(generations, start=1):
+            if item.get("style") != "lifestyle_animation":
+                continue
+            image_url = item.get("lifestyle_image_url")
+            if not image_url:
+                skipped.append(item.get("product_name", f"image_{index}"))
+                continue
+
+            image_bytes, content_type = fetch_image_bytes(image_url)
+            if not image_bytes:
+                skipped.append(item.get("product_name", f"image_{index}"))
+                continue
+
+            ext_map = {
+                "image/jpeg": ".jpg",
+                "image/jpg": ".jpg",
+                "image/png": ".png",
+                "image/webp": ".webp",
+            }
+            ext = ext_map.get((content_type or '').lower(), ".jpg")
+            product_name = item.get("product_name", f"image_{index}")
+            base = safe_export_filename(product_name, f"image_{index}")
+            filename = f"{index:03d}_{base}{ext}"
+            counter = 2
+            while filename in used_names:
+                filename = f"{index:03d}_{base}_{counter}{ext}"
+                counter += 1
+            used_names.add(filename)
+            archive.writestr(f"lifestyle_images/{filename}", image_bytes)
+            added += 1
 
     return output.getvalue(), added, skipped
 
@@ -3232,8 +3286,10 @@ def main():
         progress.progress(1.0, text=f"Found {len(scraped_products)} product(s)")
 
         if scraped_products:
-            # Store in session state so selections persist
+            # Store in session state so selections persist. A fresh scrape starts a
+            # fresh hook batch so old index-based hook choices cannot attach to new products.
             st.session_state["scraped"] = scraped_products
+            st.session_state["product_hooks"] = {}
         else:
             st.error("No products could be scraped. Check your links.")
 
@@ -3244,6 +3300,8 @@ def main():
         edited_names = {}
         lifestyle_settings = {}
 
+        st.caption("Remove any product you do not want before generating hooks. Removed products are excluded from every later step.")
+
         for idx, product in enumerate(scraped_products):
             st.markdown("---")
 
@@ -3251,15 +3309,40 @@ def main():
             product_fingerprint = hashlib.sha1(
                 product.get("source_url", str(idx)).encode("utf-8")
             ).hexdigest()[:10]
-            product_name_key = f"product_name_{idx}_{product_fingerprint}"
+            product_name_key = f"product_name_{product_fingerprint}"
             if product_name_key not in st.session_state:
                 st.session_state[product_name_key] = "" if detected_name == "Unknown Product" else detected_name
-            edited_name = st.text_input(
-                "Product name",
-                placeholder="Type the product name if TikTok did not provide it",
-                key=product_name_key,
-                help="The app fills this automatically when TikTok exposes a title. You can still correct it here.",
-            ).strip()
+
+            product_name_col, remove_product_col = st.columns([5, 1], vertical_alignment="bottom")
+            with product_name_col:
+                edited_name = st.text_input(
+                    "Product name",
+                    placeholder="Type the product name if TikTok did not provide it",
+                    key=product_name_key,
+                    help="The app fills this automatically when TikTok exposes a title. You can still correct it here.",
+                ).strip()
+            with remove_product_col:
+                if st.button(
+                    "🗑️ Remove",
+                    key=f"remove_product_{product_fingerprint}",
+                    use_container_width=True,
+                    help="Remove this product from the current batch.",
+                ):
+                    remaining_products = [
+                        saved_product
+                        for saved_index, saved_product in enumerate(st.session_state.get("scraped", []))
+                        if saved_index != idx
+                    ]
+                    if remaining_products:
+                        st.session_state["scraped"] = remaining_products
+                    else:
+                        st.session_state.pop("scraped", None)
+
+                    # Hooks are indexed by the active product order, so reset them after removal.
+                    # Product widgets use stable URL fingerprints, so the remaining products keep
+                    # their names, selected references, and Lifestyle settings after the rerun.
+                    st.session_state["product_hooks"] = {}
+                    st.rerun()
             if not edited_name:
                 edited_name = detected_name
             edited_names[idx] = edited_name
@@ -3278,9 +3361,9 @@ def main():
                 f"Review/customer photos ({len(review_images)})",
             ])
 
-            listing_state_key = f"listing_refs_{idx}"
-            review_state_key = f"review_refs_{idx}"
-            primary_state_key = f"primary_reference_url_{idx}"
+            listing_state_key = f"listing_refs_{product_fingerprint}"
+            review_state_key = f"review_refs_{product_fingerprint}"
+            primary_state_key = f"primary_reference_url_{product_fingerprint}"
 
             if listing_state_key not in st.session_state:
                 st.session_state[listing_state_key] = [0] if listing_images else []
@@ -3312,7 +3395,7 @@ def main():
                             with select_col:
                                 if st.button(
                                     "Deselect" if is_selected else "Select",
-                                    key=f"listing_toggle_{idx}_{image_index}",
+                                    key=f"listing_toggle_{product_fingerprint}_{image_index}",
                                     use_container_width=True,
                                 ):
                                     selected_items = list(st.session_state.get(listing_state_key, []))
@@ -3329,7 +3412,7 @@ def main():
                             with primary_col:
                                 if st.button(
                                     "Make primary",
-                                    key=f"listing_primary_{idx}_{image_index}",
+                                    key=f"listing_primary_{product_fingerprint}_{image_index}",
                                     disabled=not is_selected or is_primary,
                                     use_container_width=True,
                                 ):
@@ -3361,7 +3444,7 @@ def main():
                             with select_col:
                                 if st.button(
                                     "Deselect" if is_selected else "Select",
-                                    key=f"review_toggle_{idx}_{image_index}",
+                                    key=f"review_toggle_{product_fingerprint}_{image_index}",
                                     use_container_width=True,
                                 ):
                                     selected_items = list(st.session_state.get(review_state_key, []))
@@ -3378,7 +3461,7 @@ def main():
                             with primary_col:
                                 if st.button(
                                     "Make primary",
-                                    key=f"review_primary_{idx}_{image_index}",
+                                    key=f"review_primary_{product_fingerprint}_{image_index}",
                                     disabled=not is_selected or is_primary,
                                     use_container_width=True,
                                 ):
@@ -3391,7 +3474,7 @@ def main():
                     "Add review-photo URLs manually (optional)",
                     placeholder="Paste one direct image URL per line",
                     height=90,
-                    key=f"manual_review_urls_{idx}",
+                    key=f"manual_review_urls_{product_fingerprint}",
                 )
 
             selected_listing_indices = [
@@ -3446,7 +3529,7 @@ def main():
             if style == "lifestyle_animation":
                 st.markdown("##### Lifestyle image setup")
                 inferred_product_type = infer_lifestyle_product_type(edited_name)
-                type_widget_key = f"lifestyle_product_type_{idx}"
+                type_widget_key = f"lifestyle_product_type_{product_fingerprint}"
                 if type_widget_key not in st.session_state:
                     st.session_state[type_widget_key] = "auto"
 
@@ -3470,7 +3553,7 @@ def main():
                 if preferred_scene in scene_options:
                     scene_options.remove(preferred_scene)
                     scene_options.insert(0, preferred_scene)
-                scene_widget_key = f"lifestyle_scene_{idx}"
+                scene_widget_key = f"lifestyle_scene_{product_fingerprint}"
                 if st.session_state.get(scene_widget_key) not in scene_options:
                     st.session_state[scene_widget_key] = scene_options[0]
                 scene_key = st.selectbox(
@@ -3487,7 +3570,7 @@ def main():
                         "Custom lifestyle scene",
                         placeholder="Example: a cream sectional couch in a small lived-in apartment living room beside a rug and floor lamp",
                         height=90,
-                        key=f"lifestyle_custom_scene_{idx}",
+                        key=f"lifestyle_custom_scene_{product_fingerprint}",
                         help="Describe where the product should realistically be placed. Include the room or outdoor setting and useful scale references.",
                     ).strip()
                     if not custom_scene:
@@ -3497,7 +3580,7 @@ def main():
                     "Product appearance and scale details",
                     placeholder=LIFESTYLE_PRODUCT_TYPES[resolved_product_type]["appearance_help"],
                     height=92,
-                    key=f"lifestyle_appearance_{idx}",
+                    key=f"lifestyle_appearance_{product_fingerprint}",
                     help="Kling uses this after image approval. Include every feature that must stay unchanged, especially overall size, materials, controls, accessories, and proportions.",
                 ).strip()
                 default_appearance = (
@@ -3642,9 +3725,46 @@ def main():
                     if hook_data.get("sound_tip"):
                         st.caption(f"Sound tip: {hook_data['sound_tip']}")
 
-                hooks_ready = all_accepted
+                st.markdown("---")
+                bulk_hook_col, bulk_hook_note_col = st.columns([1.35, 2.65], vertical_alignment="center")
+                with bulk_hook_col:
+                    keep_all_hooks = st.button(
+                        "✅ Keep All Selected Hooks",
+                        key="keep_all_selected_hooks",
+                        type="primary",
+                        use_container_width=True,
+                        help="Accept the currently selected hook for every product in this batch.",
+                    )
+                with bulk_hook_note_col:
+                    st.caption(
+                        "Choose an option for each product, then click once here. "
+                        "Any product you did not change will keep its first hook option."
+                    )
+
+                if keep_all_hooks:
+                    accepted_count = 0
+                    for hook_index, _product in enumerate(final_products):
+                        hook_entry = st.session_state["product_hooks"].get(hook_index)
+                        hook_options = list((hook_entry or {}).get("hook_options") or [])
+                        if not hook_entry or not hook_options:
+                            continue
+                        selected_option_index = int(st.session_state.get(f"hookpick_{hook_index}", 0) or 0)
+                        selected_option_index = max(0, min(selected_option_index, len(hook_options) - 1))
+                        hook_entry["accepted_hook"] = hook_options[selected_option_index]
+                        accepted_count += 1
+                    if accepted_count:
+                        st.session_state["bulk_hooks_saved_message"] = f"Kept {accepted_count} selected hook(s)."
+                        st.rerun()
+
+                if st.session_state.pop("bulk_hooks_saved_message", None):
+                    st.success("✅ All selected hooks were saved for this batch.")
+
+                hooks_ready = all(
+                    bool((st.session_state["product_hooks"].get(hook_index) or {}).get("accepted_hook"))
+                    for hook_index in range(len(final_products))
+                )
                 if not hooks_ready:
-                    st.info("👆 Accept a hook for each product, then generate.")
+                    st.info("Choose the hooks you want, then click **Keep All Selected Hooks** once.")
                 else:
                     st.success("✅ All hooks accepted! Ready to generate.")
 
@@ -4595,6 +4715,23 @@ def main():
                     with image_col:
                         st.markdown("#### Generated lifestyle image")
                         st.image(lifestyle_image_url, use_container_width=True)
+                        image_bytes, image_content_type = fetch_image_bytes(lifestyle_image_url)
+                        if image_bytes:
+                            ext_map = {
+                                "image/jpeg": ".jpg",
+                                "image/jpg": ".jpg",
+                                "image/png": ".png",
+                                "image/webp": ".webp",
+                            }
+                            image_ext = ext_map.get((image_content_type or "").lower(), ".jpg")
+                            st.download_button(
+                                "⬇️ Download lifestyle image",
+                                data=image_bytes,
+                                file_name=f"{safe_name}_{creation_id or i}_lifestyle{image_ext}",
+                                mime=image_content_type or "image/jpeg",
+                                key=f"dl_lifestyle_image_{i}",
+                                use_container_width=True,
+                            )
                     with approval_col:
                         if status == "image_completed":
                             st.success("Review this image carefully. Click **Approve image** only when the product and scene look right.")
@@ -4899,7 +5036,7 @@ def main():
         export_stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         csv_data = generations_csv_bytes(saved_gens)
 
-        download_col1, download_col2, download_col3, download_col4 = st.columns(4)
+        download_col1, download_col2, download_col3, download_col4, download_col5 = st.columns(5)
         download_col1.download_button(
             "📥 Download CSV",
             data=csv_data,
@@ -4918,7 +5055,17 @@ def main():
             disabled=zip_video_count == 0,
         )
 
+        lifestyle_zip_data, lifestyle_zip_count, lifestyle_zip_skipped = lifestyle_images_zip_bytes(saved_gens)
         download_col3.download_button(
+            f"🖼️ Download Lifestyle Images ({lifestyle_zip_count})",
+            data=lifestyle_zip_data,
+            file_name=f"lifestyle_images_{export_stamp}.zip",
+            mime="application/zip",
+            use_container_width=True,
+            disabled=lifestyle_zip_count == 0,
+        )
+
+        download_col4.download_button(
             "📝 Download Past Hooks",
             data=past_hooks_csv_bytes(saved_gens),
             file_name=f"past_text_hooks_{export_stamp}.csv",
@@ -4926,7 +5073,7 @@ def main():
             use_container_width=True,
         )
 
-        download_col4.download_button(
+        download_col5.download_button(
             "📥 Download JSON",
             data=json.dumps(saved_gens, indent=2, default=str),
             file_name=f"generations_{export_stamp}.json",
@@ -4935,11 +5082,15 @@ def main():
         )
 
         st.caption(
-            f"The ZIP contains {zip_video_count} available video(s) plus captions.csv. "
+            f"The video ZIP contains {zip_video_count} available video(s) plus captions.csv. "
             "Edited text versions are used first; otherwise the original completed video is included."
         )
         if zip_skipped:
             st.caption(f"Skipped {len(zip_skipped)} item(s) that do not have an available finished video yet.")
+        if lifestyle_zip_count:
+            st.caption(f"The lifestyle image ZIP contains {lifestyle_zip_count} generated lifestyle image(s).")
+        if lifestyle_zip_skipped:
+            st.caption(f"Skipped {len(lifestyle_zip_skipped)} lifestyle image(s) that are not available yet.")
 
 
 if __name__ == "__main__":
