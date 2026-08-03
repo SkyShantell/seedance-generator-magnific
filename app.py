@@ -1443,6 +1443,8 @@ MAGNIFIC_MCP_URL = "https://mcp.magnific.com"
 XAI_IMAGE_API_URL = "https://api.x.ai/v1/images/edits"
 XAI_IMAGE_MODEL = "grok-imagine-image-quality"
 DIRECTOR_INGEST_URL_DEFAULT = "https://app.momentumacademy.co/api/director/ingest"
+SEEDANCE_QUEUE_SCHEMA = "momentum.seedance.batch.v1"
+SEEDANCE_QUEUE_PATH_DEFAULT = "seedance_inbox"
 MAGNIFIC_MCP_NAME = "magnific"
 MODEL = "claude-sonnet-4-6"
 MCP_BETA = "mcp-client-2025-11-20"
@@ -3318,6 +3320,209 @@ def push_generated_image_to_director(
         return False, f"Director ingest failed: {exc}"
 
 
+
+
+def _github_queue_headers(token: str) -> dict:
+    return {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {(token or '').strip()}",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "seedance-studio-sniper-inbox",
+    }
+
+
+def _github_contents_url(repo: str, path: str) -> str:
+    safe_path = requests.utils.quote((path or "").strip("/"), safe="/")
+    return f"https://api.github.com/repos/{(repo or '').strip().strip('/')}/contents/{safe_path}"
+
+
+def fetch_seedance_queue_batch(
+    token: str,
+    repo: str,
+    branch: str,
+    file_path: str,
+) -> tuple[dict | None, dict | None, str | None]:
+    """Fetch and decode one Momentum Sniper queue JSON file from GitHub."""
+    if not token or not repo or not file_path:
+        return None, None, "The Seedance queue connection is incomplete."
+    try:
+        response = requests.get(
+            _github_contents_url(repo, file_path),
+            headers=_github_queue_headers(token),
+            params={"ref": branch or "main"},
+            timeout=60,
+        )
+        if response.status_code >= 400:
+            return None, None, f"GitHub queue request failed ({response.status_code}): {response.text[:400]}"
+        file_info = response.json()
+        encoded = str(file_info.get("content") or "").replace("\n", "")
+        if encoded:
+            import base64
+            raw = base64.b64decode(encoded).decode("utf-8")
+        else:
+            download_url = file_info.get("download_url")
+            if not download_url:
+                return None, file_info, "The queue file did not contain downloadable content."
+            raw_response = requests.get(
+                download_url,
+                headers=_github_queue_headers(token),
+                timeout=60,
+            )
+            raw_response.raise_for_status()
+            raw = raw_response.text
+        batch = json.loads(raw)
+        if not isinstance(batch, dict):
+            return None, file_info, "The queue file is not a valid batch object."
+        batch["_queue_path"] = file_path
+        batch["_queue_sha"] = file_info.get("sha")
+        return batch, file_info, None
+    except Exception as exc:
+        return None, None, f"Could not read the Seedance queue: {exc}"
+
+
+@st.cache_data(show_spinner=False, ttl=20)
+def list_seedance_queue_batches(
+    token: str,
+    repo: str,
+    branch: str,
+    inbox_path: str,
+) -> tuple[list[dict], str | None]:
+    """List pending Momentum Sniper batches, newest first."""
+    if not token or not repo:
+        return [], "The Seedance queue token or repository is missing."
+    try:
+        response = requests.get(
+            _github_contents_url(repo, inbox_path or SEEDANCE_QUEUE_PATH_DEFAULT),
+            headers=_github_queue_headers(token),
+            params={"ref": branch or "main"},
+            timeout=60,
+        )
+        if response.status_code == 404:
+            return [], None
+        if response.status_code >= 400:
+            return [], f"GitHub queue request failed ({response.status_code}): {response.text[:400]}"
+        entries = response.json()
+        if not isinstance(entries, list):
+            return [], "The configured inbox path is not a GitHub directory."
+
+        files = [
+            entry for entry in entries
+            if entry.get("type") == "file" and str(entry.get("name") or "").endswith(".json")
+        ]
+        # A normal batch is small. Limit the number of detail calls so an old queue
+        # can never make the Streamlit page slow or exhaust the GitHub API quota.
+        files = sorted(files, key=lambda item: item.get("name", ""), reverse=True)[:30]
+        batches: list[dict] = []
+        for entry in files:
+            batch, _file_info, error = fetch_seedance_queue_batch(
+                token, repo, branch, entry.get("path") or ""
+            )
+            if error or not batch:
+                continue
+            if batch.get("schema") != SEEDANCE_QUEUE_SCHEMA:
+                continue
+            if str(batch.get("status") or "pending").lower() == "imported":
+                continue
+            batches.append(batch)
+        batches.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        return batches, None
+    except Exception as exc:
+        return [], f"Could not list the Seedance queue: {exc}"
+
+
+def mark_seedance_queue_batch_imported(
+    token: str,
+    repo: str,
+    branch: str,
+    batch: dict,
+) -> tuple[bool, str | None]:
+    """Update a queue file in place after Seedance imports it."""
+    file_path = str(batch.get("_queue_path") or "").strip()
+    file_sha = str(batch.get("_queue_sha") or "").strip()
+    if not file_path or not file_sha:
+        return False, "The queue file path or SHA is missing."
+
+    cleaned = {
+        key: value
+        for key, value in batch.items()
+        if not str(key).startswith("_queue_")
+    }
+    cleaned["status"] = "imported"
+    cleaned["imported_at"] = datetime.utcnow().isoformat() + "Z"
+
+    import base64
+    payload = {
+        "message": f"Mark Seedance batch {cleaned.get('batch_id', '')} imported",
+        "content": base64.b64encode(
+            json.dumps(cleaned, indent=2, ensure_ascii=False).encode("utf-8")
+        ).decode("ascii"),
+        "sha": file_sha,
+        "branch": branch or "main",
+    }
+    try:
+        response = requests.put(
+            _github_contents_url(repo, file_path),
+            headers={**_github_queue_headers(token), "Content-Type": "application/json"},
+            json=payload,
+            timeout=90,
+        )
+        if response.status_code >= 400:
+            return False, f"Imported products, but could not archive the queue batch ({response.status_code}): {response.text[:400]}"
+        list_seedance_queue_batches.clear()
+        return True, None
+    except Exception as exc:
+        return False, f"Imported products, but could not archive the queue batch: {exc}"
+
+
+def normalize_sniper_batch_products(batch: dict) -> tuple[list[dict], list[str]]:
+    """Convert a Momentum Sniper batch into the existing Seedance scrape structure."""
+    normalized: list[dict] = []
+    skipped: list[str] = []
+    for raw_product in list(batch.get("products") or []):
+        if not isinstance(raw_product, dict):
+            continue
+        product_name = str(raw_product.get("name") or "Unknown Product").strip()
+        source_url = str(raw_product.get("source_url") or "").strip()
+
+        reference_urls: list[str] = []
+        for value in (
+            list(raw_product.get("images") or [])
+            + list(raw_product.get("listing_images") or [])
+            + [raw_product.get("primary_image_url")]
+        ):
+            url = str(value or "").strip()
+            if url.startswith(("http://", "https://")) and url not in reference_urls:
+                reference_urls.append(url)
+
+        scraped_fallback = None
+        if not reference_urls and source_url:
+            scraped_fallback = scrape_product(source_url)
+            if scraped_fallback:
+                reference_urls = list(scraped_fallback.get("images") or [])
+
+        if not reference_urls:
+            skipped.append(product_name)
+            continue
+
+        listing_images = list(raw_product.get("listing_images") or [])
+        listing_images = [url for url in listing_images if url in reference_urls]
+        if not listing_images:
+            listing_images = reference_urls
+
+        normalized.append({
+            "name": product_name,
+            "images": reference_urls,
+            "listing_images": listing_images,
+            "review_images": list(raw_product.get("review_images") or []),
+            "source_url": source_url,
+            "sniper_caption": str(raw_product.get("caption") or "").strip(),
+            "sniper_scene_prompt": str(raw_product.get("scene_prompt") or "").strip(),
+            "sniper_meta": dict(raw_product.get("sniper_meta") or {}),
+            "sniper_batch_id": batch.get("batch_id"),
+            "sniper_preset": batch.get("preset"),
+        })
+    return normalized, skipped
+
 # ═══════════════════════════════════════════════════════════════════
 #  STREAMLIT UI
 # ═══════════════════════════════════════════════════════════════════
@@ -3350,6 +3555,10 @@ def main():
     xai_key_from_secrets = get_secret("XAI_API_KEY")
     director_key_from_secrets = get_secret("DIRECTOR_INGEST_KEY")
     director_url_from_secrets = get_secret("DIRECTOR_INGEST_URL") or DIRECTOR_INGEST_URL_DEFAULT
+    queue_token_from_secrets = get_secret("SEEDANCE_QUEUE_GITHUB_TOKEN")
+    queue_repo_from_secrets = get_secret("SEEDANCE_QUEUE_REPO")
+    queue_branch_from_secrets = get_secret("SEEDANCE_QUEUE_BRANCH") or "main"
+    queue_path_from_secrets = get_secret("SEEDANCE_QUEUE_PATH") or SEEDANCE_QUEUE_PATH_DEFAULT
 
     if "runtime_anthropic_api_key" not in st.session_state:
         st.session_state["runtime_anthropic_api_key"] = api_key_from_secrets
@@ -3361,6 +3570,14 @@ def main():
         st.session_state["runtime_director_ingest_key"] = director_key_from_secrets
     if "runtime_director_ingest_url" not in st.session_state:
         st.session_state["runtime_director_ingest_url"] = director_url_from_secrets
+    if "runtime_seedance_queue_token" not in st.session_state:
+        st.session_state["runtime_seedance_queue_token"] = queue_token_from_secrets
+    if "runtime_seedance_queue_repo" not in st.session_state:
+        st.session_state["runtime_seedance_queue_repo"] = queue_repo_from_secrets
+    if "runtime_seedance_queue_branch" not in st.session_state:
+        st.session_state["runtime_seedance_queue_branch"] = queue_branch_from_secrets
+    if "runtime_seedance_queue_path" not in st.session_state:
+        st.session_state["runtime_seedance_queue_path"] = queue_path_from_secrets
 
     with st.container(border=True):
         st.markdown("### Video setup")
@@ -3431,7 +3648,11 @@ def main():
         xai_api_key = st.session_state.get("runtime_xai_api_key", "")
         director_ingest_key = st.session_state.get("runtime_director_ingest_key", "")
         director_ingest_url = st.session_state.get("runtime_director_ingest_url", DIRECTOR_INGEST_URL_DEFAULT)
-        status_col_1, status_col_2, status_col_3, status_col_4, status_col_5 = st.columns(5)
+        queue_token = st.session_state.get("runtime_seedance_queue_token", "")
+        queue_repo = st.session_state.get("runtime_seedance_queue_repo", "")
+        queue_branch = st.session_state.get("runtime_seedance_queue_branch", "main") or "main"
+        queue_path = st.session_state.get("runtime_seedance_queue_path", SEEDANCE_QUEUE_PATH_DEFAULT) or SEEDANCE_QUEUE_PATH_DEFAULT
+        status_col_1, status_col_2, status_col_3, status_col_4, status_col_5, status_col_6 = st.columns(6)
         if api_key:
             status_col_1.success("Anthropic connected")
         else:
@@ -3448,7 +3669,11 @@ def main():
             status_col_4.success("Director connected")
         else:
             status_col_4.info("Director key optional")
-        status_col_5.info(f"{STYLE_LABELS[style]} · {resolved_style_duration(style, duration)}s")
+        if queue_token and queue_repo:
+            status_col_5.success("Sniper inbox connected")
+        else:
+            status_col_5.info("Sniper inbox optional")
+        status_col_6.info(f"{STYLE_LABELS[style]} · {resolved_style_duration(style, duration)}s")
 
         required_connections_ready = bool(api_key and magnific_token and (xai_api_key if style == "lifestyle_animation" else True))
         with st.expander("API connection", expanded=not required_connections_ready):
@@ -3498,16 +3723,60 @@ def main():
                 help="Leave this at the default unless the Momentum Academy Director endpoint changes.",
             ).strip() or DIRECTOR_INGEST_URL_DEFAULT
 
+            st.markdown("**Momentum Sniper inbox connection**")
+            if queue_token_from_secrets and queue_repo_from_secrets:
+                st.success("Seedance queue repository loaded from Streamlit secrets.")
+            else:
+                queue_connection_col_1, queue_connection_col_2 = st.columns(2)
+                with queue_connection_col_1:
+                    st.session_state["runtime_seedance_queue_token"] = st.text_input(
+                        "Seedance queue GitHub token",
+                        type="password",
+                        value=st.session_state.get("runtime_seedance_queue_token", ""),
+                        key="runtime_seedance_queue_token_input",
+                        help="A fine-grained GitHub token with Contents read/write access to the dedicated queue repository.",
+                    )
+                with queue_connection_col_2:
+                    st.session_state["runtime_seedance_queue_repo"] = st.text_input(
+                        "Seedance queue repository",
+                        value=st.session_state.get("runtime_seedance_queue_repo", ""),
+                        key="runtime_seedance_queue_repo_input",
+                        placeholder="owner/seedance-queue",
+                    )
+            queue_settings_col_1, queue_settings_col_2 = st.columns(2)
+            with queue_settings_col_1:
+                st.session_state["runtime_seedance_queue_branch"] = st.text_input(
+                    "Queue branch",
+                    value=st.session_state.get("runtime_seedance_queue_branch", "main"),
+                    key="runtime_seedance_queue_branch_input",
+                ).strip() or "main"
+            with queue_settings_col_2:
+                st.session_state["runtime_seedance_queue_path"] = st.text_input(
+                    "Queue inbox folder",
+                    value=st.session_state.get("runtime_seedance_queue_path", SEEDANCE_QUEUE_PATH_DEFAULT),
+                    key="runtime_seedance_queue_path_input",
+                ).strip().strip("/") or SEEDANCE_QUEUE_PATH_DEFAULT
+
             magnific_token = st.session_state.get("runtime_magnific_token", "")
             api_key = st.session_state.get("runtime_anthropic_api_key", "")
             xai_api_key = st.session_state.get("runtime_xai_api_key", "")
             director_ingest_key = st.session_state.get("runtime_director_ingest_key", "")
             director_ingest_url = st.session_state.get("runtime_director_ingest_url", DIRECTOR_INGEST_URL_DEFAULT)
+            queue_token = st.session_state.get("runtime_seedance_queue_token", "")
+            queue_repo = st.session_state.get("runtime_seedance_queue_repo", "")
+            queue_branch = st.session_state.get("runtime_seedance_queue_branch", "main") or "main"
+            queue_path = st.session_state.get("runtime_seedance_queue_path", SEEDANCE_QUEUE_PATH_DEFAULT) or SEEDANCE_QUEUE_PATH_DEFAULT
 
             st.markdown("**Momentum Director connection**")
             st.markdown(
                 'Add `DIRECTOR_INGEST_KEY = "your-key"` to Streamlit secrets. '
                 '`DIRECTOR_INGEST_URL` is optional and defaults to the existing Momentum Academy Director ingest endpoint.'
+            )
+
+            st.markdown("**Momentum Sniper queue secrets**")
+            st.markdown(
+                'Add `SEEDANCE_QUEUE_GITHUB_TOKEN` and `SEEDANCE_QUEUE_REPO = "owner/seedance-queue"` to both apps. '
+                '`SEEDANCE_QUEUE_BRANCH` and `SEEDANCE_QUEUE_PATH` are optional.'
             )
 
             st.markdown("**xAI key for Lifestyle images**")
@@ -3521,6 +3790,151 @@ def main():
 4. Connect, open Auth Settings, and complete the Quick OAuth Flow.
 5. Copy the `access_token` and paste it above.
             """)
+
+
+    # ════════════════════════════════════════════════════════════════
+    #  MOMENTUM SNIPER INBOX
+    # ════════════════════════════════════════════════════════════════
+    imported_message = st.session_state.pop("sniper_import_message", None)
+    if imported_message:
+        st.success(imported_message)
+
+    with st.container(border=True):
+        inbox_header_col, inbox_refresh_col = st.columns([4, 1], vertical_alignment="center")
+        with inbox_header_col:
+            st.markdown("### 📥 Momentum Sniper Inbox")
+            st.caption(
+                "Products sent from Momentum Sniper arrive here with their names, TikTok links, "
+                "image references, captions, scene prompts, and research metrics already attached."
+            )
+        with inbox_refresh_col:
+            if st.button(
+                "🔄 Refresh inbox",
+                key="refresh_sniper_inbox",
+                use_container_width=True,
+                disabled=not bool(queue_token and queue_repo),
+            ):
+                list_seedance_queue_batches.clear()
+                st.rerun()
+
+        if not (queue_token and queue_repo):
+            st.info(
+                "Connect the shared GitHub queue in **API connection** to receive Momentum Sniper batches."
+            )
+        else:
+            pending_batches, queue_error = list_seedance_queue_batches(
+                queue_token,
+                queue_repo,
+                queue_branch,
+                queue_path,
+            )
+            if queue_error:
+                st.error(queue_error)
+
+            try:
+                requested_batch_path = st.query_params.get("sniper_batch", "")
+                if isinstance(requested_batch_path, list):
+                    requested_batch_path = requested_batch_path[0] if requested_batch_path else ""
+                requested_batch_path = str(requested_batch_path or "").strip()
+            except Exception:
+                requested_batch_path = ""
+
+            if requested_batch_path and not any(
+                batch.get("_queue_path") == requested_batch_path for batch in pending_batches
+            ):
+                requested_batch, _file_info, requested_error = fetch_seedance_queue_batch(
+                    queue_token,
+                    queue_repo,
+                    queue_branch,
+                    requested_batch_path,
+                )
+                if requested_batch and str(requested_batch.get("status") or "pending").lower() != "imported":
+                    pending_batches.insert(0, requested_batch)
+                elif requested_error:
+                    st.warning(f"The linked Momentum Sniper batch could not be opened: {requested_error}")
+
+            if not pending_batches:
+                st.info("No pending Momentum Sniper batches are waiting.")
+            else:
+                batch_paths = [str(batch.get("_queue_path") or "") for batch in pending_batches]
+                default_batch_index = 0
+                if requested_batch_path in batch_paths:
+                    default_batch_index = batch_paths.index(requested_batch_path)
+
+                batch_by_path = {
+                    str(batch.get("_queue_path") or ""): batch
+                    for batch in pending_batches
+                }
+
+                def sniper_batch_label(file_path: str) -> str:
+                    batch = batch_by_path[file_path]
+                    preset_label = str(batch.get("preset") or "Custom")
+                    product_count = int(batch.get("product_count") or len(batch.get("products") or []))
+                    created_at = str(batch.get("created_at") or "")
+                    created_label = created_at.replace("T", " ")[:16] if created_at else ""
+                    return f"{preset_label} · {product_count} products" + (f" · {created_label}" if created_label else "")
+
+                selected_batch_path = st.selectbox(
+                    "Pending batch",
+                    options=batch_paths,
+                    index=default_batch_index,
+                    format_func=sniper_batch_label,
+                    key="selected_sniper_batch_path",
+                )
+                selected_batch = batch_by_path[selected_batch_path]
+                preview_rows = []
+                for product in list(selected_batch.get("products") or []):
+                    if not isinstance(product, dict):
+                        continue
+                    meta = dict(product.get("sniper_meta") or {})
+                    preview_rows.append({
+                        "Product": product.get("name", "Unknown Product"),
+                        "Price": meta.get("avg_price"),
+                        "Revenue 7d": meta.get("revenue_7d"),
+                        "Ads": meta.get("ads_top10"),
+                        "Images": len(product.get("images") or []),
+                        "TikTok link": product.get("source_url", ""),
+                    })
+                if preview_rows:
+                    st.dataframe(preview_rows, use_container_width=True, hide_index=True)
+
+                import_batch_clicked = st.button(
+                    f"⬇️ Import {len(preview_rows)} product(s) into Seedance",
+                    type="primary",
+                    use_container_width=True,
+                    key="import_selected_sniper_batch",
+                )
+                if import_batch_clicked:
+                    with st.spinner("Importing product references into Seedance Studio…"):
+                        imported_products, skipped_products = normalize_sniper_batch_products(selected_batch)
+                    if not imported_products:
+                        st.error("None of the products had a usable image reference.")
+                    else:
+                        st.session_state["scraped"] = imported_products
+                        st.session_state["product_hooks"] = {}
+                        st.session_state.pop("product_hooks_style", None)
+                        archived, archive_warning = mark_seedance_queue_batch_imported(
+                            queue_token,
+                            queue_repo,
+                            queue_branch,
+                            selected_batch,
+                        )
+                        message = f"Imported {len(imported_products)} Momentum Sniper product(s)."
+                        if skipped_products:
+                            message += f" Skipped {len(skipped_products)} without usable images."
+                        if archive_warning:
+                            st.session_state["sniper_import_archive_warning"] = archive_warning
+                        st.session_state["sniper_import_message"] = message
+                        try:
+                            if "sniper_batch" in st.query_params:
+                                del st.query_params["sniper_batch"]
+                        except Exception:
+                            pass
+                        st.rerun()
+
+        archive_warning = st.session_state.pop("sniper_import_archive_warning", None)
+        if archive_warning:
+            st.warning(archive_warning)
 
     # ════════════════════════════════════════════════════════════════
     #  STEP 1 — PASTE LINKS
@@ -3635,6 +4049,10 @@ def main():
                 st.warning("TikTok did not expose a product title. Enter the product name above before generating hooks.")
 
             st.caption(f"Source: {product['source_url'][:100]}...")
+            if product.get("sniper_caption"):
+                st.caption(f"Momentum Sniper hook: {product['sniper_caption']}")
+            if product.get("sniper_preset"):
+                st.caption(f"Imported from Momentum Sniper preset: {product['sniper_preset']}")
 
             listing_images = product.get("listing_images") or product.get("images", [])
             review_images = product.get("review_images") or []
@@ -3896,6 +4314,11 @@ def main():
                 "image_url": selected_refs[0],
                 "image_urls": selected_refs,
                 "source_url": product["source_url"],
+                "sniper_caption": product.get("sniper_caption", ""),
+                "sniper_scene_prompt": product.get("sniper_scene_prompt", ""),
+                "sniper_meta": product.get("sniper_meta", {}),
+                "sniper_batch_id": product.get("sniper_batch_id"),
+                "sniper_preset": product.get("sniper_preset"),
             }
             if style == "lifestyle_animation":
                 lifestyle_config = lifestyle_settings.get(idx, {})
@@ -3956,9 +4379,16 @@ def main():
                                       text=f"Hooks {i+1}/{len(final_products)}: {product['name'][:30]}...")
                     with st.spinner(f"Writing hooks for {product['name'][:30]}..."):
                         hook_result = write_hooks(api_key, product["name"], style=style)
+                    generated_hook_options = list(hook_result.get("hook_options", []) or [])
+                    sniper_hook = str(product.get("sniper_caption") or "").strip()
+                    if sniper_hook:
+                        generated_hook_options = [sniper_hook] + [
+                            hook for hook in generated_hook_options if hook.strip() != sniper_hook
+                        ]
+                        generated_hook_options = generated_hook_options[:5]
                     st.session_state["product_hooks"][i] = {
                         "product_name": product["name"],
-                        "hook_options": hook_result.get("hook_options", []),
+                        "hook_options": generated_hook_options,
                         "caption": hook_result.get("caption", ""),
                         "hashtags": hook_result.get("hashtags", ""),
                         "sound_tip": hook_result.get("sound_tip", ""),
@@ -4196,6 +4626,11 @@ def main():
             entry["image_url"] = fp["image_url"]
             entry["image_urls"] = fp.get("image_urls", [fp["image_url"]])
             entry["source_url"] = fp["source_url"]
+            entry["sniper_caption"] = fp.get("sniper_caption", "")
+            entry["sniper_scene_prompt"] = fp.get("sniper_scene_prompt", "")
+            entry["sniper_meta"] = fp.get("sniper_meta", {})
+            entry["sniper_batch_id"] = fp.get("sniper_batch_id")
+            entry["sniper_preset"] = fp.get("sniper_preset")
             entry["style"] = style
             entry["duration"] = resolved_style_duration(style, duration)
             entry["voice_script"] = voice_script or ""
@@ -4392,6 +4827,11 @@ def main():
             r["image_url"] = fp["image_url"]
             r["image_urls"] = fp.get("image_urls", [fp["image_url"]])
             r["source_url"] = fp["source_url"]
+            r["sniper_caption"] = fp.get("sniper_caption", "")
+            r["sniper_scene_prompt"] = fp.get("sniper_scene_prompt", "")
+            r["sniper_meta"] = fp.get("sniper_meta", {})
+            r["sniper_batch_id"] = fp.get("sniper_batch_id")
+            r["sniper_preset"] = fp.get("sniper_preset")
             r["style"] = style
             r["duration"] = resolved_style_duration(style, duration)
             r["voice_script"] = voice_script or ""
