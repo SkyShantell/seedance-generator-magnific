@@ -3474,53 +3474,100 @@ def mark_seedance_queue_batch_imported(
         return False, f"Imported products, but could not archive the queue batch: {exc}"
 
 
-def normalize_sniper_batch_products(batch: dict) -> tuple[list[dict], list[str]]:
-    """Convert a Momentum Sniper batch into the existing Seedance scrape structure."""
+def normalize_sniper_batch_products(
+    batch: dict,
+    progress_callback=None,
+) -> tuple[list[dict], list[str]]:
+    """Re-scrape Sniper TikTok links with Seedance's normal scrape flow.
+
+    This intentionally ignores transferred image URLs whenever a TikTok product
+    link is available. That gives imported products the same official listing
+    photos and review/customer photos as products pasted directly into Step 1.
+    Older queue batches remain compatible because queued images are used only as
+    a fallback when TikTok cannot be scraped.
+    """
     normalized: list[dict] = []
     skipped: list[str] = []
-    for raw_product in list(batch.get("products") or []):
-        if not isinstance(raw_product, dict):
-            continue
-        product_name = str(raw_product.get("name") or "Unknown Product").strip()
+    raw_products = [
+        product for product in list(batch.get("products") or [])
+        if isinstance(product, dict)
+    ]
+    total = len(raw_products)
+
+    for product_index, raw_product in enumerate(raw_products, start=1):
+        sniper_name = str(raw_product.get("name") or "Unknown Product").strip()
         source_url = str(raw_product.get("source_url") or "").strip()
 
-        reference_urls: list[str] = []
+        if progress_callback:
+            progress_callback(product_index, total, sniper_name)
+
+        freshly_scraped = None
+        if source_url.startswith(("http://", "https://")):
+            freshly_scraped = scrape_product(source_url)
+
+        if freshly_scraped and freshly_scraped.get("images"):
+            scraped_name = str(freshly_scraped.get("name") or "").strip()
+            product_name = sniper_name
+            if not product_name or product_name == "Unknown Product":
+                product_name = scraped_name or "Unknown Product"
+
+            normalized.append({
+                "name": product_name,
+                "images": list(freshly_scraped.get("images") or []),
+                "listing_images": list(
+                    freshly_scraped.get("listing_images")
+                    or freshly_scraped.get("images")
+                    or []
+                ),
+                "review_images": list(freshly_scraped.get("review_images") or []),
+                "source_url": source_url,
+                "sniper_caption": str(raw_product.get("caption") or "").strip(),
+                "sniper_scene_prompt": str(raw_product.get("scene_prompt") or "").strip(),
+                "sniper_meta": dict(raw_product.get("sniper_meta") or {}),
+                "sniper_batch_id": batch.get("batch_id"),
+                "sniper_preset": batch.get("preset"),
+                "sniper_transfer_mode": "tiktok_link_rescrape",
+            })
+            continue
+
+        # Compatibility fallback for older batches if TikTok blocks or fails.
+        fallback_urls: list[str] = []
         for value in (
             list(raw_product.get("images") or [])
             + list(raw_product.get("listing_images") or [])
+            + list(raw_product.get("review_images") or [])
             + [raw_product.get("primary_image_url")]
         ):
             url = str(value or "").strip()
-            if url.startswith(("http://", "https://")) and url not in reference_urls:
-                reference_urls.append(url)
+            if url.startswith(("http://", "https://")) and url not in fallback_urls:
+                fallback_urls.append(url)
 
-        scraped_fallback = None
-        if not reference_urls and source_url:
-            scraped_fallback = scrape_product(source_url)
-            if scraped_fallback:
-                reference_urls = list(scraped_fallback.get("images") or [])
-
-        if not reference_urls:
-            skipped.append(product_name)
+        if not fallback_urls:
+            skipped.append(sniper_name or source_url or f"Product {product_index}")
             continue
 
-        listing_images = list(raw_product.get("listing_images") or [])
-        listing_images = [url for url in listing_images if url in reference_urls]
-        if not listing_images:
-            listing_images = reference_urls
-
+        queued_listing = [
+            str(url).strip() for url in list(raw_product.get("listing_images") or [])
+            if str(url).strip() in fallback_urls
+        ]
+        queued_reviews = [
+            str(url).strip() for url in list(raw_product.get("review_images") or [])
+            if str(url).strip() in fallback_urls
+        ]
         normalized.append({
-            "name": product_name,
-            "images": reference_urls,
-            "listing_images": listing_images,
-            "review_images": list(raw_product.get("review_images") or []),
+            "name": sniper_name or "Unknown Product",
+            "images": fallback_urls,
+            "listing_images": queued_listing or fallback_urls,
+            "review_images": queued_reviews,
             "source_url": source_url,
             "sniper_caption": str(raw_product.get("caption") or "").strip(),
             "sniper_scene_prompt": str(raw_product.get("scene_prompt") or "").strip(),
             "sniper_meta": dict(raw_product.get("sniper_meta") or {}),
             "sniper_batch_id": batch.get("batch_id"),
             "sniper_preset": batch.get("preset"),
+            "sniper_transfer_mode": "queued_image_fallback",
         })
+
     return normalized, skipped
 
 # ═══════════════════════════════════════════════════════════════════
@@ -3804,8 +3851,9 @@ def main():
         with inbox_header_col:
             st.markdown("### 📥 Momentum Sniper Inbox")
             st.caption(
-                "Products sent from Momentum Sniper arrive here with their names, TikTok links, "
-                "image references, captions, scene prompts, and research metrics already attached."
+                "Momentum Sniper sends the TikTok links and research data. When you import a batch, "
+                "Seedance re-scrapes every TikTok page using the same flow as pasted links so you get "
+                "official listing photos and customer review photos."
             )
         with inbox_refresh_col:
             if st.button(
@@ -3892,23 +3940,43 @@ def main():
                         "Price": meta.get("avg_price"),
                         "Revenue 7d": meta.get("revenue_7d"),
                         "Ads": meta.get("ads_top10"),
-                        "Images": len(product.get("images") or []),
+                        "Photos": "Scrape on import",
                         "TikTok link": product.get("source_url", ""),
                     })
                 if preview_rows:
                     st.dataframe(preview_rows, use_container_width=True, hide_index=True)
 
                 import_batch_clicked = st.button(
-                    f"⬇️ Import {len(preview_rows)} product(s) into Seedance",
+                    f"🔍 Scrape TikTok links & import {len(preview_rows)} product(s)",
                     type="primary",
                     use_container_width=True,
                     key="import_selected_sniper_batch",
+                    help=(
+                        "Runs every TikTok link through Seedance's normal scraper to collect "
+                        "official listing photos and customer review photos before importing."
+                    ),
                 )
                 if import_batch_clicked:
-                    with st.spinner("Importing product references into Seedance Studio…"):
-                        imported_products, skipped_products = normalize_sniper_batch_products(selected_batch)
+                    scrape_progress = st.progress(0, text="Preparing TikTok photo scrape…")
+
+                    def update_sniper_scrape_progress(current, total, product_name):
+                        denominator = max(total, 1)
+                        scrape_progress.progress(
+                            max(0.0, min(0.95, (current - 1) / denominator)),
+                            text=f"Scraping TikTok {current}/{total}: {product_name[:55]}…",
+                        )
+
+                    with st.spinner("Scraping TikTok listing and review photos…"):
+                        imported_products, skipped_products = normalize_sniper_batch_products(
+                            selected_batch,
+                            progress_callback=update_sniper_scrape_progress,
+                        )
+                    scrape_progress.progress(1.0, text="TikTok photo scrape complete.")
+
                     if not imported_products:
-                        st.error("None of the products had a usable image reference.")
+                        st.error(
+                            "Seedance could not collect usable photos from any TikTok link in this batch."
+                        )
                     else:
                         st.session_state["scraped"] = imported_products
                         st.session_state["product_hooks"] = {}
@@ -3919,9 +3987,20 @@ def main():
                             queue_branch,
                             selected_batch,
                         )
-                        message = f"Imported {len(imported_products)} Momentum Sniper product(s)."
+                        listing_count = sum(
+                            len(product.get("listing_images") or [])
+                            for product in imported_products
+                        )
+                        review_count = sum(
+                            len(product.get("review_images") or [])
+                            for product in imported_products
+                        )
+                        message = (
+                            f"Scraped and imported {len(imported_products)} Momentum Sniper product(s) "
+                            f"with {listing_count} listing photo(s) and {review_count} review photo(s)."
+                        )
                         if skipped_products:
-                            message += f" Skipped {len(skipped_products)} without usable images."
+                            message += f" Skipped {len(skipped_products)} link(s) with no usable photos."
                         if archive_warning:
                             st.session_state["sniper_import_archive_warning"] = archive_warning
                         st.session_state["sniper_import_message"] = message
