@@ -3174,8 +3174,9 @@ def push_generated_image_to_director(
 ) -> tuple[bool, str]:
     """Send one generated image into the Momentum Academy Director ingest flow.
 
-    The existing Director endpoint accepts either image_url or image_base64. Generated
-    xAI URLs can expire, so this app downloads the image and sends a data URI instead.
+    Send the hosted image URL first so the request stays far below serverless payload
+    limits. If Director cannot ingest the URL directly, retry once with a resized,
+    compressed JPEG data URI that is intentionally kept small enough for the endpoint.
     """
     ingest_key = (ingest_key or "").strip()
     ingest_url = (ingest_url or DIRECTOR_INGEST_URL_DEFAULT).strip()
@@ -3186,29 +3187,21 @@ def push_generated_image_to_director(
     if not image_url:
         return False, "No generated image URL is available to send."
 
-    image_bytes, content_type = fetch_image_bytes(image_url)
-    if not image_bytes:
-        return False, "The generated image could not be downloaded before sending to Director."
-
-    import base64
-
-    mime_type = content_type if (content_type or "").startswith("image/") else "image/jpeg"
-    image_data_uri = f"data:{mime_type};base64," + base64.b64encode(image_bytes).decode("ascii")
-    payload = {
+    base_meta = {
+        **(meta or {}),
+        "source_app": "Seedance Studio",
+        "generated_image_url": image_url,
+        "director_delivery": "image_url",
+    }
+    base_payload = {
         "product_name": (product_name or "Untitled Product").strip(),
         "caption": (caption or "").strip(),
         "scene_prompt": (scene_prompt or "").strip(),
-        "meta": {
-            **(meta or {}),
-            "source_app": "Seedance Studio",
-            "generated_image_url": image_url,
-            "image_content_type": mime_type,
-        },
-        "image_base64": image_data_uri,
+        "meta": base_meta,
     }
 
-    try:
-        response = requests.post(
+    def post_payload(payload: dict):
+        return requests.post(
             ingest_url,
             headers={
                 "Content-Type": "application/json",
@@ -3217,23 +3210,25 @@ def push_generated_image_to_director(
             json=payload,
             timeout=120,
         )
-        if response.status_code >= 400:
-            try:
-                error_payload = response.json()
-                error_message = (
+
+    def response_error(response) -> str:
+        try:
+            error_payload = response.json()
+            if isinstance(error_payload, dict):
+                return str(
                     error_payload.get("message")
                     or error_payload.get("error")
                     or json.dumps(error_payload)
-                ) if isinstance(error_payload, dict) else str(error_payload)
-            except Exception:
-                error_message = response.text or "Unknown Director ingest error"
-            return False, f"Director ingest failed ({response.status_code}): {str(error_message)[:500]}"
+                )[:500]
+            return str(error_payload)[:500]
+        except Exception:
+            return str(response.text or "Unknown Director ingest error")[:500]
 
+    def success_message(response) -> str:
         try:
             response_payload = response.json()
         except Exception:
             response_payload = None
-
         if isinstance(response_payload, dict):
             director_id = (
                 response_payload.get("id")
@@ -3241,8 +3236,82 @@ def push_generated_image_to_director(
                 or response_payload.get("inbox_id")
             )
             if director_id:
-                return True, f"Sent to Director successfully. Item ID: {director_id}"
-        return True, "Sent to Director successfully."
+                return f"Sent to Director successfully. Item ID: {director_id}"
+        return "Sent to Director successfully."
+
+    try:
+        # Preferred path: Director receives the temporary Grok URL and imports it
+        # immediately. This avoids base64's ~33% size inflation and Vercel's body limit.
+        url_payload = {**base_payload, "image_url": image_url}
+        response = post_payload(url_payload)
+        if response.status_code < 400:
+            return True, success_message(response)
+
+        first_error = response_error(response)
+
+        # Authentication and route errors will not be fixed by retrying with bytes.
+        if response.status_code in {401, 403, 404}:
+            return False, f"Director ingest failed ({response.status_code}): {first_error}"
+
+        # Compatibility fallback: compress to a modest JPEG and keep the encoded body
+        # comfortably below common serverless request limits.
+        image_bytes, _content_type = fetch_image_bytes(image_url)
+        if not image_bytes:
+            return False, (
+                f"Director rejected the image URL ({response.status_code}: {first_error}), "
+                "and the app could not download the image for a compressed retry."
+            )
+
+        compressed_bytes = image_bytes
+        if PIL_AVAILABLE:
+            try:
+                source_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+                source_image.thumbnail((1440, 2560), Image.Resampling.LANCZOS)
+
+                # Keep raw JPEG under 2.25 MB so base64 + JSON remain well below 4.5 MB.
+                target_bytes = 2_250_000
+                for quality in (86, 80, 74, 68, 62, 56):
+                    output = io.BytesIO()
+                    source_image.save(
+                        output,
+                        format="JPEG",
+                        quality=quality,
+                        optimize=True,
+                        progressive=True,
+                    )
+                    compressed_bytes = output.getvalue()
+                    if len(compressed_bytes) <= target_bytes:
+                        break
+            except Exception:
+                compressed_bytes = image_bytes
+
+        if len(compressed_bytes) > 2_500_000:
+            return False, (
+                f"Director rejected the image URL ({response.status_code}: {first_error}). "
+                "The fallback image is still too large to send safely."
+            )
+
+        import base64
+
+        image_data_uri = "data:image/jpeg;base64," + base64.b64encode(compressed_bytes).decode("ascii")
+        fallback_payload = {
+            **base_payload,
+            "meta": {
+                **base_meta,
+                "director_delivery": "compressed_base64_fallback",
+                "compressed_image_bytes": len(compressed_bytes),
+            },
+            "image_base64": image_data_uri,
+        }
+        fallback_response = post_payload(fallback_payload)
+        if fallback_response.status_code < 400:
+            return True, success_message(fallback_response)
+
+        return False, (
+            f"Director ingest failed ({fallback_response.status_code}): "
+            f"{response_error(fallback_response)}"
+        )
+
     except requests.Timeout:
         return False, "Director ingest timed out before confirming the upload."
     except Exception as exc:
