@@ -343,14 +343,14 @@ def inject_apple_glass_css():
         /* Buttons */
         .stButton > button,
         .stDownloadButton > button {
-            min-height: 42px;
+            min-height: 44px;
             border-radius: 14px !important;
-            border: 1px solid var(--glass-border) !important;
-            background: linear-gradient(145deg, rgba(33,39,53,.96), rgba(20,24,34,.96)) !important;
-            color: #eef2f8 !important;
-            box-shadow: 0 10px 26px rgba(0,0,0,.24) !important;
+            border: 1.4px solid rgba(122, 177, 255, .48) !important;
+            background: linear-gradient(145deg, rgba(49,58,77,.98), rgba(24,29,41,.98)) !important;
+            color: #ffffff !important;
+            box-shadow: 0 10px 26px rgba(0,0,0,.28), 0 0 0 1px rgba(255,255,255,.03) inset !important;
             backdrop-filter: blur(16px);
-            font-weight: 700 !important;
+            font-weight: 800 !important;
             transition: transform .16s ease, box-shadow .16s ease, border-color .16s ease, background .16s ease;
         }
 
@@ -358,26 +358,28 @@ def inject_apple_glass_css():
         .stDownloadButton > button p,
         .stButton > button span,
         .stDownloadButton > button span {
-            color: #eef2f8 !important;
+            color: #ffffff !important;
+            font-weight: 800 !important;
         }
 
         .stButton > button:hover,
         .stDownloadButton > button:hover {
             transform: translateY(-1px);
-            border-color: var(--glass-border-hover) !important;
-            background: linear-gradient(145deg, rgba(43,50,67,.98), rgba(26,31,43,.98)) !important;
-            box-shadow: 0 14px 34px rgba(0,0,0,.34) !important;
+            border-color: rgba(151, 196, 255, .82) !important;
+            background: linear-gradient(145deg, rgba(59,69,91,.99), rgba(31,37,52,.99)) !important;
+            box-shadow: 0 14px 34px rgba(0,0,0,.38), 0 0 0 1px rgba(151,196,255,.18) inset !important;
         }
 
         .stButton > button[kind="primary"] {
             color: white !important;
-            background: linear-gradient(135deg, #247ff0, #7658e8) !important;
-            border: 1px solid rgba(255,255,255,.12) !important;
-            box-shadow: 0 14px 34px rgba(35, 103, 226, .30) !important;
+            background: linear-gradient(135deg, #2d8fff, #7b5dff) !important;
+            border: 1.4px solid rgba(212,230,255,.42) !important;
+            box-shadow: 0 14px 34px rgba(35, 103, 226, .36), 0 0 0 1px rgba(255,255,255,.06) inset !important;
         }
 
         .stButton > button[kind="primary"]:hover {
-            background: linear-gradient(135deg, #348cff, #8668f8) !important;
+            background: linear-gradient(135deg, #45a0ff, #8e70ff) !important;
+            border-color: rgba(255,255,255,.54) !important;
         }
 
         button:disabled,
@@ -1696,6 +1698,12 @@ LIFESTYLE_PRODUCT_TYPES = {
         "framing": "Use a close phone-camera composition where the product fills roughly 45-75% of the frame without looking oversized.",
         "appearance_help": "Include packaging color, label, cap, logo placement, count, material, and proportions.",
     },
+    "clothing_shoe": {
+        "label": "Clothing / shoes — apparel, footwear, fashion accessories",
+        "description": "a clothing, footwear, or wearable fashion product shown at realistic human scale",
+        "framing": "Show the full clothing or shoe product clearly at believable scale. For shoes, keep the complete pair or complete single product visible. For clothing, show the main garment cleanly on-body or staged naturally in a realistic wardrobe setting.",
+        "appearance_help": "Include garment type, cut, silhouette, color, fabric, texture, stitching, hardware, sole, laces, straps, logo placement, and any included pieces.",
+    },
     "countertop_appliance": {
         "label": "Countertop appliance — air fryer, blender, coffee maker",
         "description": "a medium countertop appliance or home device",
@@ -1776,6 +1784,13 @@ LIFESTYLE_TYPE_KEYWORDS = {
         "laptop", "tablet", "keyboard", "microphone", "camera", "router", "gaming chair", "headphones",
         "earbuds", "charging station", "computer", "scanner",
     ),
+    "clothing_shoe": (
+        "shoe", "shoes", "sneaker", "sneakers", "trainer", "trainers", "boot", "boots", "heel", "heels",
+        "slipper", "slippers", "loafer", "loafers", "sandal", "sandals", "slide", "slides", "slip on",
+        "sock", "socks", "legging", "leggings", "hoodie", "sweatshirt", "jacket", "coat", "dress", "shirt",
+        "tee", "t shirt", "top", "skirt", "jeans", "pants", "shorts", "bra", "bralette", "shapewear",
+        "sweater", "cardigan", "activewear", "athleisure", "set", "two piece", "tracksuit", "onesie", "robe",
+    ),
     "small_handheld": (
         "gummies", "capsules", "supplement", "vitamin", "serum", "cream", "lotion", "perfume", "spray",
         "toner", "cleanser", "shampoo", "conditioner", "makeup", "lip", "mask", "powder", "drink mix",
@@ -1789,7 +1804,7 @@ def infer_lifestyle_product_type(product_name: str) -> str:
     normalized = f" {re.sub(r'[^a-z0-9]+', ' ', (product_name or '').lower()).strip()} "
     for type_key in (
         "furniture_large", "floor_cleaning", "countertop_appliance", "fitness_large",
-        "outdoor_large", "electronics", "small_handheld",
+        "outdoor_large", "electronics", "clothing_shoe", "small_handheld",
     ):
         if any(keyword in normalized for keyword in LIFESTYLE_TYPE_KEYWORDS[type_key]):
             return type_key
@@ -1825,6 +1840,12 @@ def infer_lifestyle_default_scene(product_name: str, product_type: str) -> str:
         if any(word in normalized for word in ("lawn", "blower", "mower", "pressure washer", "hose", "driveway")):
             return "yard_driveway_product"
         return "patio_product"
+    if product_type == "clothing_shoe":
+        if any(word in normalized for word in ("shoe", "shoes", "sneaker", "sneakers", "boot", "boots", "heel", "heels", "sandal", "sandals", "slide", "slides", "slipper", "slippers", "loafer", "loafers")):
+            return "shoe_entryway"
+        if any(word in normalized for word in ("legging", "leggings", "bra", "bralette", "activewear", "athleisure", "tracksuit")):
+            return "clothing_mirror"
+        return "clothing_closet"
     if product_type == "small_handheld":
         if any(word in normalized for word in ("gummies", "capsules", "supplement", "vitamin", "drink mix", "powder")):
             return "hand_kitchen"
@@ -1955,6 +1976,41 @@ LIFESTYLE_SCENES = {
         "background": "a water bottle, towel, bench, and softly blurred gym equipment",
         "hand_present": False,
         "camera_motion": "a short bench-height arc and subtle push-in",
+    },
+
+    # Clothing and shoes
+    "shoe_entryway": {
+        "label": "Shoes — entryway / hallway",
+        "types": ["clothing_shoe", "other"],
+        "setting": (
+            "placed naturally on the floor in a real entryway, hallway, or mudroom. Show the full shoes at believable scale with laces, soles, straps, logos, and material texture clearly visible. A rug, baseboards, and casual everyday clutter make the scene feel real"
+        ),
+        "placement": "positioned naturally at full scale in a real entryway or hallway",
+        "background": "a rug, baseboards, doorway, wall, and ordinary entryway details",
+        "hand_present": False,
+        "camera_motion": "a low handheld side arc with a gentle push-in across the shoes",
+    },
+    "clothing_mirror": {
+        "label": "Clothing — on-body mirror / bedroom",
+        "types": ["clothing_shoe", "other"],
+        "setting": (
+            "worn naturally in a casual bedroom or dressing-area mirror setup. Show the clothing item clearly at correct human scale with realistic drape, fit, fabric texture, seams, and proportions. The scene should feel like a genuine UGC outfit check, not a polished fashion campaign"
+        ),
+        "placement": "worn naturally at realistic scale in a casual bedroom or dressing-area setting",
+        "background": "a bedroom mirror, bed edge, dresser, laundry basket, or ordinary bedroom details",
+        "hand_present": False,
+        "camera_motion": "a casual handheld mirror-style reframe with slight body-level drift while the clothing stays visually fixed in the approved start frame",
+    },
+    "clothing_closet": {
+        "label": "Clothing — closet / wardrobe area",
+        "types": ["clothing_shoe", "other"],
+        "setting": (
+            "displayed naturally in a closet, wardrobe, or bedroom corner. Show the full garment or outfit at believable scale on a hanger, rack, chair, or styled drape so its cut, length, texture, and details are easy to see. Nearby clothing and room details should make the scene feel lived-in"
+        ),
+        "placement": "displayed naturally at full scale in a closet or wardrobe area",
+        "background": "a clothing rack, hangers, dresser, mirror, or ordinary wardrobe details",
+        "hand_present": False,
+        "camera_motion": "a slow wardrobe-area side reveal with a subtle push-in",
     },
 
     # Countertop appliances
@@ -2164,6 +2220,7 @@ LIFESTYLE_SCENES = {
 
 DEFAULT_LIFESTYLE_SCENE_BY_TYPE = {
     "small_handheld": "hand_bathroom",
+    "clothing_shoe": "shoe_entryway",
     "countertop_appliance": "kitchen_appliance",
     "floor_cleaning": "vacuum_living_room",
     "furniture_large": "living_room_furniture",
