@@ -5437,6 +5437,152 @@ def main():
             use_container_width=True,
         )
 
+        # Bulk Director push: send every available Lifestyle image that has not
+        # already been delivered. Successful items are marked immediately so a
+        # later retry only attempts the remaining failures and never duplicates
+        # images that were already accepted by Director.
+        bulk_director_available = []
+        bulk_director_pending = []
+        for bulk_index, bulk_result in enumerate(saved_gens):
+            if bulk_result.get("style") != "lifestyle_animation":
+                continue
+            bulk_image_url = (
+                bulk_result.get("lifestyle_image_url")
+                or (
+                    bulk_result.get("url")
+                    if str(bulk_result.get("url") or "").lower().split("?")[0].endswith(
+                        (".jpg", ".jpeg", ".png", ".webp", ".avif")
+                    )
+                    else ""
+                )
+            )
+            if not bulk_image_url:
+                continue
+            bulk_director_available.append((bulk_index, bulk_result, bulk_image_url))
+            if not bulk_result.get("director_pushed_at"):
+                bulk_director_pending.append((bulk_index, bulk_result, bulk_image_url))
+
+        bulk_summary = st.session_state.pop("bulk_director_summary", None)
+        if isinstance(bulk_summary, dict):
+            success_count = int(bulk_summary.get("success", 0) or 0)
+            failure_count = int(bulk_summary.get("failed", 0) or 0)
+            if success_count:
+                st.success(f"Sent {success_count} Lifestyle image(s) to Director.")
+            if failure_count:
+                st.error(f"{failure_count} Lifestyle image(s) could not be sent. Click the bulk button again to retry only those items.")
+                failure_messages = bulk_summary.get("messages") or []
+                if failure_messages:
+                    with st.expander("Director errors", expanded=False):
+                        for failure_message in failure_messages:
+                            st.caption(f"• {failure_message}")
+
+        bulk_director_label = f"↗️ Send to Director ({len(bulk_director_pending)})"
+        bulk_send_to_director = st.button(
+            bulk_director_label,
+            key="bulk_send_lifestyle_to_director",
+            type="primary",
+            use_container_width=True,
+            disabled=(not bool(director_ingest_key) or not bulk_director_pending),
+            help=(
+                "Send every available Lifestyle image that has not already been sent into the Momentum Academy Director flow."
+                if director_ingest_key
+                else "Add DIRECTOR_INGEST_KEY in API connection or Streamlit Secrets first."
+            ),
+        )
+
+        if not director_ingest_key:
+            st.caption("Connect the Momentum Director ingest key above to enable bulk sending.")
+        elif not bulk_director_available:
+            st.caption("No generated Lifestyle images are available to send yet.")
+        elif not bulk_director_pending:
+            st.caption(f"All {len(bulk_director_available)} available Lifestyle image(s) have already been sent to Director.")
+        else:
+            already_sent_count = len(bulk_director_available) - len(bulk_director_pending)
+            sent_note = f" {already_sent_count} already-sent image(s) will be skipped." if already_sent_count else ""
+            st.caption(
+                f"This sends {len(bulk_director_pending)} pending Lifestyle image(s)."
+                f"{sent_note} Successful items are marked immediately, so retries only send failures."
+            )
+
+        if bulk_send_to_director:
+            bulk_progress = st.progress(0, text="Preparing Lifestyle images for Director...")
+            bulk_success_count = 0
+            bulk_failure_count = 0
+            bulk_failure_messages = []
+            bulk_total = len(bulk_director_pending)
+            bulk_batch_id = f"director_bulk_{export_stamp}"
+
+            for bulk_position, (bulk_index, bulk_result, bulk_image_url) in enumerate(
+                bulk_director_pending,
+                start=1,
+            ):
+                bulk_product_name = bulk_result.get("product_name", "Untitled Product")
+                bulk_progress.progress(
+                    (bulk_position - 1) / max(1, bulk_total),
+                    text=f"Sending {bulk_position}/{bulk_total}: {bulk_product_name[:55]}...",
+                )
+
+                director_ok, director_message = push_generated_image_to_director(
+                    ingest_key=director_ingest_key,
+                    ingest_url=director_ingest_url,
+                    image_url=bulk_image_url,
+                    product_name=bulk_product_name,
+                    caption=bulk_result.get("caption") or bulk_result.get("accepted_hook") or "",
+                    scene_prompt=(
+                        bulk_result.get("lifestyle_prompt")
+                        or bulk_result.get("prompt_used")
+                        or bulk_result.get("prompt")
+                        or ""
+                    ),
+                    meta={
+                        "source_url": bulk_result.get("source_url", ""),
+                        "style": bulk_result.get("style", "lifestyle_animation"),
+                        "scene_key": bulk_result.get("scene_key"),
+                        "custom_scene": bulk_result.get("custom_scene", ""),
+                        "product_type": bulk_result.get("product_type"),
+                        "appearance_details": bulk_result.get("appearance_details", ""),
+                        "image_model": bulk_result.get("image_model", XAI_IMAGE_MODEL),
+                        "image_resolution": bulk_result.get("image_resolution", "2k"),
+                        "image_aspect_ratio": bulk_result.get("image_aspect_ratio", "9:16"),
+                        "creation_id": bulk_result.get("lifestyle_creation_id") or bulk_result.get("creation_id"),
+                        "generated_at": bulk_result.get("generated_at", ""),
+                        "accepted_hook": bulk_result.get("accepted_hook", ""),
+                        "hashtags": bulk_result.get("hashtags", ""),
+                        "director_bulk_batch_id": bulk_batch_id,
+                    },
+                )
+
+                attempt_time = datetime.now().isoformat(timespec="seconds")
+                saved_gens[bulk_index]["director_last_attempt_at"] = attempt_time
+                saved_gens[bulk_index]["director_ingest_message"] = director_message
+                saved_gens[bulk_index]["director_bulk_batch_id"] = bulk_batch_id
+
+                if director_ok:
+                    saved_gens[bulk_index]["director_pushed_at"] = attempt_time
+                    saved_gens[bulk_index]["director_ingest_status"] = "sent"
+                    bulk_success_count += 1
+                else:
+                    saved_gens[bulk_index]["director_ingest_status"] = "error"
+                    bulk_failure_count += 1
+                    bulk_failure_messages.append(f"{bulk_product_name}: {director_message}")
+
+                # Save after every item so progress survives a browser refresh or a
+                # later request failure during a larger batch.
+                save_generations(saved_gens)
+                bulk_progress.progress(
+                    bulk_position / max(1, bulk_total),
+                    text=f"Processed {bulk_position}/{bulk_total} Lifestyle image(s)",
+                )
+                if bulk_position < bulk_total:
+                    time.sleep(0.35)
+
+            st.session_state["bulk_director_summary"] = {
+                "success": bulk_success_count,
+                "failed": bulk_failure_count,
+                "messages": bulk_failure_messages,
+            }
+            st.rerun()
+
         st.caption(
             f"The video ZIP contains {zip_video_count} available video(s) plus captions.csv. "
             "Edited text versions are used first; otherwise the original completed video is included."
