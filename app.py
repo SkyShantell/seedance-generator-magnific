@@ -1442,6 +1442,7 @@ def lifestyle_images_zip_bytes(generations: list[dict]) -> tuple[bytes | None, i
 MAGNIFIC_MCP_URL = "https://mcp.magnific.com"
 XAI_IMAGE_API_URL = "https://api.x.ai/v1/images/edits"
 XAI_IMAGE_MODEL = "grok-imagine-image-quality"
+DIRECTOR_INGEST_URL_DEFAULT = "https://app.momentumacademy.co/api/director/ingest"
 MAGNIFIC_MCP_NAME = "magnific"
 MODEL = "claude-sonnet-4-6"
 MCP_BETA = "mcp-client-2025-11-20"
@@ -3162,6 +3163,92 @@ def check_creation_status(api_key: str, magnific_token: str, creation_id: str) -
         return {"status": "error", "url": None, "error": str(e)}
 
 
+def push_generated_image_to_director(
+    ingest_key: str,
+    ingest_url: str,
+    image_url: str,
+    product_name: str,
+    caption: str = "",
+    scene_prompt: str = "",
+    meta: dict | None = None,
+) -> tuple[bool, str]:
+    """Send one generated image into the Momentum Academy Director ingest flow.
+
+    The existing Director endpoint accepts either image_url or image_base64. Generated
+    xAI URLs can expire, so this app downloads the image and sends a data URI instead.
+    """
+    ingest_key = (ingest_key or "").strip()
+    ingest_url = (ingest_url or DIRECTOR_INGEST_URL_DEFAULT).strip()
+    image_url = (image_url or "").strip()
+
+    if not ingest_key:
+        return False, "DIRECTOR_INGEST_KEY is missing. Add it in Streamlit Secrets or API connection."
+    if not image_url:
+        return False, "No generated image URL is available to send."
+
+    image_bytes, content_type = fetch_image_bytes(image_url)
+    if not image_bytes:
+        return False, "The generated image could not be downloaded before sending to Director."
+
+    import base64
+
+    mime_type = content_type if (content_type or "").startswith("image/") else "image/jpeg"
+    image_data_uri = f"data:{mime_type};base64," + base64.b64encode(image_bytes).decode("ascii")
+    payload = {
+        "product_name": (product_name or "Untitled Product").strip(),
+        "caption": (caption or "").strip(),
+        "scene_prompt": (scene_prompt or "").strip(),
+        "meta": {
+            **(meta or {}),
+            "source_app": "Seedance Studio",
+            "generated_image_url": image_url,
+            "image_content_type": mime_type,
+        },
+        "image_base64": image_data_uri,
+    }
+
+    try:
+        response = requests.post(
+            ingest_url,
+            headers={
+                "Content-Type": "application/json",
+                "x-ingest-key": ingest_key,
+            },
+            json=payload,
+            timeout=120,
+        )
+        if response.status_code >= 400:
+            try:
+                error_payload = response.json()
+                error_message = (
+                    error_payload.get("message")
+                    or error_payload.get("error")
+                    or json.dumps(error_payload)
+                ) if isinstance(error_payload, dict) else str(error_payload)
+            except Exception:
+                error_message = response.text or "Unknown Director ingest error"
+            return False, f"Director ingest failed ({response.status_code}): {str(error_message)[:500]}"
+
+        try:
+            response_payload = response.json()
+        except Exception:
+            response_payload = None
+
+        if isinstance(response_payload, dict):
+            director_id = (
+                response_payload.get("id")
+                or response_payload.get("item_id")
+                or response_payload.get("inbox_id")
+            )
+            if director_id:
+                return True, f"Sent to Director successfully. Item ID: {director_id}"
+        return True, "Sent to Director successfully."
+    except requests.Timeout:
+        return False, "Director ingest timed out before confirming the upload."
+    except Exception as exc:
+        return False, f"Director ingest failed: {exc}"
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  STREAMLIT UI
 # ═══════════════════════════════════════════════════════════════════
@@ -3192,6 +3279,8 @@ def main():
     api_key_from_secrets = get_secret("ANTHROPIC_API_KEY")
     token_from_secrets = get_secret("MAGNIFIC_AUTH_TOKEN")
     xai_key_from_secrets = get_secret("XAI_API_KEY")
+    director_key_from_secrets = get_secret("DIRECTOR_INGEST_KEY")
+    director_url_from_secrets = get_secret("DIRECTOR_INGEST_URL") or DIRECTOR_INGEST_URL_DEFAULT
 
     if "runtime_anthropic_api_key" not in st.session_state:
         st.session_state["runtime_anthropic_api_key"] = api_key_from_secrets
@@ -3199,6 +3288,10 @@ def main():
         st.session_state["runtime_magnific_token"] = token_from_secrets
     if "runtime_xai_api_key" not in st.session_state:
         st.session_state["runtime_xai_api_key"] = xai_key_from_secrets
+    if "runtime_director_ingest_key" not in st.session_state:
+        st.session_state["runtime_director_ingest_key"] = director_key_from_secrets
+    if "runtime_director_ingest_url" not in st.session_state:
+        st.session_state["runtime_director_ingest_url"] = director_url_from_secrets
 
     with st.container(border=True):
         st.markdown("### Video setup")
@@ -3267,7 +3360,9 @@ def main():
         api_key = st.session_state.get("runtime_anthropic_api_key", "")
         magnific_token = st.session_state.get("runtime_magnific_token", "")
         xai_api_key = st.session_state.get("runtime_xai_api_key", "")
-        status_col_1, status_col_2, status_col_3, status_col_4 = st.columns(4)
+        director_ingest_key = st.session_state.get("runtime_director_ingest_key", "")
+        director_ingest_url = st.session_state.get("runtime_director_ingest_url", DIRECTOR_INGEST_URL_DEFAULT)
+        status_col_1, status_col_2, status_col_3, status_col_4, status_col_5 = st.columns(5)
         if api_key:
             status_col_1.success("Anthropic connected")
         else:
@@ -3280,7 +3375,11 @@ def main():
             status_col_3.success("Grok images connected")
         else:
             status_col_3.info("Grok key needed for Lifestyle")
-        status_col_4.info(f"{STYLE_LABELS[style]} · {resolved_style_duration(style, duration)}s")
+        if director_ingest_key:
+            status_col_4.success("Director connected")
+        else:
+            status_col_4.info("Director key optional")
+        status_col_5.info(f"{STYLE_LABELS[style]} · {resolved_style_duration(style, duration)}s")
 
         required_connections_ready = bool(api_key and magnific_token and (xai_api_key if style == "lifestyle_animation" else True))
         with st.expander("API connection", expanded=not required_connections_ready):
@@ -3312,9 +3411,35 @@ def main():
                 key="runtime_magnific_token_input",
                 help="Paste a refreshed token here whenever Magnific authentication expires.",
             )
+
+            if director_key_from_secrets:
+                st.success("Momentum Director ingest key loaded from Streamlit secrets.")
+            else:
+                st.session_state["runtime_director_ingest_key"] = st.text_input(
+                    "Momentum Director ingest key",
+                    type="password",
+                    value=st.session_state.get("runtime_director_ingest_key", ""),
+                    key="runtime_director_ingest_key_input",
+                    help="Used by the Send to Director button for generated Lifestyle images.",
+                )
+            st.session_state["runtime_director_ingest_url"] = st.text_input(
+                "Momentum Director ingest URL",
+                value=st.session_state.get("runtime_director_ingest_url", DIRECTOR_INGEST_URL_DEFAULT),
+                key="runtime_director_ingest_url_input",
+                help="Leave this at the default unless the Momentum Academy Director endpoint changes.",
+            ).strip() or DIRECTOR_INGEST_URL_DEFAULT
+
             magnific_token = st.session_state.get("runtime_magnific_token", "")
             api_key = st.session_state.get("runtime_anthropic_api_key", "")
             xai_api_key = st.session_state.get("runtime_xai_api_key", "")
+            director_ingest_key = st.session_state.get("runtime_director_ingest_key", "")
+            director_ingest_url = st.session_state.get("runtime_director_ingest_url", DIRECTOR_INGEST_URL_DEFAULT)
+
+            st.markdown("**Momentum Director connection**")
+            st.markdown(
+                'Add `DIRECTOR_INGEST_KEY = "your-key"` to Streamlit secrets. '
+                '`DIRECTOR_INGEST_URL` is optional and defaults to the existing Momentum Academy Director ingest endpoint.'
+            )
 
             st.markdown("**xAI key for Lifestyle images**")
             st.markdown('Add `XAI_API_KEY = "your-key"` to Streamlit secrets, or paste the key in the field above. Grok is used only for the Lifestyle approval image.')
@@ -4849,6 +4974,68 @@ def main():
                             st.caption(f"Custom scene: {result['custom_scene']}")
                         if result.get("appearance_details"):
                             st.caption(f"Product details: {result['appearance_details']}")
+
+                        st.markdown("---")
+                        if result.get("director_pushed_at"):
+                            st.success(f"Already sent to Director: {result['director_pushed_at']}")
+
+                        director_button_label = (
+                            "↗️ Send image to Director again"
+                            if result.get("director_pushed_at")
+                            else "↗️ Send image to Director"
+                        )
+                        send_to_director = st.button(
+                            director_button_label,
+                            key=f"send_lifestyle_to_director_{i}",
+                            type="primary" if not result.get("director_pushed_at") else "secondary",
+                            use_container_width=True,
+                            disabled=not bool(director_ingest_key),
+                            help=(
+                                "Push this generated Lifestyle image into the Momentum Academy Director flow."
+                                if director_ingest_key
+                                else "Add DIRECTOR_INGEST_KEY in API connection or Streamlit Secrets first."
+                            ),
+                        )
+                        if not director_ingest_key:
+                            st.caption("Connect the Momentum Director ingest key above to enable this button.")
+
+                        if send_to_director:
+                            with st.spinner("Sending the generated image to Momentum Director..."):
+                                director_ok, director_message = push_generated_image_to_director(
+                                    ingest_key=director_ingest_key,
+                                    ingest_url=director_ingest_url,
+                                    image_url=lifestyle_image_url,
+                                    product_name=product_name,
+                                    caption=result.get("caption") or result.get("accepted_hook") or "",
+                                    scene_prompt=result.get("lifestyle_prompt") or result.get("prompt_used") or result.get("prompt") or "",
+                                    meta={
+                                        "source_url": result.get("source_url", ""),
+                                        "style": result.get("style", "lifestyle_animation"),
+                                        "scene_key": result.get("scene_key"),
+                                        "custom_scene": result.get("custom_scene", ""),
+                                        "product_type": result.get("product_type"),
+                                        "appearance_details": result.get("appearance_details", ""),
+                                        "image_model": result.get("image_model", XAI_IMAGE_MODEL),
+                                        "image_resolution": result.get("image_resolution", "2k"),
+                                        "image_aspect_ratio": result.get("image_aspect_ratio", "9:16"),
+                                        "creation_id": result.get("lifestyle_creation_id") or result.get("creation_id"),
+                                        "generated_at": result.get("generated_at", ""),
+                                        "accepted_hook": result.get("accepted_hook", ""),
+                                        "hashtags": result.get("hashtags", ""),
+                                    },
+                                )
+                            if director_ok:
+                                saved_gens[i]["director_pushed_at"] = datetime.now().isoformat(timespec="seconds")
+                                saved_gens[i]["director_ingest_status"] = "sent"
+                                saved_gens[i]["director_ingest_message"] = director_message
+                                save_generations(saved_gens)
+                                st.success(director_message)
+                                st.rerun()
+                            else:
+                                saved_gens[i]["director_ingest_status"] = "error"
+                                saved_gens[i]["director_ingest_message"] = director_message
+                                save_generations(saved_gens)
+                                st.error(director_message)
                 elif result.get("image_url"):
                     preview_image_col, preview_message_col = st.columns([1, 1.5])
                     with preview_image_col:
