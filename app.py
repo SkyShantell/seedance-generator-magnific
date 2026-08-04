@@ -695,10 +695,15 @@ def add_generation(result: dict):
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def fetch_video_bytes(video_url: str) -> bytes | None:
-    """Download video bytes and cache the result for Streamlit reruns."""
+def fetch_video_bytes(video_url: str, cache_key: str = "") -> bytes | None:
+    """Download video bytes; cache_key separates regenerated creations even when a CDN URL is reused."""
+    _ = cache_key
     try:
-        resp = requests.get(video_url, timeout=90)
+        resp = requests.get(
+            video_url,
+            timeout=90,
+            headers={"Cache-Control": "no-cache", "Pragma": "no-cache"},
+        )
         resp.raise_for_status()
         return resp.content
     except Exception:
@@ -3101,6 +3106,68 @@ If the creation is a video and it's completed, the url field should contain the 
 Extract URLs from the creation data — look for fields like url, videoUrl, previewUrl, etc.
 """
 
+def _extract_status_payload(payload, result: dict):
+    """Extract status and output URLs from nested Magnific creation responses."""
+    url_candidates = []
+
+    def walk(value, path=()):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                key_text = str(key)
+                key_lower = key_text.lower()
+                child_path = path + (key_lower,)
+
+                if key_lower in {"status", "state", "creation_status"} and isinstance(child, str):
+                    normalized = child.strip().lower()
+                    status_aliases = {
+                        "succeeded": "completed",
+                        "success": "completed",
+                        "done": "completed",
+                        "finished": "completed",
+                        "pending": "queued",
+                        "running": "processing",
+                        "failed": "error",
+                        "failure": "error",
+                    }
+                    result["status"] = status_aliases.get(normalized, normalized)
+
+                if isinstance(child, str) and child.startswith(("http://", "https://")):
+                    path_text = " ".join(child_path)
+                    score = 0
+                    if key_lower in {"videourl", "video_url", "video", "downloadurl", "download_url"}:
+                        score += 120
+                    elif key_lower in {"outputurl", "output_url", "resulturl", "result_url", "mediaurl", "media_url"}:
+                        score += 105
+                    elif key_lower in {"url", "fileurl", "file_url"}:
+                        score += 75
+                    elif "preview" in key_lower:
+                        score += 55
+                    if any(token in path_text for token in ("output", "result", "video", "media", "asset", "download")):
+                        score += 25
+                    if any(token in path_text for token in ("input", "reference", "source_image", "uploaded_image")):
+                        score -= 80
+                    if any(token in child.lower() for token in (".mp4", ".mov", ".m4v", "video")):
+                        score += 30
+                    url_candidates.append((score, "preview" in key_lower or "preview" in path_text, child))
+
+                walk(child, child_path)
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                walk(child, path + (str(index),))
+
+    walk(payload)
+    if url_candidates:
+        url_candidates.sort(key=lambda item: item[0], reverse=True)
+        for _score, is_preview, url in url_candidates:
+            if is_preview and not result.get("preview_url"):
+                result["preview_url"] = url
+            elif not is_preview and not result.get("url"):
+                result["url"] = url
+        if not result.get("url"):
+            result["url"] = url_candidates[0][2]
+    return result
+
+
 def check_creation_status(api_key: str, magnific_token: str, creation_id: str) -> dict:
     """Check a Magnific creation's status via MCP."""
     mcp_servers = [{
@@ -3136,34 +3203,30 @@ def check_creation_status(api_key: str, magnific_token: str, creation_id: str) -
                     k = cleaned.rfind("}") + 1
                     if j >= 0 and k > j:
                         parsed = json.loads(cleaned[j:k])
-                        result.update({k2: v for k2, v in parsed.items() if v is not None})
-                except json.JSONDecodeError:
+                        _extract_status_payload(parsed, result)
+                        for field in ("status", "url", "preview_url"):
+                            if parsed.get(field):
+                                result[field] = parsed[field]
+                except (json.JSONDecodeError, TypeError):
                     pass
 
-            elif block.type == "mcp_tool_result":
-                if hasattr(block, "content") and block.content:
-                    for sub in block.content:
-                        if hasattr(sub, "text"):
-                            try:
-                                tr = json.loads(sub.text)
-                                if isinstance(tr, dict):
-                                    # Extract video URL from creation data
-                                    for url_key in ["url", "videoUrl", "video_url", "previewUrl", "preview_url"]:
-                                        if url_key in tr and tr[url_key]:
-                                            if "preview" in url_key.lower():
-                                                result["preview_url"] = tr[url_key]
-                                            else:
-                                                result["url"] = tr[url_key]
-                                    if "status" in tr:
-                                        result["status"] = tr["status"]
-                            except (json.JSONDecodeError, TypeError):
-                                pass
+            elif block.type == "mcp_tool_result" and getattr(block, "content", None):
+                for sub in block.content:
+                    if not hasattr(sub, "text"):
+                        continue
+                    try:
+                        tool_payload = json.loads(sub.text)
+                        _extract_status_payload(tool_payload, result)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
 
+        # Never mark the job finished until an actual output URL is available.
+        if result.get("status") == "completed" and not (result.get("url") or result.get("preview_url")):
+            result["status"] = "processing"
         return result
 
     except Exception as e:
         return {"status": "error", "url": None, "error": str(e)}
-
 
 def push_generated_image_to_director(
     ingest_key: str,
@@ -5151,11 +5214,15 @@ def main():
                         if approved_image_url:
                             saved_gens[refresh_index]["lifestyle_image_url"] = approved_image_url
                     else:
-                        saved_gens[refresh_index]["status"] = status_result.get("status", refresh_status)
+                        refreshed_status = status_result.get("status", refresh_status)
+                        saved_gens[refresh_index]["status"] = refreshed_status
                         if status_result.get("url"):
                             saved_gens[refresh_index]["url"] = status_result["url"]
                         if status_result.get("preview_url"):
                             saved_gens[refresh_index]["preview_url"] = status_result["preview_url"]
+                        if refreshed_status == "completed" and (status_result.get("url") or status_result.get("preview_url")):
+                            saved_gens[refresh_index]["completed_at"] = datetime.now().isoformat()
+                            saved_gens[refresh_index]["video_refresh_key"] = f"{refresh_creation_id}-{time.time_ns()}"
                     refreshed_any = True
             if refreshed_any:
                 save_generations(saved_gens)
@@ -5314,11 +5381,17 @@ def main():
                                 if lifestyle_url:
                                     saved_gens[i]["lifestyle_image_url"] = lifestyle_url
                             else:
-                                saved_gens[i]["status"] = status_result.get("status", status)
+                                refreshed_status = status_result.get("status", status)
+                                saved_gens[i]["status"] = refreshed_status
                                 if status_result.get("url"):
                                     saved_gens[i]["url"] = status_result["url"]
                                 if status_result.get("preview_url"):
                                     saved_gens[i]["preview_url"] = status_result["preview_url"]
+                                if refreshed_status == "completed" and (status_result.get("url") or status_result.get("preview_url")):
+                                    saved_gens[i]["completed_at"] = datetime.now().isoformat()
+                                    saved_gens[i]["video_refresh_key"] = f"{creation_id}-{time.time_ns()}"
+                            st.session_state["selected_generation_key"] = str(creation_id)
+                            st.session_state["video_refresh_nonce"] = time.time_ns()
                             save_generations(saved_gens)
                             st.rerun()
 
@@ -5474,12 +5547,18 @@ def main():
                                 ) or result.get("audio_track", "")
                                 new_result["audio_volume_pct"] = 100
                                 new_result["generated_at"] = datetime.now().isoformat()
-                                new_generation_key = str(
-                                    new_result.get("creation_id") or new_result["generated_at"]
-                                )
-                                add_generation(new_result)
-                                st.session_state["selected_generation_key"] = new_generation_key
-                                st.rerun()
+                                new_result["regenerated_from_creation_id"] = creation_id
+                                new_result.pop("processed_path", None)
+                                new_result.pop("processed_at", None)
+                                new_creation_id = new_result.get("creation_id")
+                                if not new_creation_id:
+                                    st.error(new_result.get("error") or "Magnific did not return a new creation ID, so the old video was left selected.")
+                                else:
+                                    new_generation_key = str(new_creation_id)
+                                    add_generation(new_result)
+                                    st.session_state["selected_generation_key"] = new_generation_key
+                                    st.session_state["video_refresh_nonce"] = time.time_ns()
+                                    st.rerun()
 
                 is_lifestyle_result = result.get("style") == "lifestyle_animation"
                 is_image_stage = is_lifestyle_result and result.get("pipeline_stage") == "image"
@@ -5494,11 +5573,18 @@ def main():
 
                     with original_preview_col:
                         st.markdown("#### Original video")
+                        preview_cache_key = str(
+                            result.get("video_refresh_key")
+                            or result.get("creation_id")
+                            or result.get("completed_at")
+                            or result.get("generated_at")
+                            or i
+                        )
+                        original_bytes = fetch_video_bytes(video_url, preview_cache_key)
                         try:
-                            st.video(video_url)
+                            st.video(original_bytes if original_bytes else video_url)
                         except Exception:
                             st.markdown(f"🎬 [Watch original video]({video_url})")
-                        original_bytes = fetch_video_bytes(video_url)
                         if original_bytes:
                             st.download_button(
                                 "⬇️ Download original",
