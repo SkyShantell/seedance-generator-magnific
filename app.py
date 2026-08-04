@@ -1033,12 +1033,48 @@ def choose_random_audio_track(exclude: str | None = None) -> str:
     return random.SystemRandom().choice(choices).name
 
 
+VIDEO_COLOR_FILTER_SETTINGS = {
+    "temperature": -3,
+    "tint": 2,
+    "saturation": -6,
+    "exposure": -3,
+    "contrast": 12,
+    "highlights": -35,
+    "shadows": 18,
+    "fade": 6,
+}
+
+VIDEO_COLOR_FILTER_LABEL = (
+    "Temp -3 · Tint +2 · Saturation -6 · Exposure -3 · Contrast +12 · "
+    "Highlights -35 · Shadows +18 · Fade +6"
+)
+
+
+def ffmpeg_color_filter_chain(enabled: bool) -> str:
+    """Return an FFmpeg approximation of the saved mobile-editor color preset."""
+    if not enabled:
+        return ""
+
+    # FFmpeg uses different scales than mobile editors. These values map the requested
+    # controls to a cooler image, slight magenta tint, lower saturation/exposure,
+    # stronger contrast, compressed highlights, lifted shadows, and a subtle fade.
+    return (
+        "colorbalance="
+        "rs=-0.015:gs=-0.006:bs=0.020:"
+        "rm=0.006:gm=-0.010:bm=0.008:"
+        "rh=-0.010:gh=-0.004:bh=0.018,"
+        "eq=brightness=-0.030:contrast=1.120:saturation=0.940,"
+        "curves=all='0/0.06 0.18/0.26 0.50/0.50 0.82/0.73 1/0.89'"
+    )
+
+
 def processed_video_path(
     creation_id: str | None,
     hook: str,
     settings: dict,
     audio_track: str | None = None,
     audio_volume_pct: int = 100,
+    apply_color_filter: bool = False,
 ) -> Path:
     """Create a stable output filename based on text and soundtrack settings."""
     key_data = json.dumps(
@@ -1047,6 +1083,7 @@ def processed_video_path(
             "settings": settings,
             "audio_track": audio_track or "",
             "audio_volume_pct": int(audio_volume_pct),
+            "apply_color_filter": bool(apply_color_filter),
         },
         sort_keys=True,
         ensure_ascii=False,
@@ -1063,8 +1100,9 @@ def apply_text_with_ffmpeg(
     settings: dict,
     audio_track: str | None = None,
     audio_volume_pct: int = 100,
+    apply_color_filter: bool = False,
 ) -> tuple[Path | None, str | None]:
-    """Apply text and an optional looping soundtrack to a generated video."""
+    """Apply text, an optional soundtrack, and the optional saved color preset."""
     if not video_url:
         return None, "No completed video URL is available."
     if not hook.strip():
@@ -1085,6 +1123,7 @@ def apply_text_with_ffmpeg(
         settings,
         audio_track=selected_audio_path.name if selected_audio_path else None,
         audio_volume_pct=audio_volume_pct,
+        apply_color_filter=apply_color_filter,
     )
     if final_path.exists() and final_path.stat().st_size > 0:
         return final_path, None
@@ -1106,6 +1145,15 @@ def apply_text_with_ffmpeg(
             if not overlay_ok:
                 return None, overlay_warning or "Could not build the text overlay."
 
+            color_chain = ffmpeg_color_filter_chain(apply_color_filter)
+            if color_chain:
+                video_filter_graph = (
+                    f"[0:v]{color_chain}[graded];"
+                    "[graded][1:v]overlay=0:0:format=auto:shortest=1[v]"
+                )
+            else:
+                video_filter_graph = "[0:v][1:v]overlay=0:0:format=auto:shortest=1[v]"
+
             if selected_audio_path:
                 volume_factor = max(0.0, min(2.0, int(audio_volume_pct) / 100.0))
                 command = [
@@ -1120,7 +1168,7 @@ def apply_text_with_ffmpeg(
                     "-stream_loop", "-1",
                     "-i", str(selected_audio_path),
                     "-filter_complex",
-                    f"[0:v][1:v]overlay=0:0:format=auto:shortest=1[v];[2:a]volume={volume_factor:.3f}[a]",
+                    f"{video_filter_graph};[2:a]volume={volume_factor:.3f}[a]",
                     "-map", "[v]",
                     "-map", "[a]",
                     "-c:v", "libx264",
@@ -1143,7 +1191,7 @@ def apply_text_with_ffmpeg(
                     "-loop", "1",
                     "-framerate", "30",
                     "-i", str(overlay_path),
-                    "-filter_complex", "[0:v][1:v]overlay=0:0:format=auto:shortest=1[v]",
+                    "-filter_complex", video_filter_graph,
                     "-map", "[v]",
                     "-map", "0:a?",
                     "-c:v", "libx264",
@@ -1212,6 +1260,7 @@ def generation_export_rows(generations: list[dict]) -> list[dict]:
             "sound_tip": item.get("sound_tip", ""),
             "audio_track": item.get("audio_track", ""),
             "audio_volume_pct": item.get("audio_volume_pct", 100),
+            "color_filter_applied": bool(item.get("apply_color_filter", False)),
             "full_caption": full_caption,
             "on_screen_text": item.get("accepted_hook", ""),
             "video_url": video_url,
@@ -1229,7 +1278,7 @@ def generations_csv_bytes(generations: list[dict]) -> bytes:
     rows = generation_export_rows(generations)
     buffer = io.StringIO()
     fieldnames = [
-        "product_name", "product_link", "caption", "hashtags", "sound_tip", "audio_track", "audio_volume_pct", "full_caption",
+        "product_name", "product_link", "caption", "hashtags", "sound_tip", "audio_track", "audio_volume_pct", "color_filter_applied", "full_caption",
         "on_screen_text", "video_url", "processed_video_file", "style",
         "status", "creation_id", "generated_at",
     ]
@@ -1279,8 +1328,9 @@ def apply_text_to_uploaded_video(
     settings: dict,
     audio_track: str | None = None,
     audio_volume_pct: int = 100,
+    apply_color_filter: bool = False,
 ) -> tuple[Path | None, str | None]:
-    """Apply an overlay and optional soundtrack to a user-uploaded MP4 using the same renderer as generated videos."""
+    """Apply text, soundtrack, and the optional saved color preset to an uploaded video."""
     if not video_bytes:
         return None, "Upload a video first."
     if not hook.strip():
@@ -1296,6 +1346,7 @@ def apply_text_to_uploaded_video(
         "hook": hook,
         "audio_track": selected_audio_path.name if selected_audio_path else "",
         "audio_volume_pct": int(audio_volume_pct),
+        "apply_color_filter": bool(apply_color_filter),
     }
     digest_data = video_bytes[:1048576] + json.dumps(
         digest_payload, sort_keys=True, ensure_ascii=False
@@ -1320,13 +1371,22 @@ def apply_text_to_uploaded_video(
             if not overlay_ok:
                 return None, overlay_warning or "Could not build the text overlay."
 
+            color_chain = ffmpeg_color_filter_chain(apply_color_filter)
+            if color_chain:
+                video_filter_graph = (
+                    f"[0:v]{color_chain}[graded];"
+                    "[graded][1:v]overlay=0:0:format=auto:shortest=1[v]"
+                )
+            else:
+                video_filter_graph = "[0:v][1:v]overlay=0:0:format=auto:shortest=1[v]"
+
             if selected_audio_path:
                 volume_factor = max(0.0, min(2.0, int(audio_volume_pct) / 100.0))
                 command = [
                     ffmpeg_path, "-hide_banner", "-loglevel", "error", "-y",
                     "-i", str(input_path), "-loop", "1", "-framerate", "30",
                     "-i", str(overlay_path), "-stream_loop", "-1", "-i", str(selected_audio_path),
-                    "-filter_complex", f"[0:v][1:v]overlay=0:0:format=auto:shortest=1[v];[2:a]volume={volume_factor:.3f}[a]",
+                    "-filter_complex", f"{video_filter_graph};[2:a]volume={volume_factor:.3f}[a]",
                     "-map", "[v]", "-map", "[a]", "-c:v", "libx264",
                     "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
                     "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
@@ -1337,7 +1397,7 @@ def apply_text_to_uploaded_video(
                     ffmpeg_path, "-hide_banner", "-loglevel", "error", "-y",
                     "-i", str(input_path), "-loop", "1", "-framerate", "30",
                     "-i", str(overlay_path),
-                    "-filter_complex", "[0:v][1:v]overlay=0:0:format=auto:shortest=1[v]",
+                    "-filter_complex", video_filter_graph,
                     "-map", "[v]", "-map", "0:a?", "-c:v", "libx264",
                     "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
                     "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
@@ -5139,6 +5199,15 @@ def main():
             else:
                 st.warning("No audio tracks found. Add your 14 files to the `audio_tracks/` folder in GitHub.")
 
+            st.markdown('<span class="preset-pill">COLOR FILTER</span>', unsafe_allow_html=True)
+            upload_apply_color_filter = st.toggle(
+                "Apply saved color filter",
+                value=bool(st.session_state.get("upload_apply_color_filter", False)),
+                key="upload_apply_color_filter",
+                help="Applies the fixed FFmpeg color preset when creating the finished video.",
+            )
+            st.caption(VIDEO_COLOR_FILTER_LABEL)
+
             if st.button("🎨 Add / Update Text", type="primary", use_container_width=True, key="process_uploaded_video"):
                 with st.spinner("Applying text with FFmpeg..."):
                     upload_output, upload_warning = apply_text_to_uploaded_video(
@@ -5148,6 +5217,7 @@ def main():
                         settings=upload_settings,
                         audio_track=upload_selected_audio_track,
                         audio_volume_pct=upload_audio_volume_pct,
+                        apply_color_filter=upload_apply_color_filter,
                     )
                 if upload_output:
                     st.session_state["uploaded_text_output"] = str(upload_output)
@@ -5922,6 +5992,17 @@ def main():
                         else:
                             st.warning("No audio tracks found. Add your 14 files to the `audio_tracks/` folder in GitHub.")
 
+                        st.markdown('<span class="preset-pill">COLOR FILTER</span>', unsafe_allow_html=True)
+                        filter_widget_key = f"apply_color_filter_{i}"
+                        if filter_widget_key not in st.session_state:
+                            st.session_state[filter_widget_key] = bool(result.get("apply_color_filter", False))
+                        apply_color_filter = st.toggle(
+                            "Apply saved color filter",
+                            key=filter_widget_key,
+                            help="Applies the fixed FFmpeg color preset to the final video while keeping the original untouched.",
+                        )
+                        st.caption(VIDEO_COLOR_FILTER_LABEL)
+
                         apply_col, remove_col = st.columns([1.5, 1])
                         apply_label = "🎬 Update final video" if has_processed_version else "🎬 Create final video"
 
@@ -5939,6 +6020,7 @@ def main():
                                     settings=editor_settings,
                                     audio_track=selected_audio_track or None,
                                     audio_volume_pct=audio_volume_pct,
+                                    apply_color_filter=apply_color_filter,
                                 )
 
                             if output_path:
@@ -5954,6 +6036,7 @@ def main():
                                 saved_gens[i]["text_preset_name"] = "Default"
                                 saved_gens[i]["audio_track"] = selected_audio_track
                                 saved_gens[i]["audio_volume_pct"] = audio_volume_pct
+                                saved_gens[i]["apply_color_filter"] = bool(apply_color_filter)
                                 saved_gens[i]["processed_path"] = str(output_path)
                                 saved_gens[i]["processed_at"] = datetime.now().isoformat()
                                 save_generations(saved_gens)
