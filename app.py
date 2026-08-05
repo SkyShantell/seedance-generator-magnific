@@ -1916,8 +1916,10 @@ def infer_lifestyle_default_scene(product_name: str, product_type: str) -> str:
             return "clothing_mirror"
         return "clothing_closet"
     if product_type == "small_handheld":
-        if any(word in normalized for word in ("gummies", "capsules", "supplement", "vitamin", "drink mix", "powder")):
-            return "hand_kitchen"
+        if any(word in normalized for word in ("gummies", "capsules", "supplement", "vitamin", "drink mix", "powder", "prebiotic", "probiotic", "collagen", "sea moss", "enzyme")):
+            return "counter_kitchen"
+        if any(word in normalized for word in ("toothpaste", "mouthwash", "oral", "tooth", "cleanser", "serum", "cream", "lotion", "toner", "deodorant", "soap", "spray")):
+            return "counter_bathroom"
         if any(word in normalized for word in ("perfume", "sleep", "earplugs", "eye mask")):
             return "nightstand"
         return "hand_bathroom"
@@ -1937,6 +1939,18 @@ LIFESTYLE_SCENES = {
         "background": "a bathroom mirror edge, toothbrush holder, and folded towel",
         "hand_present": True,
         "camera_motion": "a small side-to-side handheld arc and slight push-in",
+    },
+    "counter_bathroom": {
+        "label": "On bathroom counter",
+        "types": ["small_handheld", "other"],
+        "setting": (
+            "placed naturally on a clean, realistic bathroom counter or vanity. Keep the surface bright, tidy, and uncluttered with only one or two subtle context items, "
+            "such as a toothbrush holder, folded towel, or soap dish softly out of focus. Use clean natural or soft indoor light so the scene feels clear and well exposed rather than dark"
+        ),
+        "placement": "positioned naturally on a bathroom counter or vanity",
+        "background": "a bright clean bathroom counter with minimal clutter and soft realistic bathroom details",
+        "hand_present": False,
+        "camera_motion": "a gentle handheld side arc with a subtle push-in",
     },
     "hand_kitchen": {
         "label": "Held in hand — kitchen",
@@ -2361,19 +2375,24 @@ def build_lifestyle_image_prompt(
         else "Do not add a person or hand unless it is essential to the user-supplied custom scene. "
     )
     brightness_rule = ""
-    if scene_key in ("hand_kitchen", "counter_kitchen"):
+    if scene_key in ("hand_kitchen", "counter_kitchen", "counter_bathroom"):
         brightness_rule = (
             "Keep the lighting bright, natural, and well exposed. The counter should look clean and realistic with minimal clutter, "
             "not crowded, dirty, messy, or dark. "
         )
-    if supplement_like and scene_key in ("hand_kitchen", "counter_kitchen"):
+    if supplement_like and scene_key in ("hand_kitchen", "counter_kitchen", "counter_bathroom"):
         brightness_rule += (
-            "For supplement or wellness products, make the kitchen-counter scene especially clean and simple, with only one or two subtle "
+            "For supplement or wellness products, make the counter scene especially clean and simple, with only one or two subtle "
             "background objects and no moody shadows. "
         )
+    safety_rule = (
+        "Do not include moving water, fire, steam, dirt, sand, powder clouds, pulsing light, animated electronic screens, pets, animals, or any living beings. "
+        "Do not show cluttered environments, other brand titles, prices, retail messaging, cartoon or abstract environments, spaceships, levitating products, physics-breaking product orientation, or the same environment as the original listing image. "
+        "Keep all visible text clear and readable rather than warped, hieroglyphic, or illegible. The product must be fully visible in frame during image generation, correctly scaled, correctly colored, and realistically lit so it matches the environment. "
+    )
     return (
         f"{LIFESTYLE_IPHONE_STYLE}Photograph the exact {product_name} as {profile['description']}, {scene['setting']}. "
-        f"{profile['framing']} {hand_rule}{brightness_rule}Use all uploaded images as strict visual references for the real product: preserve its "
+        f"{profile['framing']} {hand_rule}{brightness_rule}{safety_rule}Use all uploaded images as strict visual references for the real product: preserve its "
         "true dimensions, silhouette, colors, materials, texture, seams, controls, attachments, accessories, logo placement, "
         "physical label text where applicable, and exact proportions. Do not turn a large item into a miniature and do not enlarge "
         "a small item unnaturally. Show only the correct number of products and included parts. The environment should feel lived-in, "
@@ -2403,8 +2422,9 @@ def build_lifestyle_kling_prompt(
         f"{product_details}. Keep the same environment and lighting: {scene['background']}. Only the handheld phone camera moves: "
         f"{scene.get('camera_motion', 'a natural side-to-side arc and slight push-in')}, with realistic parallax, contact shadows, reflections, "
         "depth of field, and small phone micro-shake. For furniture, appliances, vacuums, electronics, fitness equipment, and outdoor products, "
-        "keep the full footprint and major parts visible and correctly attached. Repeat: the product stays fixed while only the camera moves. "
-        "No rendered text, captions, stickers, prices, particles, new people or hands, flicker, broken shadows, hallucinated accessories, "
+        "keep the full footprint and major parts visible and correctly attached. The product must stay entirely in frame and occupy most of the video, ideally 80% or more of the clip. Repeat: the product stays fixed while only the camera moves. "
+        "Do not add moving water, fire, steam, dirt, sand, powder, pulsing lights, animated electronic screens, pets, animals, or living beings. Do not create mismatching lighting between the product and environment, warped or illegible text, mis-colored products, cluttered environments, other brand titles, prices or retail messaging, levitation, physics-breaking orientation, or unrealistic/cartoon/abstract environments. "
+        "No rendered text, captions, stickers, particles, new people or hands, flicker, broken shadows, hallucinated accessories, "
         "miniaturization, scale changes, or polished commercial styling. Sound off. True 9:16."
     )
     return re.sub(r"\s+", " ", prompt).strip()[:2800]
@@ -2571,6 +2591,103 @@ def _extract_raw_title_candidates(html: str):
             if value:
                 candidates.append(value)
     return candidates
+
+
+def _extract_visible_text_excerpt(html: str, limit: int = 2400) -> str:
+    """Get a compact visible-text excerpt from a page for fallback title recovery."""
+    try:
+        cleaned = re.sub(r"<script\b.*?</script>", " ", html, flags=re.IGNORECASE | re.DOTALL)
+        cleaned = re.sub(r"<style\b.*?</style>", " ", cleaned, flags=re.IGNORECASE | re.DOTALL)
+        cleaned = re.sub(r"<noscript\b.*?</noscript>", " ", cleaned, flags=re.IGNORECASE | re.DOTALL)
+        cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+        cleaned = html_unescape(cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        noisy = [
+            "tiktok", "shop", "for you", "following", "friends", "live", "upload", "search",
+            "download app", "log in", "sign up", "privacy policy", "terms of service"
+        ]
+        parts = []
+        for chunk in re.split(r"(?<=[.!?])\s+|\s+[|•]\s+", cleaned):
+            chunk_clean = chunk.strip()
+            if len(chunk_clean) < 3:
+                continue
+            lowered = chunk_clean.lower()
+            if sum(marker in lowered for marker in noisy) >= 3:
+                continue
+            parts.append(chunk_clean)
+            if len(" ".join(parts)) >= limit:
+                break
+        excerpt = " ".join(parts)
+        return excerpt[:limit]
+    except Exception:
+        return ""
+
+
+def recover_product_name_with_page_context(api_key: str, html: str, image_urls: list[str], page_url: str = "", product_id: str = "") -> str:
+    """Fallback product-name recovery using page text plus up to 3 images."""
+    if not api_key:
+        return ""
+
+    visible_text = _extract_visible_text_excerpt(html)
+    image_blocks = []
+    for image_url in list(image_urls or [])[:3]:
+        try:
+            response = requests.get(image_url, headers=HEADERS, timeout=30)
+            response.raise_for_status()
+            media_type = (response.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip().lower()
+            if media_type not in {"image/jpeg", "image/png", "image/webp", "image/gif"}:
+                suffix = Path(urlparse(image_url).path).suffix.lower()
+                media_type = {
+                    ".png": "image/png",
+                    ".webp": "image/webp",
+                    ".gif": "image/gif",
+                }.get(suffix, "image/jpeg")
+            image_blocks.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": base64.b64encode(response.content).decode("ascii"),
+                },
+            })
+        except Exception:
+            continue
+
+    if not visible_text and not image_blocks:
+        return ""
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        content = []
+        if visible_text:
+            content.append({"type": "text", "text": f"Visible page text excerpt:\n{visible_text[:2400]}"})
+        content.extend(image_blocks)
+        content.append({
+            "type": "text",
+            "text": (
+                "Recover the real product name for this TikTok Shop item. Use the visible page text and listing images. "
+                + (f"TikTok product ID: {product_id}. " if product_id else "")
+                + (f"Page URL: {page_url}. " if page_url else "")
+                + "Return the clearest concise retail product name only, based on what is actually visible. Do not invent claims, sizes, or variants that are not visible."
+            ),
+        })
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=250,
+            system=(
+                "You identify retail product names from weak e-commerce page signals. Read only what is actually shown in the page text or images. "
+                "Return ONLY JSON: {\"product_name\":\"...\",\"confidence\":\"high|medium|low\"}."
+            ),
+            messages=[{"role": "user", "content": content}],
+        )
+        text_blocks = [block.text for block in response.content if getattr(block, "type", "") == "text"]
+        parsed = _extract_json_object("\n".join(text_blocks))
+        candidate = _clean_product_name_candidate((parsed or {}).get("product_name", ""))
+        if candidate.lower() in {"", "unknown", "unknown product", "product"}:
+            return ""
+        return candidate[:100]
+    except Exception:
+        return ""
 
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".avif")
@@ -2920,6 +3037,18 @@ def scrape_product(url: str, api_key: str = "") -> dict | None:
                     break
 
         product_id = _product_id_from_url(resp.url) or _product_id_from_url(url)
+        if (not name or name == "Unknown Product") and api_key:
+            recovered_name = recover_product_name_with_page_context(
+                api_key=api_key,
+                html=html,
+                image_urls=all_images,
+                page_url=resp.url,
+                product_id=product_id,
+            )
+            if recovered_name:
+                name = recovered_name
+                name_source = "page_context_fallback"
+
         if (not name or name == "Unknown Product") and api_key:
             recovered_name = recover_product_name_from_images(
                 api_key=api_key,
