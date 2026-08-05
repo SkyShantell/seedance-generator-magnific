@@ -7,6 +7,7 @@ generate videos automatically OR get prompts to generate manually.
 
 import streamlit as st
 import anthropic
+import base64
 import csv
 import hashlib
 import io
@@ -2472,7 +2473,7 @@ def _name_from_url(url: str) -> str:
 
 
 def _extract_meta_candidates(html: str):
-    """Read title-like values from meta/link tags regardless of attribute order."""
+    """Read title-like values and canonical URLs from page metadata and image attributes."""
     names = []
     urls = []
 
@@ -2486,11 +2487,21 @@ def _extract_meta_candidates(html: str):
             )
         )
         marker = (attrs.get("property") or attrs.get("name") or attrs.get("itemprop") or "").lower()
-        content = (attrs.get("content") or "").strip()
+        content = re.sub(r"\s+", " ", (attrs.get("content") or "")).strip()
         if not content:
             continue
-        if marker in {"og:title", "twitter:title", "title", "product:name", "product_title"}:
+        if marker in {
+            "og:title", "twitter:title", "title", "product:name", "product_name",
+            "product:title", "product_title", "item:name", "item_name",
+        }:
             names.append(content)
+        elif marker in {"og:description", "twitter:description", "description"}:
+            # TikTok's ID-only product pages sometimes expose the product title only
+            # at the start of a description. Keep the first concise segment as a candidate.
+            first_segment = re.split(r"[|•\n]|\s[-–—]\s|\.\s", content, maxsplit=1)[0].strip()
+            first_segment = re.sub(r"^(shop|buy|discover)\s+", "", first_segment, flags=re.IGNORECASE)
+            if 4 <= len(first_segment) <= 180:
+                names.append(first_segment)
         elif marker in {"og:url", "twitter:url"}:
             urls.append(content)
 
@@ -2506,6 +2517,24 @@ def _extract_meta_candidates(html: str):
         if (attrs.get("rel") or "").lower() == "canonical" and attrs.get("href"):
             urls.append(attrs["href"].strip())
 
+    # Product images frequently carry the title in alt/title/aria-label even when
+    # the page's Open Graph title is generic.
+    for tag in re.findall(r"<img\b[^>]*>", html, flags=re.IGNORECASE):
+        attrs = dict(
+            (key.lower(), html_unescape(value))
+            for key, _quote, value in re.findall(
+                r"([A-Za-z_:][-A-Za-z0-9_:.]*)\s*=\s*([\"'])(.*?)\2",
+                tag,
+                flags=re.DOTALL,
+            )
+        )
+        for attr_name in ("alt", "title", "aria-label"):
+            candidate = re.sub(r"\s+", " ", attrs.get(attr_name, "")).strip()
+            if 4 <= len(candidate) <= 180 and candidate.lower() not in {
+                "image", "product image", "tiktok shop", "shop", "photo"
+            }:
+                names.append(candidate)
+
     title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
     if title_match:
         names.append(re.sub(r"<[^>]+>", " ", title_match.group(1)))
@@ -2520,6 +2549,9 @@ def _extract_raw_title_candidates(html: str):
         "product_name", "productName", "product_title", "productTitle",
         "item_name", "itemName", "item_title", "itemTitle",
         "display_name", "displayName", "seo_title", "seoTitle",
+        "goods_name", "goodsName", "goods_title", "goodsTitle",
+        "share_title", "shareTitle", "product_display_name", "productDisplayName",
+        "sku_name", "skuName", "listing_name", "listingName",
     )
     key_pattern = "|".join(re.escape(key) for key in keys)
     patterns = [
@@ -2657,25 +2689,140 @@ def _find_product_names_in_dict(obj, depth=0, max_depth=10):
     return names
 
 
+def _product_id_from_url(url: str) -> str:
+    """Extract the numeric TikTok Shop product identifier from ID-only share links."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return ""
+    match = re.search(r"/(?:view/)?product/(\d{12,24})(?:/|$)", parsed.path, flags=re.IGNORECASE)
+    return match.group(1) if match else ""
+
+
+def _clean_product_name_candidate(value: str) -> str:
+    """Normalize a possible retail title without inventing missing wording."""
+    candidate = re.sub(r"\s+", " ", html_unescape(str(value or ""))).strip(" -|–—:;,.\t\r\n")
+    candidate = re.sub(
+        r"\s*[|–—]\s*(TikTok(?: Shop)?|Shop|Buy Now|Free Shipping).*$",
+        "",
+        candidate,
+        flags=re.IGNORECASE,
+    ).strip()
+    candidate = re.sub(r"^(product|item|shop)\s*[:|-]\s*", "", candidate, flags=re.IGNORECASE)
+    return candidate[:180].strip()
+
+
+def recover_product_name_from_images(api_key: str, image_urls: list[str], product_id: str = "") -> str:
+    """Use Claude vision only as a fallback when an ID-only TikTok page exposes no title.
+
+    The model is told to read visible brand/product wording and avoid fabricating a
+    long marketplace title. This call runs only for an otherwise unnamed product.
+    """
+    if not api_key:
+        return ""
+
+    image_blocks = []
+    for image_url in list(image_urls or [])[:3]:
+        try:
+            response = requests.get(image_url, headers=HEADERS, timeout=30)
+            response.raise_for_status()
+            media_type = (response.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip().lower()
+            if media_type not in {"image/jpeg", "image/png", "image/webp", "image/gif"}:
+                suffix = Path(urlparse(image_url).path).suffix.lower()
+                media_type = {
+                    ".png": "image/png",
+                    ".webp": "image/webp",
+                    ".gif": "image/gif",
+                }.get(suffix, "image/jpeg")
+            image_blocks.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": base64.b64encode(response.content).decode("ascii"),
+                },
+            })
+        except Exception:
+            continue
+
+    if not image_blocks:
+        return ""
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=300,
+            system=(
+                "Identify a retail product from TikTok Shop listing images. Read only visible brand, product, variant, "
+                "and packaging wording. Return a concise, useful product name. Do not invent benefits, size, flavor, "
+                "model, or marketplace wording that is not visible. If the exact long listing title is unavailable, "
+                "return the visible brand plus the clearest product type. Return ONLY JSON: "
+                '{"product_name":"...","confidence":"high|medium|low"}'
+            ),
+            messages=[{
+                "role": "user",
+                "content": image_blocks + [{
+                    "type": "text",
+                    "text": (
+                        "Read the product name from these listing images. "
+                        + (f"TikTok product ID: {product_id}. " if product_id else "")
+                        + "Do not return Unknown Product unless there is truly no readable product identity."
+                    ),
+                }],
+            }],
+        )
+        text_blocks = [block.text for block in response.content if getattr(block, "type", "") == "text"]
+        parsed = _extract_json_object("\n".join(text_blocks))
+        candidate = _clean_product_name_candidate((parsed or {}).get("product_name", ""))
+        if candidate.lower() in {"", "unknown", "unknown product", "product"}:
+            return ""
+        return candidate[:100]
+    except Exception:
+        return ""
+
+
 def _best_product_name(candidates):
     """Choose the most product-like title from scraped candidates."""
     cleaned = []
+    generic_markers = {
+        "unknown product", "tiktok shop", "tiktok", "shop", "product", "view product",
+        "log in", "sign up", "for you", "discover", "shopping made easy",
+    }
     for value in candidates:
-        if not value:
+        candidate = _clean_product_name_candidate(value)
+        if not candidate or candidate.lower() in generic_markers:
             continue
-        value = re.sub(r"\s+", " ", html_unescape(str(value))).strip()
-        value = re.sub(r'\s*[|\-–—]\s*(TikTok|Shop|Amazon|Walmart).*$', '', value, flags=re.IGNORECASE)
-        if value and value.lower() not in {"unknown product", "tiktok shop", "tiktok", "shop"}:
-            cleaned.append(value)
+        if candidate.startswith(("http://", "https://")) or candidate.isdigit():
+            continue
+        # Reject shell-page or cookie/captcha copy rather than forwarding it as a title.
+        lowered = candidate.lower()
+        if any(marker in lowered for marker in (
+            "enable javascript", "verify to continue", "captcha", "privacy policy",
+            "terms of service", "download the app", "something went wrong",
+        )):
+            continue
+        if len(candidate.split()) > 30:
+            continue
+        cleaned.append(candidate)
+
     if not cleaned:
         return ""
-    # Prefer descriptive titles with several words, without choosing huge page blobs.
+
     cleaned = list(dict.fromkeys(cleaned))
-    cleaned.sort(key=lambda x: (2 <= len(x.split()) <= 14, len(x.split()), len(x)), reverse=True)
+
+    def score(candidate: str):
+        words = candidate.split()
+        product_word_bonus = 1 if 2 <= len(words) <= 18 else 0
+        brand_title_bonus = 1 if any(char.isupper() for char in candidate) else 0
+        punctuation_penalty = -1 if candidate.count(":") + candidate.count(";") > 2 else 0
+        return product_word_bonus, brand_title_bonus, punctuation_penalty, min(len(words), 18), len(candidate)
+
+    cleaned.sort(key=score, reverse=True)
     return cleaned[0][:100]
 
 
-def scrape_product(url: str) -> dict | None:
+def scrape_product(url: str, api_key: str = "") -> dict | None:
     try:
         resp = requests.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
         resp.raise_for_status()
@@ -2761,19 +2908,36 @@ def scrape_product(url: str) -> dict | None:
             return None
 
         name = _best_product_name(name_candidates)
+        name_source = "page_metadata" if name else ""
         if not name or name == "Unknown Product":
-            # Short share links often redirect to a full PDP URL containing the product slug.
+            # Slug-based PDP and short-share redirects can still expose a readable name.
             fallback_urls = [resp.url] + meta_url_candidates + [url]
             for fallback_url in fallback_urls:
                 candidate_name = _name_from_url(fallback_url)
                 if candidate_name and candidate_name != "Unknown Product":
                     name = candidate_name
+                    name_source = "url_slug"
                     break
+
+        product_id = _product_id_from_url(resp.url) or _product_id_from_url(url)
+        if (not name or name == "Unknown Product") and api_key:
+            recovered_name = recover_product_name_from_images(
+                api_key=api_key,
+                image_urls=all_images,
+                product_id=product_id,
+            )
+            if recovered_name:
+                name = recovered_name
+                name_source = "image_fallback"
+
         if not name:
             name = "Unknown Product"
+            name_source = "unresolved"
 
         return {
             "name": name[:100],
+            "name_source": name_source,
+            "product_id": product_id,
             "images": all_images[:36],
             "listing_images": listing_images[:18],
             "review_images": review_images[:24],
@@ -3618,6 +3782,7 @@ def mark_seedance_queue_batch_imported(
 def normalize_sniper_batch_products(
     batch: dict,
     progress_callback=None,
+    api_key: str = "",
 ) -> tuple[list[dict], list[str]]:
     """Re-scrape Sniper TikTok links with Seedance's normal scrape flow.
 
@@ -3644,7 +3809,7 @@ def normalize_sniper_batch_products(
 
         freshly_scraped = None
         if source_url.startswith(("http://", "https://")):
-            freshly_scraped = scrape_product(source_url)
+            freshly_scraped = scrape_product(source_url, api_key=api_key)
 
         if freshly_scraped and freshly_scraped.get("images"):
             scraped_name = str(freshly_scraped.get("name") or "").strip()
@@ -4111,6 +4276,7 @@ def main():
                         imported_products, skipped_products = normalize_sniper_batch_products(
                             selected_batch,
                             progress_callback=update_sniper_scrape_progress,
+                            api_key=api_key,
                         )
                     scrape_progress.progress(1.0, text="TikTok photo scrape complete.")
 
@@ -4193,7 +4359,7 @@ def main():
 
         for i, url in enumerate(links):
             progress.progress(i / len(links), text=f"Scraping {i+1}/{len(links)}...")
-            scraped = scrape_product(url)
+            scraped = scrape_product(url, api_key=api_key)
 
             if scraped and scraped["images"]:
                 scraped_products.append(scraped)
@@ -4267,6 +4433,8 @@ def main():
 
             if edited_name == "Unknown Product":
                 st.warning("TikTok did not expose a product title. Enter the product name above before generating hooks.")
+            elif product.get("name_source") == "image_fallback":
+                st.caption("Product name recovered from the listing image because this TikTok ID-only link did not expose a readable title.")
 
             st.caption(f"Source: {product['source_url'][:100]}...")
             if product.get("sniper_caption"):
