@@ -1941,11 +1941,12 @@ LIFESTYLE_SCENES = {
         "label": "Held in hand — kitchen",
         "types": ["small_handheld", "other"],
         "setting": (
-            "held in one hand over a real kitchen countertop. A water glass, coffee mug, cutting-board edge, and fruit bowl "
-            "appear softly out of focus. Morning window light comes from the side"
+            "held in one hand over a clean, realistic kitchen countertop. Keep the space bright and tidy with only light context, "
+            "such as a single water glass, a simple mug, or a subtle cutting-board edge softly out of focus. Use bright natural "
+            "window light from the side so the scene feels airy, realistic, and well exposed rather than dark"
         ),
-        "placement": "held in one hand over a kitchen countertop",
-        "background": "a water glass, coffee mug, cutting-board edge, and normal kitchen counter",
+        "placement": "held in one hand over a clean kitchen countertop",
+        "background": "a bright realistic kitchen counter with only a water glass, simple mug, or light kitchen detail",
         "hand_present": True,
         "camera_motion": "a gentle handheld reframe and tiny push-in",
     },
@@ -1953,11 +1954,13 @@ LIFESTYLE_SCENES = {
         "label": "On kitchen counter",
         "types": ["small_handheld", "countertop_appliance", "electronics", "other"],
         "setting": (
-            "placed naturally on a lived-in kitchen countertop, slightly off-center. A coffee mug, phone, dish towel, and "
-            "paper towel roll sit nearby. Natural window light comes from one side"
+            "placed naturally on a clean, realistic kitchen countertop, slightly off-center. Keep the counter mostly clear with "
+            "only one or two simple nearby items such as a mug, a folded dish towel, or a subtle everyday kitchen detail. The "
+            "scene should feel realistic and lived-in but not messy or crowded. Use bright natural side light so the image feels "
+            "clean, clear, and well exposed rather than dark or moody"
         ),
-        "placement": "positioned naturally on a kitchen countertop",
-        "background": "a lived-in kitchen counter with a mug, dish towel, and ordinary kitchen details",
+        "placement": "positioned naturally on a clean kitchen countertop",
+        "background": "a clean realistic kitchen counter with minimal clutter and soft natural light",
         "hand_present": False,
         "camera_motion": "a slow phone-camera half-arc with mild parallax",
     },
@@ -2347,14 +2350,29 @@ def build_lifestyle_image_prompt(
 ) -> str:
     scene = resolve_lifestyle_scene(scene_key, custom_scene)
     profile = LIFESTYLE_PRODUCT_TYPES.get(product_type, LIFESTYLE_PRODUCT_TYPES["other"])
+    normalized_name = (product_name or "").lower()
+    supplement_like = any(word in normalized_name for word in (
+        "gummies", "capsules", "supplement", "vitamin", "powder", "drink mix", "prebiotic", "probiotic", "sea moss", "enzyme", "collagen"
+    ))
     hand_rule = (
         "Show one natural hand only, with correct fingers and a believable grip; the hand must not hide the product. "
         if scene.get("hand_present")
         else "Do not add a person or hand unless it is essential to the user-supplied custom scene. "
     )
+    brightness_rule = ""
+    if scene_key in ("hand_kitchen", "counter_kitchen"):
+        brightness_rule = (
+            "Keep the lighting bright, natural, and well exposed. The counter should look clean and realistic with minimal clutter, "
+            "not crowded, dirty, messy, or dark. "
+        )
+    if supplement_like and scene_key in ("hand_kitchen", "counter_kitchen"):
+        brightness_rule += (
+            "For supplement or wellness products, make the kitchen-counter scene especially clean and simple, with only one or two subtle "
+            "background objects and no moody shadows. "
+        )
     return (
         f"{LIFESTYLE_IPHONE_STYLE}Photograph the exact {product_name} as {profile['description']}, {scene['setting']}. "
-        f"{profile['framing']} {hand_rule}Use all uploaded images as strict visual references for the real product: preserve its "
+        f"{profile['framing']} {hand_rule}{brightness_rule}Use all uploaded images as strict visual references for the real product: preserve its "
         "true dimensions, silhouette, colors, materials, texture, seams, controls, attachments, accessories, logo placement, "
         "physical label text where applicable, and exact proportions. Do not turn a large item into a miniature and do not enlarge "
         "a small item unnaturally. Show only the correct number of products and included parts. The environment should feel lived-in, "
