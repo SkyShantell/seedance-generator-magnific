@@ -2436,10 +2436,13 @@ STYLE_LABELS = {
     "warehouse": "🏬 Warehouse",
     "pool": "🏝️ Pool",
     "lifestyle_animation": "📸 Lifestyle Animation",
+    "avatar_outfit": "🪞 Avatar Outfit",
 }
 
 LIFESTYLE_IMAGE_MODEL_LABEL = "Grok Imagine Image Quality · 2k · 9:16"
 LIFESTYLE_VIDEO_MODEL_LABEL = "Kling O1 · 720p · 5s · start frame"
+AVATAR_OUTFIT_IMAGE_MODEL_LABEL = "GPT Image 2 · 2k · High · 9:16 · Magnific · 2 references"
+AVATAR_OUTFIT_VIDEO_MODEL_LABEL = "Kling O1 · 720p · ~8s · start frame"
 
 
 def resolved_style_duration(style: str, selected_duration: int = 15) -> int:
@@ -2449,6 +2452,8 @@ def resolved_style_duration(style: str, selected_duration: int = 15) -> int:
         return 8
     if style == "lifestyle_animation":
         return 5
+    if style == "avatar_outfit":
+        return 8
     return int(selected_duration)
 
 
@@ -4005,6 +4010,631 @@ def normalize_sniper_batch_products(
 
     return normalized, skipped
 
+
+# ═══════════════════════════════════════════════════════════════════
+#  AVATAR OUTFIT — two-skill workflow
+#  Skill 1: avatar + outfit -> mirror-selfie try-on image
+#  Skill 2: approved image -> Kling O1 mirror-selfie video
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _uploaded_image_payload(uploaded_file) -> tuple[bytes, str, str]:
+    """Return bytes, mime type, and a base64 data URI for a Streamlit upload."""
+    if uploaded_file is None:
+        return b"", "image/jpeg", ""
+    data = uploaded_file.getvalue()
+    mime = (getattr(uploaded_file, "type", None) or "image/jpeg").lower()
+    if mime not in {"image/jpeg", "image/png", "image/webp", "image/gif"}:
+        suffix = Path(getattr(uploaded_file, "name", "")).suffix.lower()
+        mime = {
+            ".png": "image/png",
+            ".webp": "image/webp",
+            ".gif": "image/gif",
+        }.get(suffix, "image/jpeg")
+    data_uri = f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+    return data, mime, data_uri
+
+
+def analyze_avatar_outfit_images(
+    api_key: str,
+    avatar_bytes: bytes,
+    avatar_mime: str,
+    outfit_bytes: bytes,
+    outfit_mime: str,
+) -> dict:
+    """Analyze the two skill inputs using the uploaded-skill rules."""
+    if not api_key:
+        return {"error": "Anthropic API key is missing."}
+    if not avatar_bytes or not outfit_bytes:
+        return {"error": "Upload both the avatar image and the outfit image."}
+
+    system = """You analyze two images for an AI-avatar clothing try-on workflow.
+Image 1 is the AVATAR. Image 2 is the OUTFIT.
+
+For the avatar, describe ONLY visible physical appearance: build, descriptive skin tone, hair style/length/color, visible facial hair, visible face details, and clearly visible tattoos/piercings/features. Do NOT describe the avatar's current clothing. Do NOT use age words. Do NOT use race or ethnicity labels. Do not guess.
+
+For the outfit, describe ONLY the clothing/footwear product, never the person modeling it. Capture garment pieces, silhouette/fit, neckline/collar, visible material look, colors, pattern/print, buttons/zippers/drawstrings/pockets and other visible construction. Do NOT use brand names; describe visual design instead.
+
+Also determine whether shoes are visibly included. If shoes are visible, describe them. If not, return clean white sneakers as the default. If only a top is visible with no matching bottom, set bottom_fallback to black fitted jogger pants; otherwise leave bottom_fallback empty.
+
+Return ONLY valid JSON:
+{
+  "avatar_description":"concise visible physical description",
+  "outfit_description":"rich but concise outfit description",
+  "shoes_description":"visible shoes or clean white sneakers",
+  "bottom_fallback":"black fitted jogger pants or empty string",
+  "outfit_has_shoes":true,
+  "outfit_has_bottom":true
+}"""
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=900,
+            system=system,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": avatar_mime,
+                            "data": base64.b64encode(avatar_bytes).decode("ascii"),
+                        },
+                    },
+                    {"type": "text", "text": "IMAGE 1 — AVATAR. Analyze identity/appearance only. Ignore current clothing."},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": outfit_mime,
+                            "data": base64.b64encode(outfit_bytes).decode("ascii"),
+                        },
+                    },
+                    {"type": "text", "text": "IMAGE 2 — OUTFIT. Analyze garment/footwear only. Ignore any model wearing it."},
+                ],
+            }],
+        )
+        text_blocks = [block.text for block in response.content if getattr(block, "type", "") == "text"]
+        parsed = _extract_json_object("\n".join(text_blocks)) or {}
+        if not parsed.get("avatar_description") or not parsed.get("outfit_description"):
+            return {"error": "Could not extract both avatar and outfit descriptions."}
+        parsed["shoes_description"] = (parsed.get("shoes_description") or "clean white sneakers").strip()
+        parsed["bottom_fallback"] = (parsed.get("bottom_fallback") or "").strip()
+        return parsed
+    except Exception as exc:
+        return {"error": f"Avatar/outfit analysis failed: {exc}"}
+
+
+def build_avatar_outfit_image_prompt(
+    avatar_description: str,
+    outfit_description: str,
+    shoes_description: str,
+    bottom_fallback: str = "",
+) -> str:
+    """Build the image prompt from the kling-tryon-image skill."""
+    outfit_line = outfit_description.strip()
+    if bottom_fallback:
+        outfit_line += f" Pair the visible top with {bottom_fallback}."
+
+    prompt = f"""Generate an image that looks like an authentic iPhone 15 Pro mirror selfie taken in a dimly lit room at night. Portrait orientation, 9:16 aspect ratio.
+
+Use the person from the FIRST reference image as the subject. Preserve the exact same identity and visible appearance. Visible avatar reference: {avatar_description}. Do not preserve the avatar's original clothing.
+
+Dress the subject in the outfit from the SECOND reference image. Replicate the clothing exactly: same colors, pattern, fit, silhouette, fabric look and visible construction details. Outfit: {outfit_line}
+
+Shoes: {shoes_description}. Also add a thick gold Cuban link chain necklace, gold luxury wristwatch, and gold rings.
+
+Scene: full-body head-to-toe mirror selfie inside a luxury modern penthouse at night. The subject stands before a full-length mirror and holds a black iPhone 16 in the right hand at face level so the phone partially covers the face. Slightly off-center natural handheld composition. Behind the subject: floor-to-ceiling glass windows, illuminated blue infinity pool, night city skyline and palm trees, minimalist lounge furniture, warm polished tile floor and warm recessed ceiling lights.
+
+iPhone UGC realism is critical: slight low-light sensor grain/noise in shadows; faint cool phone-screen glow on fingers and near side of face; barely visible mirror smudge/fingerprint; natural pores and skin texture; slightly muted warm iPhone nighttime colors; sharpest focus on torso/outfit with softer frame edges; very subtle free-hand motion blur; mixed warm ceiling light and cool blue pool light; no HDR, studio fill, rim light or beauty lighting; natural shadows; realistic fabric texture and slight worn creases.
+
+It must look like a real TikTok mirror selfie, not an AI render or polished fashion campaign. One person only. Full body entirely in frame. No extra people, pets or animals. No text, captions, prices, watermarks, logos added by the generator, or overlays."""
+    return re.sub(r"\s+", " ", prompt).strip()
+
+
+def build_avatar_outfit_kling_prompt(
+    avatar_description: str,
+    outfit_description: str,
+    shoes_description: str,
+) -> str:
+    """Build a Kling O1 prompt from the kling-mirror-tryon skill and keep it under 1,900 chars."""
+    avatar = re.sub(r"\s+", " ", avatar_description.strip())[:180]
+    outfit = re.sub(r"\s+", " ", outfit_description.strip())[:330]
+    shoes = re.sub(r"\s+", " ", shoes_description.strip())[:100] or "clean white sneakers"
+
+    prompt = f"""9:16 vertical video, single continuous mirror-selfie shot, no cuts. {avatar} stands before a full-length mirror in a luxury penthouse at night, holding a smartphone at face level in the right hand. The phone partially covers the face the entire video. The subject wears {outfit}, {shoes}, a thick gold Cuban link chain, gold luxury watch, and gold rings. Behind the subject: floor-to-ceiling glass, illuminated blue infinity pool, city skyline, palm trees, night sky, warm recessed lighting, polished tile floor.
+
+[00:00-00:02] Standing centered in mirror, full body head-to-toe, legs shoulder-width, upright and still. Outfit clearly displayed from front. Gentle handheld sway.
+
+[00:02-00:04] Shift weight to one side. Free hand lightly touches the shirt or garment front. Slight quarter-turn showing the outfit at an angle. Phone stays at face level covering the face.
+
+[00:04-00:06] Step back for a wider full-body view, shift between legs and turn to show the outfit from the side. Free arm gestures casually. Full outfit remains visible head-to-toe.
+
+[00:06-00:08] Settle into a confident final pose at a slight angle and adjust the watch or chain. Outfit fully displayed. End cleanly.
+
+Preserve the exact avatar identity, outfit colors/pattern/fit, shoes, penthouse environment and lighting from the approved start image. One person only. No animals. No voiceover, on-screen text, captions, subtitles, watermarks, music or sound. Photorealistic iPhone UGC realism."""
+    prompt = re.sub(r"\s+", " ", prompt).strip()
+
+    # The skill requires < 1,900 characters. Trim descriptions before touching the beat structure.
+    if len(prompt) >= 1900:
+        avatar = avatar[:110]
+        outfit = outfit[:220]
+        prompt = f"""9:16 vertical, single continuous mirror-selfie shot, no cuts. {avatar} stands before a full-length mirror in a luxury penthouse at night, holding a phone at face level so it partially covers the face throughout. Wearing {outfit}, {shoes}, thick gold Cuban link chain, gold watch, gold rings. Behind: floor-to-ceiling glass, illuminated blue infinity pool, city skyline, palm trees, warm recessed lights, polished tile.
+[00:00-00:02] Full body head-to-toe, front view, upright and still, gentle handheld sway.
+[00:02-00:04] Shift weight, free hand touches garment front, slight quarter-turn. Phone remains at face level.
+[00:04-00:06] Step back, wider full-body view, turn to show the outfit from the side, casual free-arm gesture.
+[00:06-00:08] Confident final pose at a slight angle, adjust watch or chain, clean ending.
+Preserve exact identity, outfit, shoes, setting and lighting from the approved start image. One person only. No animals. No voiceover, text, captions, subtitles, watermarks, music or sound. Photorealistic iPhone UGC."""
+        prompt = re.sub(r"\s+", " ", prompt).strip()
+    return prompt[:1899]
+
+
+AVATAR_OUTFIT_IMAGE_GENERATE_SYSTEM = """You are an image production assistant with access to Magnific tools.
+Use the same Magnific MCP account already configured in the app.
+1. Upload BOTH provided reference images to Magnific using creations_upload_image.
+2. Reference image 1 is the avatar/identity reference. Preserve this exact person's appearance and identity.
+3. Reference image 2 is the outfit/clothing reference. Use it only for the clothing, shoes, and wearable styling.
+4. Generate EXACTLY ONE final mirror-selfie try-on image.
+5. You MUST use model slug gpt_image_2.
+6. You MUST use quality high.
+7. You MUST use resolution 2k.
+8. You MUST use aspect ratio 9:16.
+9. Do not use GPT Image 1 or any default fallback image model.
+10. Return ONLY valid JSON (no markdown): {"creation_id":"the magnific creation identifier","status":"queued","url":null,"preview_url":null,"error":null}
+"""
+
+
+def generate_avatar_outfit_image_magnific(
+    api_key: str,
+    magnific_token: str,
+    avatar_data_uri: str,
+    outfit_data_uri: str,
+    prompt: str,
+) -> dict:
+    """Use Magnific GPT Image 2 with two references: avatar first, outfit second."""
+    if not api_key:
+        return {"creation_id": None, "status": "error", "error": "The Anthropic API key is missing."}
+    if not magnific_token:
+        return {"creation_id": None, "status": "error", "error": "The Magnific authorization token is missing."}
+    if not avatar_data_uri or not outfit_data_uri:
+        return {"creation_id": None, "status": "error", "error": "Upload both avatar and outfit images."}
+
+    mcp_servers = [{
+        "type": "url",
+        "url": MAGNIFIC_MCP_URL,
+        "name": MAGNIFIC_MCP_NAME,
+    }]
+    if magnific_token:
+        mcp_servers[0]["authorization_token"] = magnific_token
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.beta.messages.create(
+            model=MODEL,
+            max_tokens=2048,
+            system=AVATAR_OUTFIT_IMAGE_GENERATE_SYSTEM,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "Generate one Avatar Outfit mirror-selfie try-on image.\n"
+                    "Required Magnific settings: model slug = gpt_image_2, quality = high, resolution = 2k, aspect ratio = 9:16.\n"
+                    "Reference image 1 below is the avatar identity to preserve exactly.\n"
+                    "Reference image 2 below is the outfit / clothing / shoes reference.\n"
+                    "Upload both references to Magnific using creations_upload_image, then generate the final image.\n\n"
+                    f"Reference image 1 data URI (avatar): {avatar_data_uri}\n\n"
+                    f"Reference image 2 data URI (outfit): {outfit_data_uri}\n\n"
+                    f"Final image prompt:\n{prompt}"
+                ),
+            }],
+            mcp_servers=mcp_servers,
+            tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
+            betas=[MCP_BETA],
+        )
+        result = _parse_magnific_creation_response(response)
+        result["provider"] = "Magnific"
+        result["image_model"] = "gpt_image_2"
+        result["image_quality"] = "high"
+        result["image_resolution"] = "2k"
+        result["image_aspect_ratio"] = "9:16"
+        result["reference_count"] = 2
+        return result
+    except Exception as exc:
+        return {"creation_id": None, "status": "error", "error": f"Avatar Outfit image generation failed: {exc}"}
+
+
+AVATAR_OUTFIT_KLING_SYSTEM = """You are a video production assistant with access to Magnific tools.
+Use the same Magnific MCP account already configured in the app.
+1. Upload the ONE approved Avatar Outfit mirror-selfie image with creations_upload_image.
+2. Generate an image-to-video with video_generate using model slug kling_o1.
+3. The uploaded approved image MUST be the source/start frame.
+4. Use 9:16, 720p, approximately 8 seconds, sound off, and the provided Kling prompt.
+5. Do not use the original avatar image or original outfit image in this video step.
+6. Return the Magnific creation identifier.
+
+Return ONLY valid JSON:
+{"creation_id":"identifier","status":"queued","error":null}
+"""
+
+
+def generate_avatar_outfit_kling_magnific(
+    api_key: str,
+    magnific_token: str,
+    approved_image_url: str,
+    prompt: str,
+) -> dict:
+    """Animate the approved try-on image with Kling O1."""
+    if not api_key:
+        return {"creation_id": None, "status": "error", "error": "Anthropic API key is missing."}
+    if not magnific_token:
+        return {"creation_id": None, "status": "error", "error": "Magnific token is missing."}
+    if not approved_image_url:
+        return {"creation_id": None, "status": "error", "error": "Approve a generated try-on image first."}
+
+    mcp_servers = [{
+        "type": "url",
+        "url": MAGNIFIC_MCP_URL,
+        "name": MAGNIFIC_MCP_NAME,
+        "authorization_token": magnific_token,
+    }]
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.beta.messages.create(
+            model=MODEL,
+            max_tokens=2048,
+            system=AVATAR_OUTFIT_KLING_SYSTEM,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Approved Avatar Outfit start image: {approved_image_url}\n"
+                    "Generate a Kling O1 mirror-selfie try-on video at 720p, 9:16, approximately 8 seconds, sound off. "
+                    "Use the approved image as the start frame.\n\n"
+                    f"Kling prompt:\n{prompt}"
+                ),
+            }],
+            mcp_servers=mcp_servers,
+            tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
+            betas=[MCP_BETA],
+        )
+        return _parse_magnific_creation_response(response)
+    except Exception as exc:
+        return {"creation_id": None, "status": "error", "error": str(exc)}
+
+
+def _reset_avatar_outfit_generated_state() -> None:
+    """Clear generated outputs but leave the uploaded input widgets alone."""
+    for key in (
+        "avatar_outfit_analysis",
+        "avatar_outfit_image_result",
+        "avatar_outfit_image_approved",
+        "avatar_outfit_video_result",
+        "avatar_outfit_input_signature",
+    ):
+        st.session_state.pop(key, None)
+
+
+def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: str) -> None:
+    """Dedicated UI for the two uploaded Avatar Outfit skills."""
+    st.markdown("## 🪞 Avatar Outfit")
+    st.caption(
+        "Two-step flow: upload the avatar first and the outfit second → analyze both → generate the iPhone mirror-selfie try-on image with Magnific GPT Image 2 → approve it → animate that exact image with Kling O1."
+    )
+    st.info(
+        "This workflow intentionally has **no hook text, captions, voiceover, music, or soundtrack** because the uploaded mirror-try-on skill requires a clean silent continuous shot."
+    )
+
+    upload_col_1, upload_col_2 = st.columns(2, gap="large")
+    with upload_col_1:
+        avatar_file = st.file_uploader(
+            "1. Avatar image",
+            type=["jpg", "jpeg", "png", "webp"],
+            key="avatar_outfit_avatar_upload",
+            help="The AI avatar/person whose identity should be preserved. Their current clothes will be ignored.",
+        )
+        if avatar_file is not None:
+            st.image(avatar_file, caption="Avatar reference — identity / appearance", use_container_width=True)
+    with upload_col_2:
+        outfit_file = st.file_uploader(
+            "2. Outfit image",
+            type=["jpg", "jpeg", "png", "webp"],
+            key="avatar_outfit_outfit_upload",
+            help="The clothing product. A flat lay, mannequin, listing image, or model photo is fine; the person in this image is ignored.",
+        )
+        if outfit_file is not None:
+            st.image(outfit_file, caption="Outfit reference — clothing / shoes only", use_container_width=True)
+
+    avatar_bytes, avatar_mime, avatar_data_uri = _uploaded_image_payload(avatar_file)
+    outfit_bytes, outfit_mime, outfit_data_uri = _uploaded_image_payload(outfit_file)
+
+    if avatar_bytes and outfit_bytes:
+        input_signature = hashlib.sha1(avatar_bytes + b"|AVATAR_OUTFIT|" + outfit_bytes).hexdigest()
+        previous_signature = st.session_state.get("avatar_outfit_input_signature")
+        if previous_signature and previous_signature != input_signature:
+            for key in (
+                "avatar_outfit_analysis",
+                "avatar_outfit_image_result",
+                "avatar_outfit_image_approved",
+                "avatar_outfit_video_result",
+            ):
+                st.session_state.pop(key, None)
+        st.session_state["avatar_outfit_input_signature"] = input_signature
+
+    analyze_disabled = not (avatar_bytes and outfit_bytes and api_key)
+    if st.button(
+        "🔎 Step 1 — Analyze Avatar + Outfit",
+        type="primary",
+        use_container_width=True,
+        key="avatar_outfit_analyze_btn",
+        disabled=analyze_disabled,
+    ):
+        with st.spinner("Analyzing the avatar and outfit using the uploaded try-on rules..."):
+            analysis = analyze_avatar_outfit_images(
+                api_key=api_key,
+                avatar_bytes=avatar_bytes,
+                avatar_mime=avatar_mime,
+                outfit_bytes=outfit_bytes,
+                outfit_mime=outfit_mime,
+            )
+        if analysis.get("error"):
+            st.error(analysis["error"])
+        else:
+            st.session_state["avatar_outfit_analysis"] = analysis
+            st.session_state.pop("avatar_outfit_image_result", None)
+            st.session_state.pop("avatar_outfit_image_approved", None)
+            st.session_state.pop("avatar_outfit_video_result", None)
+            st.rerun()
+
+    if not api_key:
+        st.warning("Connect the Anthropic API key above to analyze the two reference images.")
+    if not magnific_token:
+        st.warning("Connect Magnific above to generate the Avatar Outfit try-on image and to run the Kling O1 video step.")
+
+    analysis = st.session_state.get("avatar_outfit_analysis") or {}
+    if not analysis:
+        return
+
+    st.markdown("### Reference analysis")
+    avatar_desc = st.text_area(
+        "Avatar description",
+        value=analysis.get("avatar_description", ""),
+        height=90,
+        key="avatar_outfit_avatar_description",
+        help="The avatar's original clothing is intentionally excluded.",
+    ).strip()
+    outfit_desc = st.text_area(
+        "Outfit description",
+        value=analysis.get("outfit_description", ""),
+        height=120,
+        key="avatar_outfit_outfit_description",
+    ).strip()
+    shoes_desc = st.text_input(
+        "Shoes",
+        value=analysis.get("shoes_description") or "clean white sneakers",
+        key="avatar_outfit_shoes_description",
+        help="Detected from the outfit image when visible; otherwise defaults to clean white sneakers.",
+    ).strip() or "clean white sneakers"
+    bottom_fallback = analysis.get("bottom_fallback", "")
+    if bottom_fallback:
+        st.caption(f"Only a top was detected, so the image skill will pair it with: **{bottom_fallback}**")
+
+    image_prompt = build_avatar_outfit_image_prompt(
+        avatar_description=avatar_desc,
+        outfit_description=outfit_desc,
+        shoes_description=shoes_desc,
+        bottom_fallback=bottom_fallback,
+    )
+    kling_prompt = build_avatar_outfit_kling_prompt(
+        avatar_description=avatar_desc,
+        outfit_description=outfit_desc,
+        shoes_description=shoes_desc,
+    )
+
+    with st.expander("📋 Skill prompts", expanded=False):
+        st.markdown("**Try-on image prompt**")
+        st.code(image_prompt, language=None)
+        st.caption(f"Image model: {AVATAR_OUTFIT_IMAGE_MODEL_LABEL}")
+        st.markdown("**Kling O1 mirror prompt**")
+        st.code(kling_prompt, language=None)
+        st.caption(f"Kling prompt characters: {len(kling_prompt)}/1900 · {AVATAR_OUTFIT_VIDEO_MODEL_LABEL}")
+
+    image_result = st.session_state.get("avatar_outfit_image_result") or {}
+    generated_image_url = image_result.get("url") or image_result.get("preview_url")
+
+    if not generated_image_url:
+        status = (image_result.get("status") or "").lower().strip()
+        creation_id = image_result.get("creation_id")
+        if creation_id and status in {"queued", "processing", "running", "unknown"}:
+            st.info(f"Avatar Outfit image status: **{status or 'processing'}**")
+            if st.button(
+                "🔄 Check image status",
+                use_container_width=True,
+                key="avatar_outfit_check_image_status",
+                disabled=not bool(api_key and magnific_token and creation_id),
+            ):
+                with st.spinner("Checking Magnific image status..."):
+                    refreshed = check_creation_status(api_key=api_key, magnific_token=magnific_token, creation_id=creation_id)
+                merged = {**image_result, **{k: v for k, v in refreshed.items() if v is not None}}
+                st.session_state["avatar_outfit_image_result"] = merged
+                if merged.get("status") == "error" and merged.get("error"):
+                    st.error(merged["error"])
+                st.rerun()
+        if st.button(
+            "🖼️ Step 2 — Generate Avatar Outfit Image",
+            type="primary",
+            use_container_width=True,
+            key="avatar_outfit_generate_image",
+            disabled=not bool(api_key and magnific_token and avatar_data_uri and outfit_data_uri),
+        ):
+            with st.spinner("Generating the mirror-selfie try-on image with Magnific GPT Image 2..."):
+                result = generate_avatar_outfit_image_magnific(
+                    api_key=api_key,
+                    magnific_token=magnific_token,
+                    avatar_data_uri=avatar_data_uri,
+                    outfit_data_uri=outfit_data_uri,
+                    prompt=image_prompt,
+                )
+            if result.get("error"):
+                st.error(result["error"])
+            else:
+                st.session_state["avatar_outfit_image_result"] = result
+                st.session_state["avatar_outfit_image_approved"] = False
+                st.session_state.pop("avatar_outfit_video_result", None)
+                st.rerun()
+        return
+
+    st.markdown("### Generated try-on image")
+    image_col, action_col = st.columns([1.15, 1], gap="large")
+    with image_col:
+        st.image(generated_image_url, use_container_width=True)
+        image_bytes, image_content_type = fetch_image_bytes(generated_image_url)
+        if image_bytes:
+            st.download_button(
+                "⬇️ Download try-on image",
+                data=image_bytes,
+                file_name=f"avatar_outfit_{image_result.get('creation_id', 'image')}.jpg",
+                mime=image_content_type or "image/jpeg",
+                key="avatar_outfit_download_image",
+                use_container_width=True,
+            )
+    with action_col:
+        st.success("Review identity, outfit accuracy, shoes, full-body framing, and mirror realism before approving.")
+        regen_col, approve_col = st.columns(2)
+        if regen_col.button(
+            "🔁 Regenerate image",
+            use_container_width=True,
+            key="avatar_outfit_regen_image",
+            disabled=not bool(api_key and magnific_token),
+        ):
+            with st.spinner("Generating another Magnific GPT Image 2 try-on image with the same two references..."):
+                result = generate_avatar_outfit_image_magnific(
+                    api_key=api_key,
+                    magnific_token=magnific_token,
+                    avatar_data_uri=avatar_data_uri,
+                    outfit_data_uri=outfit_data_uri,
+                    prompt=image_prompt,
+                )
+            if result.get("error"):
+                st.error(result["error"])
+            else:
+                st.session_state["avatar_outfit_image_result"] = result
+                st.session_state["avatar_outfit_image_approved"] = False
+                st.session_state.pop("avatar_outfit_video_result", None)
+                st.rerun()
+        if approve_col.button(
+            "✅ Approve image",
+            type="primary",
+            use_container_width=True,
+            key="avatar_outfit_approve_image",
+        ):
+            st.session_state["avatar_outfit_image_approved"] = True
+            st.rerun()
+
+    if not st.session_state.get("avatar_outfit_image_approved"):
+        st.info("Approve the generated image before sending it to Kling O1.")
+        return
+
+    st.success("Image approved. This exact image will be used as the Kling O1 start frame.")
+    video_result = st.session_state.get("avatar_outfit_video_result") or {}
+    creation_id = video_result.get("creation_id")
+    video_status = video_result.get("status", "")
+
+    if not creation_id:
+        if st.button(
+            "🎬 Step 3 — Generate Kling O1 Mirror Video",
+            type="primary",
+            use_container_width=True,
+            key="avatar_outfit_generate_video",
+            disabled=not bool(api_key and magnific_token),
+        ):
+            with st.spinner("Sending the approved mirror image to Kling O1 as the start frame..."):
+                result = generate_avatar_outfit_kling_magnific(
+                    api_key=api_key,
+                    magnific_token=magnific_token,
+                    approved_image_url=generated_image_url,
+                    prompt=kling_prompt,
+                )
+            if result.get("creation_id"):
+                result["prompt"] = kling_prompt
+                result["approved_image_url"] = generated_image_url
+                result["started_at"] = datetime.now().isoformat()
+                st.session_state["avatar_outfit_video_result"] = result
+                st.rerun()
+            else:
+                st.error(result.get("error", "Magnific did not return a Kling O1 creation ID."))
+        return
+
+    st.markdown("### Kling O1 mirror video")
+    st.caption(f"Creation: {creation_id} · Status: {video_status or 'queued'}")
+
+    status_col, regen_video_col = st.columns(2)
+    refresh_clicked = status_col.button(
+        "🔄 Check video status",
+        use_container_width=True,
+        key="avatar_outfit_check_video",
+        disabled=not bool(api_key and magnific_token),
+    )
+    regen_clicked = regen_video_col.button(
+        "🔁 Regenerate Kling video",
+        use_container_width=True,
+        key="avatar_outfit_regen_video",
+        disabled=not bool(api_key and magnific_token),
+    )
+
+    if refresh_clicked:
+        with st.spinner("Checking Kling O1..."):
+            status_result = check_creation_status(api_key, magnific_token, creation_id)
+        updated = dict(video_result)
+        updated["status"] = status_result.get("status", video_status)
+        if status_result.get("url"):
+            updated["url"] = status_result["url"]
+        if status_result.get("preview_url"):
+            updated["preview_url"] = status_result["preview_url"]
+        updated["last_checked_at"] = datetime.now().isoformat()
+        st.session_state["avatar_outfit_video_result"] = updated
+        st.rerun()
+
+    if regen_clicked:
+        with st.spinner("Creating a new Kling O1 generation from the approved start frame..."):
+            result = generate_avatar_outfit_kling_magnific(
+                api_key=api_key,
+                magnific_token=magnific_token,
+                approved_image_url=generated_image_url,
+                prompt=kling_prompt,
+            )
+        if result.get("creation_id"):
+            result["prompt"] = kling_prompt
+            result["approved_image_url"] = generated_image_url
+            result["started_at"] = datetime.now().isoformat()
+            st.session_state["avatar_outfit_video_result"] = result
+            st.rerun()
+        else:
+            st.error(result.get("error", "Magnific did not return a new Kling O1 creation ID."))
+
+    video_result = st.session_state.get("avatar_outfit_video_result") or {}
+    video_status = video_result.get("status", "")
+    video_url = video_result.get("url") or (video_result.get("preview_url") if video_status == "completed" else None)
+    if video_status == "completed" and video_url:
+        video_bytes = fetch_video_bytes(video_url, cache_key=str(video_result.get("creation_id") or "avatar_outfit"))
+        if video_bytes:
+            st.video(video_bytes)
+            st.download_button(
+                "⬇️ Download Avatar Outfit video",
+                data=video_bytes,
+                file_name=f"avatar_outfit_{video_result.get('creation_id', 'kling')}.mp4",
+                mime="video/mp4",
+                key="avatar_outfit_download_video",
+                use_container_width=True,
+            )
+        else:
+            st.video(video_url)
+    elif video_status == "error":
+        st.error(video_result.get("error") or "Kling O1 generation failed.")
+    else:
+        st.info("Kling O1 is still queued/processing. Use **Check video status** when it is ready.")
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  STREAMLIT UI
 # ═══════════════════════════════════════════════════════════════════
@@ -4025,7 +4655,7 @@ def main():
         <section class="apple-hero">
             <div class="apple-kicker">✦ AI VIDEO WORKSPACE</div>
             <h1>Seedance Studio</h1>
-            <p>Turn TikTok Shop products into Shoe, B-Roll, or Warehouse walk-up videos, then refine the text styling with reusable presets and Apple-style emoji overlays.</p>
+            <p>Turn TikTok Shop products into multiple video formats, or create Avatar Outfit mirror try-ons from an avatar + clothing reference using Magnific GPT Image 2 + Kling O1, then refine supported workflows with the existing editor.</p>
         </section>
         """,
         unsafe_allow_html=True,
@@ -4067,7 +4697,7 @@ def main():
 
         style = st.radio(
             "Video style",
-            options=["shoe_video", "texthook_broll", "warehouse", "pool", "lifestyle_animation"],
+            options=["shoe_video", "texthook_broll", "warehouse", "pool", "lifestyle_animation", "avatar_outfit"],
             format_func=lambda value: STYLE_LABELS[value],
             key="main_video_style",
             horizontal=True,
@@ -4120,6 +4750,13 @@ def main():
                 )
                 st.caption(f"Image model: {LIFESTYLE_IMAGE_MODEL_LABEL}  |  Video model: {LIFESTYLE_VIDEO_MODEL_LABEL}")
             voice_script = None
+        elif style == "avatar_outfit":
+            duration = 8
+            voice_script = None
+            st.info(
+                "Avatar Outfit uses the two uploaded try-on skills as one workflow: upload the avatar and outfit separately, analyze both, generate a 9:16 iPhone-style penthouse mirror selfie with Magnific GPT Image 2, approve it, then use that exact image as the Kling O1 start frame for the silent mirror try-on video."
+            )
+            st.caption(f"Image model: {AVATAR_OUTFIT_IMAGE_MODEL_LABEL}  |  Video model: {AVATAR_OUTFIT_VIDEO_MODEL_LABEL}")
         else:
             duration = 8
             voice_script = None
@@ -4146,7 +4783,7 @@ def main():
         if xai_api_key:
             status_col_3.success("Grok images connected")
         else:
-            status_col_3.info("Grok key needed for Lifestyle")
+            status_col_3.info("Grok key needed for image workflows")
         if director_ingest_key:
             status_col_4.success("Director connected")
         else:
@@ -4157,7 +4794,7 @@ def main():
             status_col_5.info("Sniper inbox optional")
         status_col_6.info(f"{STYLE_LABELS[style]} · {resolved_style_duration(style, duration)}s")
 
-        required_connections_ready = bool(api_key and magnific_token and (xai_api_key if style == "lifestyle_animation" else True))
+        required_connections_ready = bool(api_key and magnific_token and (xai_api_key if style in ("lifestyle_animation", "avatar_outfit") else True))
         with st.expander("API connection", expanded=not required_connections_ready):
             if api_key_from_secrets:
                 st.success("Anthropic API key loaded from Streamlit secrets.")
@@ -4177,7 +4814,7 @@ def main():
                     type="password",
                     value=st.session_state.get("runtime_xai_api_key", ""),
                     key="runtime_xai_api_key_input",
-                    help="Used only to generate Lifestyle approval images with Grok Imagine.",
+                    help="Used to generate Lifestyle approval images with Grok Imagine.",
                 )
 
             st.session_state["runtime_magnific_token"] = st.text_input(
@@ -4261,8 +4898,8 @@ def main():
                 '`SEEDANCE_QUEUE_BRANCH` and `SEEDANCE_QUEUE_PATH` are optional.'
             )
 
-            st.markdown("**xAI key for Lifestyle images**")
-            st.markdown('Add `XAI_API_KEY = "your-key"` to Streamlit secrets, or paste the key in the field above. Grok is used only for the Lifestyle approval image.')
+            st.markdown("**xAI key for image workflows**")
+            st.markdown('Add `XAI_API_KEY = "your-key"` to Streamlit secrets, or paste the key in the field above. Grok is used for Lifestyle approval images.')
 
             st.markdown("**How to refresh the Magnific token**")
             st.markdown("""
@@ -4273,6 +4910,14 @@ def main():
 5. Copy the `access_token` and paste it above.
             """)
 
+
+    if style == "avatar_outfit":
+        render_avatar_outfit_flow(
+            api_key=st.session_state.get("runtime_anthropic_api_key", ""),
+            xai_api_key=st.session_state.get("runtime_xai_api_key", ""),
+            magnific_token=st.session_state.get("runtime_magnific_token", ""),
+        )
+        return
 
     # ════════════════════════════════════════════════════════════════
     #  MOMENTUM SNIPER INBOX
@@ -5819,7 +6464,7 @@ def main():
                                 "🖼️ Regenerate lifestyle image",
                                 key=f"regen_lifestyle_{i}",
                                 use_container_width=True,
-                                disabled=not bool(xai_api_key),
+                                disabled=not bool(api_key and magnific_token),
                             ):
                                 with st.spinner("Generating another lifestyle image with Grok Imagine..."):
                                     image_result = generate_lifestyle_image_grok(
