@@ -4035,6 +4035,100 @@ def _uploaded_image_payload(uploaded_file) -> tuple[bytes, str, str]:
     return data, mime, data_uri
 
 
+AVATAR_LIBRARY_SEARCH_DIRS = [
+    Path("avatar_library"),
+    Path("avatars"),
+    Path("/mnt/data/avatar_library"),
+    Path("/mnt/data/avatars"),
+]
+AVATAR_LIBRARY_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+
+
+def _find_avatar_library_dir() -> Path | None:
+    for folder in AVATAR_LIBRARY_SEARCH_DIRS:
+        try:
+            if folder.exists() and folder.is_dir():
+                return folder
+        except Exception:
+            continue
+    return None
+
+
+def load_avatar_library() -> tuple[list[dict], str]:
+    """Load saved avatars from a repo folder such as avatar_library/ or avatars/."""
+    folder = _find_avatar_library_dir()
+    if not folder:
+        return [], ""
+
+    manifest = None
+    for name in ("manifest.json", "avatars.json"):
+        path = folder / name
+        if path.exists():
+            try:
+                manifest = json.loads(path.read_text())
+            except Exception:
+                manifest = None
+            break
+
+    records = []
+    used = set()
+    if isinstance(manifest, dict):
+        manifest = manifest.get("avatars") or manifest.get("items") or manifest.get("data")
+    if isinstance(manifest, list):
+        for item in manifest:
+            if not isinstance(item, dict):
+                continue
+            file_name = str(item.get("file") or item.get("filename") or item.get("path") or "").strip()
+            if not file_name:
+                continue
+            img_path = (folder / file_name).resolve()
+            if not img_path.exists() or img_path.suffix.lower() not in AVATAR_LIBRARY_EXTENSIONS:
+                continue
+            label = str(item.get("label") or item.get("name") or img_path.stem.replace("_", " ").replace("-", " ").title()).strip()
+            avatar_id = str(item.get("id") or img_path.stem).strip() or img_path.stem
+            records.append({"id": avatar_id, "label": label, "path": str(img_path), "file_name": img_path.name})
+            used.add(img_path.resolve())
+
+    for img_path in sorted(folder.iterdir()):
+        if not img_path.is_file() or img_path.suffix.lower() not in AVATAR_LIBRARY_EXTENSIONS:
+            continue
+        if img_path.resolve() in used:
+            continue
+        records.append({
+            "id": img_path.stem,
+            "label": img_path.stem.replace("_", " ").replace("-", " ").title(),
+            "path": str(img_path.resolve()),
+            "file_name": img_path.name,
+        })
+    return records, str(folder)
+
+
+def _local_image_payload(image_path: str) -> tuple[bytes, str, str]:
+    """Return bytes, mime type, and a base64 data URI for a local image path."""
+    try:
+        data = Path(image_path).read_bytes()
+    except Exception:
+        return b"", "image/jpeg", ""
+    suffix = Path(image_path).suffix.lower()
+    mime = {
+        ".png": "image/png",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+    }.get(suffix, "image/jpeg")
+    data_uri = f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+    return data, mime, data_uri
+
+
+def _remote_image_payload(image_url: str) -> tuple[bytes, str, str]:
+    """Return bytes, mime type, and a base64 data URI for a remote image URL."""
+    data, mime = fetch_image_bytes(image_url)
+    if not data:
+        return b"", "image/jpeg", ""
+    mime = (mime or "image/jpeg").split(";")[0].strip().lower() or "image/jpeg"
+    data_uri = f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+    return data, mime, data_uri
+
+
 def analyze_avatar_outfit_images(
     api_key: str,
     avatar_bytes: bytes,
@@ -4316,40 +4410,142 @@ def _reset_avatar_outfit_generated_state() -> None:
 
 
 def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: str) -> None:
-    """Dedicated UI for the two uploaded Avatar Outfit skills."""
+    """Avatar Outfit workflow: choose a saved avatar + scrape outfit product or upload outfit image."""
     st.markdown("## 🪞 Avatar Outfit")
     st.caption(
-        "Two-step flow: upload the avatar first and the outfit second → analyze both → generate the iPhone mirror-selfie try-on image with Magnific GPT Image 2 → approve it → animate that exact image with Kling O1."
+        "Choose a saved avatar from your repo library, then paste a TikTok Shop clothing link or upload an outfit image. The app analyzes both, generates the mirror-selfie try-on image with Magnific GPT Image 2, then animates that approved image with Kling O1."
     )
     st.info(
         "This workflow intentionally has **no hook text, captions, voiceover, music, or soundtrack** because the uploaded mirror-try-on skill requires a clean silent continuous shot."
     )
 
-    upload_col_1, upload_col_2 = st.columns(2, gap="large")
-    with upload_col_1:
-        avatar_file = st.file_uploader(
-            "1. Avatar image",
-            type=["jpg", "jpeg", "png", "webp"],
-            key="avatar_outfit_avatar_upload",
-            help="The AI avatar/person whose identity should be preserved. Their current clothes will be ignored.",
-        )
-        if avatar_file is not None:
-            st.image(avatar_file, caption="Avatar reference — identity / appearance", use_container_width=True)
-    with upload_col_2:
-        outfit_file = st.file_uploader(
-            "2. Outfit image",
-            type=["jpg", "jpeg", "png", "webp"],
-            key="avatar_outfit_outfit_upload",
-            help="The clothing product. A flat lay, mannequin, listing image, or model photo is fine; the person in this image is ignored.",
-        )
-        if outfit_file is not None:
-            st.image(outfit_file, caption="Outfit reference — clothing / shoes only", use_container_width=True)
+    avatar_records, avatar_library_dir = load_avatar_library()
+    outfit_mode = st.radio(
+        "Outfit source",
+        ["TikTok Shop link", "Upload image manually"],
+        horizontal=True,
+        key="avatar_outfit_source_mode",
+    )
 
-    avatar_bytes, avatar_mime, avatar_data_uri = _uploaded_image_payload(avatar_file)
-    outfit_bytes, outfit_mime, outfit_data_uri = _uploaded_image_payload(outfit_file)
+    input_col_1, input_col_2 = st.columns(2, gap="large")
+    with input_col_1:
+        st.markdown("### 1. Choose avatar")
+        if avatar_records:
+            avatar_options = {f"{item['label']} ({item['file_name']})": item for item in avatar_records}
+            selected_avatar_label = st.selectbox(
+                "Saved avatars",
+                options=list(avatar_options.keys()),
+                key="avatar_outfit_avatar_library_select",
+                help="These avatars are loaded from the repo folder avatar_library/ or avatars/.",
+            )
+            selected_avatar = avatar_options[selected_avatar_label]
+            st.image(selected_avatar["path"], caption=f"Selected avatar — {selected_avatar['label']}", use_container_width=True)
+            avatar_bytes, avatar_mime, avatar_data_uri = _local_image_payload(selected_avatar["path"])
+            st.caption(f"Library folder: {avatar_library_dir}")
+            avatar_source_label = selected_avatar["label"]
+        else:
+            st.warning("No saved avatars were found. Add images to `avatar_library/` or `avatars/` in the repo, or use the fallback uploader below.")
+            avatar_file = st.file_uploader(
+                "Fallback avatar image",
+                type=["jpg", "jpeg", "png", "webp"],
+                key="avatar_outfit_avatar_upload_fallback",
+                help="This is temporary. For reusable avatars, add them to avatar_library/ in the GitHub repo.",
+            )
+            if avatar_file is not None:
+                st.image(avatar_file, caption="Avatar reference — identity / appearance", use_container_width=True)
+            avatar_bytes, avatar_mime, avatar_data_uri = _uploaded_image_payload(avatar_file)
+            avatar_source_label = getattr(avatar_file, "name", "Uploaded avatar") if avatar_file else ""
+
+    with input_col_2:
+        st.markdown("### 2. Choose outfit")
+        outfit_name_prefill = ""
+        if outfit_mode == "TikTok Shop link":
+            outfit_link = st.text_input(
+                "TikTok Shop clothing link",
+                key="avatar_outfit_tiktok_link",
+                placeholder="https://www.tiktok.com/view/product/...",
+                help="Paste a TikTok Shop outfit/clothing/shoe product link. The app will scrape the product photos and let you choose which one to use.",
+            ).strip()
+            if st.button(
+                "🔎 Scrape outfit product",
+                key="avatar_outfit_scrape_link_btn",
+                use_container_width=True,
+                disabled=not bool(outfit_link),
+            ):
+                with st.spinner("Scraping the TikTok Shop product..."):
+                    scraped = scrape_product(outfit_link, api_key=api_key)
+                if not scraped:
+                    st.error("Could not scrape that TikTok Shop outfit link.")
+                else:
+                    st.session_state["avatar_outfit_scraped_product"] = scraped
+                    default_image = (scraped.get("listing_images") or scraped.get("images") or [None])[0]
+                    if default_image:
+                        st.session_state["avatar_outfit_selected_image_url"] = default_image
+                    st.rerun()
+
+            scraped = st.session_state.get("avatar_outfit_scraped_product") or {}
+            if outfit_link and scraped and scraped.get("source_url") != outfit_link:
+                scraped = {}
+            if scraped:
+                outfit_name_prefill = scraped.get("name") or ""
+                st.success(f"Scraped product: {scraped.get('name', 'Unknown Product')}")
+                if scraped.get("name_source"):
+                    st.caption(f"Name source: {scraped.get('name_source')}")
+                product_name_manual = st.text_input(
+                    "Outfit product name",
+                    value=scraped.get("name") or "",
+                    key="avatar_outfit_scraped_name_edit",
+                    help="You can edit the recovered product name if needed.",
+                ).strip()
+                if product_name_manual:
+                    outfit_name_prefill = product_name_manual
+                image_candidates = (scraped.get("listing_images") or []) + [u for u in (scraped.get("review_images") or []) if u not in (scraped.get("listing_images") or [])]
+                current_selected = st.session_state.get("avatar_outfit_selected_image_url")
+                if current_selected not in image_candidates and image_candidates:
+                    current_selected = image_candidates[0]
+                    st.session_state["avatar_outfit_selected_image_url"] = current_selected
+                if image_candidates:
+                    st.markdown("**Choose which product image to use**")
+                    cols = st.columns(3)
+                    for idx, image_url in enumerate(image_candidates[:12]):
+                        with cols[idx % 3]:
+                            st.image(image_url, use_container_width=True)
+                            label = "✅ Selected" if image_url == current_selected else "Use this image"
+                            if st.button(label, key=f"avatar_outfit_pick_img_{idx}", use_container_width=True):
+                                st.session_state["avatar_outfit_selected_image_url"] = image_url
+                                st.rerun()
+                    if current_selected:
+                        st.caption("Selected outfit image preview")
+                        st.image(current_selected, use_container_width=True)
+                        outfit_bytes, outfit_mime, outfit_data_uri = _remote_image_payload(current_selected)
+                    else:
+                        outfit_bytes, outfit_mime, outfit_data_uri = b"", "image/jpeg", ""
+                else:
+                    st.warning("This product link was scraped, but no usable product images were found.")
+                    outfit_bytes, outfit_mime, outfit_data_uri = b"", "image/jpeg", ""
+            else:
+                outfit_bytes, outfit_mime, outfit_data_uri = b"", "image/jpeg", ""
+        else:
+            manual_name = st.text_input(
+                "Outfit name (optional)",
+                key="avatar_outfit_manual_name",
+                placeholder="Blue hoodie and black joggers",
+            ).strip()
+            if manual_name:
+                outfit_name_prefill = manual_name
+            outfit_file = st.file_uploader(
+                "Outfit image",
+                type=["jpg", "jpeg", "png", "webp"],
+                key="avatar_outfit_outfit_upload",
+                help="The clothing product. A flat lay, mannequin, listing image, or model photo is fine; the person in this image is ignored.",
+            )
+            if outfit_file is not None:
+                st.image(outfit_file, caption="Outfit reference — clothing / shoes only", use_container_width=True)
+            outfit_bytes, outfit_mime, outfit_data_uri = _uploaded_image_payload(outfit_file)
 
     if avatar_bytes and outfit_bytes:
-        input_signature = hashlib.sha1(avatar_bytes + b"|AVATAR_OUTFIT|" + outfit_bytes).hexdigest()
+        outfit_name_for_state = (outfit_name_prefill or "").strip()
+        input_signature = hashlib.sha1(avatar_bytes + b"|AVATAR_OUTFIT|" + outfit_bytes + b"|" + outfit_name_for_state.encode("utf-8", "ignore")).hexdigest()
         previous_signature = st.session_state.get("avatar_outfit_input_signature")
         if previous_signature and previous_signature != input_signature:
             for key in (
@@ -4380,6 +4576,10 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
         if analysis.get("error"):
             st.error(analysis["error"])
         else:
+            if outfit_name_prefill:
+                analysis["product_name"] = outfit_name_prefill[:100]
+            if avatar_source_label:
+                analysis["avatar_label"] = avatar_source_label
             st.session_state["avatar_outfit_analysis"] = analysis
             st.session_state.pop("avatar_outfit_image_result", None)
             st.session_state.pop("avatar_outfit_image_approved", None)
@@ -4387,15 +4587,20 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
             st.rerun()
 
     if not api_key:
-        st.warning("Connect the Anthropic API key above to analyze the two reference images.")
+        st.warning("Connect the Anthropic API key above to analyze the avatar and outfit.")
     if not magnific_token:
         st.warning("Connect Magnific above to generate the Avatar Outfit try-on image and to run the Kling O1 video step.")
 
     analysis = st.session_state.get("avatar_outfit_analysis") or {}
     if not analysis:
+        st.caption("Tip: add reusable avatar images to `avatar_library/` in the repo so you can select them here without re-uploading each time.")
         return
 
     st.markdown("### Reference analysis")
+    if analysis.get("product_name"):
+        st.caption(f"Outfit product: **{analysis.get('product_name')}**")
+    if analysis.get("avatar_label"):
+        st.caption(f"Avatar: **{analysis.get('avatar_label')}**")
     avatar_desc = st.text_area(
         "Avatar description",
         value=analysis.get("avatar_description", ""),
@@ -4546,98 +4751,91 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
             type="primary",
             use_container_width=True,
             key="avatar_outfit_generate_video",
-            disabled=not bool(api_key and magnific_token),
+            disabled=not bool(api_key and magnific_token and generated_image_url),
         ):
             with st.spinner("Sending the approved mirror image to Kling O1 as the start frame..."):
-                result = generate_avatar_outfit_kling_magnific(
+                result = generate_avatar_outfit_kling_video(
                     api_key=api_key,
                     magnific_token=magnific_token,
                     approved_image_url=generated_image_url,
                     prompt=kling_prompt,
                 )
-            if result.get("creation_id"):
-                result["prompt"] = kling_prompt
-                result["approved_image_url"] = generated_image_url
-                result["started_at"] = datetime.now().isoformat()
+            if result.get("error"):
+                st.error(result["error"])
+            else:
+                result["avatar_label"] = analysis.get("avatar_label")
+                result["product_name"] = analysis.get("product_name")
                 st.session_state["avatar_outfit_video_result"] = result
                 st.rerun()
-            else:
-                st.error(result.get("error", "Magnific did not return a Kling O1 creation ID."))
         return
 
     st.markdown("### Kling O1 mirror video")
-    st.caption(f"Creation: {creation_id} · Status: {video_status or 'queued'}")
-
-    status_col, regen_video_col = st.columns(2)
-    refresh_clicked = status_col.button(
-        "🔄 Check video status",
-        use_container_width=True,
-        key="avatar_outfit_check_video",
-        disabled=not bool(api_key and magnific_token),
-    )
-    regen_clicked = regen_video_col.button(
-        "🔁 Regenerate Kling video",
-        use_container_width=True,
-        key="avatar_outfit_regen_video",
-        disabled=not bool(api_key and magnific_token),
-    )
-
-    if refresh_clicked:
-        with st.spinner("Checking Kling O1..."):
-            status_result = check_creation_status(api_key, magnific_token, creation_id)
-        updated = dict(video_result)
-        updated["status"] = status_result.get("status", video_status)
-        if status_result.get("url"):
-            updated["url"] = status_result["url"]
-        if status_result.get("preview_url"):
-            updated["preview_url"] = status_result["preview_url"]
-        updated["last_checked_at"] = datetime.now().isoformat()
-        st.session_state["avatar_outfit_video_result"] = updated
-        st.rerun()
-
-    if regen_clicked:
-        with st.spinner("Creating a new Kling O1 generation from the approved start frame..."):
-            result = generate_avatar_outfit_kling_magnific(
-                api_key=api_key,
-                magnific_token=magnific_token,
-                approved_image_url=generated_image_url,
-                prompt=kling_prompt,
-            )
-        if result.get("creation_id"):
-            result["prompt"] = kling_prompt
-            result["approved_image_url"] = generated_image_url
-            result["started_at"] = datetime.now().isoformat()
-            st.session_state["avatar_outfit_video_result"] = result
+    if video_status in {"queued", "processing", "running", "unknown"}:
+        st.info(f"Current video status: **{video_status or 'processing'}**")
+        if st.button(
+            "🔄 Check video status",
+            key="avatar_outfit_check_video_status",
+            use_container_width=True,
+            disabled=not bool(api_key and magnific_token and creation_id),
+        ):
+            with st.spinner("Checking Kling O1 video status..."):
+                refreshed = check_creation_status(api_key=api_key, magnific_token=magnific_token, creation_id=creation_id)
+            merged = {**video_result, **{k: v for k, v in refreshed.items() if v is not None}}
+            st.session_state["avatar_outfit_video_result"] = merged
             st.rerun()
-        else:
-            st.error(result.get("error", "Magnific did not return a new Kling O1 creation ID."))
+        return
 
-    video_result = st.session_state.get("avatar_outfit_video_result") or {}
-    video_status = video_result.get("status", "")
-    video_url = video_result.get("url") or (video_result.get("preview_url") if video_status == "completed" else None)
+    video_url = video_result.get("url") or video_result.get("preview_url")
     if video_status == "completed" and video_url:
-        video_bytes = fetch_video_bytes(video_url, cache_key=str(video_result.get("creation_id") or "avatar_outfit"))
+        refreshed_key = f"{creation_id}_{hashlib.sha1(video_url.encode('utf-8')).hexdigest()[:12]}"
+        st.video(video_url)
+        video_bytes = fetch_video_bytes(f"{video_url}#avatar_outfit={refreshed_key}")
         if video_bytes:
-            st.video(video_bytes)
             st.download_button(
                 "⬇️ Download Avatar Outfit video",
                 data=video_bytes,
-                file_name=f"avatar_outfit_{video_result.get('creation_id', 'kling')}.mp4",
+                file_name=f"avatar_outfit_{creation_id}.mp4",
                 mime="video/mp4",
                 key="avatar_outfit_download_video",
                 use_container_width=True,
             )
-        else:
-            st.video(video_url)
-    elif video_status == "error":
-        st.error(video_result.get("error") or "Kling O1 generation failed.")
+        regen_cols = st.columns(2)
+        if regen_cols[0].button(
+            "🎬 Regenerate Kling O1 video",
+            key="avatar_outfit_regen_video",
+            use_container_width=True,
+            disabled=not bool(api_key and magnific_token and generated_image_url),
+        ):
+            with st.spinner("Generating a fresh Kling O1 mirror video from the approved image..."):
+                result = generate_avatar_outfit_kling_video(
+                    api_key=api_key,
+                    magnific_token=magnific_token,
+                    approved_image_url=generated_image_url,
+                    prompt=kling_prompt,
+                )
+            if result.get("error"):
+                st.error(result["error"])
+            else:
+                result["avatar_label"] = analysis.get("avatar_label")
+                result["product_name"] = analysis.get("product_name")
+                st.session_state["avatar_outfit_video_result"] = result
+                st.rerun()
+        if regen_cols[1].button(
+            "🧹 Start over",
+            key="avatar_outfit_start_over",
+            use_container_width=True,
+        ):
+            _reset_avatar_outfit_generated_state()
+            st.session_state.pop("avatar_outfit_scraped_product", None)
+            st.session_state.pop("avatar_outfit_selected_image_url", None)
+            st.rerun()
+        return
+
+    if video_status == "error":
+        st.error(video_result.get("error") or "Kling O1 failed.")
     else:
-        st.info("Kling O1 is still queued/processing. Use **Check video status** when it is ready.")
+        st.warning("No finished video URL is available yet.")
 
-
-# ═══════════════════════════════════════════════════════════════════
-#  STREAMLIT UI
-# ═══════════════════════════════════════════════════════════════════
 
 def get_secret(key: str) -> str:
     try:

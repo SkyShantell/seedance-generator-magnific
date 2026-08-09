@@ -1,0 +1,14 @@
+{
+  "avatars": [
+    {
+      "id": "naomi",
+      "label": "Naomi Vale",
+      "file": "naomi.png"
+    },
+    {
+      "id": "mason",
+      "label": "Mason",
+      "file": "mason.jpg"
+    }
+  ]
+}
