@@ -1507,7 +1507,9 @@ def lifestyle_images_zip_bytes(generations: list[dict]) -> tuple[bytes | None, i
 # ── Constants ───────────────────────────────────────────────────────
 MAGNIFIC_MCP_URL = "https://mcp.magnific.com"
 XAI_IMAGE_API_URL = "https://api.x.ai/v1/images/edits"
-XAI_IMAGE_MODEL = "grok-imagine-image-quality"
+LIFESTYLE_MAGNIFIC_IMAGE_MODEL = "grok-imagine-image-quality"
+LIFESTYLE_MAGNIFIC_IMAGE_MODEL = "nano_banana_2"
+LIFESTYLE_MAGNIFIC_IMAGE_QUALITY = "pro"
 DIRECTOR_INGEST_URL_DEFAULT = "https://app.momentumacademy.co/api/director/ingest"
 SEEDANCE_QUEUE_SCHEMA = "momentum.seedance.batch.v1"
 SEEDANCE_QUEUE_PATH_DEFAULT = "seedance_inbox"
@@ -2439,7 +2441,7 @@ STYLE_LABELS = {
     "avatar_outfit": "🪞 Avatar Outfit",
 }
 
-LIFESTYLE_IMAGE_MODEL_LABEL = "Grok Imagine Image Quality · 2k · 9:16"
+LIFESTYLE_IMAGE_MODEL_LABEL = "Nano Banana 2 · Pro · 2k · 9:16"
 LIFESTYLE_VIDEO_MODEL_LABEL = "Kling O1 · 720p · 5s · start frame"
 AVATAR_OUTFIT_IMAGE_MODEL_LABEL = "GPT Image 2 · 2k · High · 9:16 · Magnific · 2 references"
 AVATAR_OUTFIT_VIDEO_MODEL_LABEL = "Kling O1 · 720p · 10s · start frame"
@@ -3321,112 +3323,87 @@ def generate_video(
 
 
 
-def generate_lifestyle_image_grok(
-    xai_api_key: str,
+LIFESTYLE_IMAGE_GENERATE_SYSTEM = """You are an image production assistant with access to Magnific tools.
+Use the same Magnific MCP account already configured in the app.
+1. Upload EVERY provided reference image to Magnific using creations_upload_image.
+2. The supplied reference images all show the same product from official listing photos and/or customer review photos.
+3. Use ALL provided references together to preserve the exact product identity: packaging, branding, text, shape, scale, materials, colors, controls, accessories, proportions, and real-world appearance.
+4. Generate EXACTLY ONE final lifestyle approval image.
+5. You MUST use the image model Nano Banana 2.
+6. You MUST use quality Pro.
+7. You MUST use resolution 2k.
+8. You MUST use aspect ratio 9:16.
+9. Submit the generation ONCE and return immediately after you receive the creation identifier. DO NOT call creations_get, DO NOT poll, and DO NOT wait for the image to finish.
+10. Return ONLY valid JSON (no markdown): {"creation_id":"the magnific creation identifier","status":"queued","url":null,"preview_url":null,"error":null}
+"""
+
+
+def generate_lifestyle_image_magnific(
+    api_key: str,
+    magnific_token: str,
     product_name: str,
     reference_urls: list[str],
     prompt: str,
 ) -> dict:
-    """Generate one 2K, 9:16 lifestyle approval image with the xAI Grok Imagine API."""
-    if not xai_api_key:
-        return {"creation_id": None, "status": "error", "error": "The xAI API key is missing."}
+    """Generate one 2K, 9:16 lifestyle approval image in Magnific with Nano Banana 2 Pro."""
+    if not api_key:
+        return {"creation_id": None, "status": "error", "error": "The Anthropic API key is missing."}
+    if not magnific_token:
+        return {"creation_id": None, "status": "error", "error": "The Magnific authorization token is missing."}
 
-    # Grok multi-image editing currently accepts up to three source images.
     refs = []
     for url in reference_urls or []:
         cleaned = str(url or "").strip()
         if cleaned and cleaned not in refs:
             refs.append(cleaned)
-        if len(refs) == 3:
+        if len(refs) == 6:
             break
 
     if not refs:
         return {"creation_id": None, "status": "error", "error": "Select at least one product reference image."}
 
-    # Multi-image edit mode allows the requested 9:16 output ratio. When only one
-    # product reference is selected, repeat it as the second reference so Grok uses
-    # the multi-image request shape while preserving the same product appearance.
-    request_refs = refs if len(refs) >= 2 else [refs[0], refs[0]]
-    payload = {
-        "model": XAI_IMAGE_MODEL,
-        "prompt": (
-            f"Create exactly one lifestyle image for {product_name}. "
-            "Treat every supplied image only as a visual reference for the same product. "
-            "Preserve its packaging, colors, logos, labels, shape, material, proportions, and real-world scale exactly. "
-            "Do not create multiple copies of the product merely because a reference image is repeated.\n\n"
-            f"{prompt}"
-        ),
-        "images": [
-            {"type": "image_url", "url": url}
-            for url in request_refs
-        ],
-        "aspect_ratio": "9:16",
-        "resolution": "2k",
-        "response_format": "url",
-        "n": 1,
-    }
+    mcp_servers = [{
+        "type": "url",
+        "url": MAGNIFIC_MCP_URL,
+        "name": MAGNIFIC_MCP_NAME,
+        "authorization_token": magnific_token,
+    }]
+
+    reference_lines = []
+    for idx, ref in enumerate(refs, start=1):
+        reference_lines.append(f"Reference image {idx}: {ref}")
+    refs_text = "\n\n".join(reference_lines)
 
     try:
-        response = requests.post(
-            XAI_IMAGE_API_URL,
-            headers={
-                "Authorization": f"Bearer {xai_api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=300,
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.beta.messages.create(
+            model=MODEL,
+            max_tokens=2048,
+            system=LIFESTYLE_IMAGE_GENERATE_SYSTEM,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Generate exactly one lifestyle approval image for {product_name}.\n"
+                    "Required Magnific settings: use Nano Banana 2, quality Pro, resolution 2k, and aspect ratio 9:16.\n"
+                    "Use the supplied reference images only as product references for the same item. Preserve the product exactly while placing it into the requested clean, realistic lifestyle scene.\n\n"
+                    f"{refs_text}\n\n"
+                    f"Final image prompt:\n{prompt}"
+                ),
+            }],
+            mcp_servers=mcp_servers,
+            tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
+            betas=[MCP_BETA],
         )
-
-        if response.status_code >= 400:
-            try:
-                error_payload = response.json()
-                if isinstance(error_payload, dict):
-                    nested = error_payload.get("error")
-                    if isinstance(nested, dict):
-                        error_message = nested.get("message") or nested.get("code")
-                    else:
-                        error_message = nested
-                    error_message = error_message or error_payload.get("message")
-                else:
-                    error_message = None
-            except Exception:
-                error_message = None
-            error_message = error_message or (response.text or "Unknown xAI API error")
-            return {
-                "creation_id": None,
-                "status": "error",
-                "error": f"xAI image request failed ({response.status_code}): {str(error_message)[:500]}",
-            }
-
-        result_payload = response.json()
-        images = result_payload.get("data") if isinstance(result_payload, dict) else None
-        first_image = images[0] if isinstance(images, list) and images else {}
-        image_url = first_image.get("url") if isinstance(first_image, dict) else None
-        if not image_url:
-            return {
-                "creation_id": None,
-                "status": "error",
-                "error": "xAI completed the request but did not return an image URL.",
-            }
-
-        creation_id = f"grok_image_{hashlib.sha1(image_url.encode('utf-8')).hexdigest()[:16]}"
-        return {
-            "creation_id": creation_id,
-            "status": "completed",
-            "url": image_url,
-            "preview_url": image_url,
-            "provider": "xAI",
-            "image_model": XAI_IMAGE_MODEL,
-            "image_resolution": "2k",
-            "image_aspect_ratio": "9:16",
-            "reference_count": len(refs),
-            "mime_type": first_image.get("mime_type") if isinstance(first_image, dict) else None,
-            "revised_prompt": first_image.get("revised_prompt") if isinstance(first_image, dict) else None,
-        }
-    except requests.Timeout:
-        return {"creation_id": None, "status": "error", "error": "The xAI image request timed out."}
+        result = _parse_magnific_creation_response(response)
+        result["provider"] = "Magnific"
+        result["image_model"] = LIFESTYLE_MAGNIFIC_IMAGE_MODEL
+        result["image_quality"] = LIFESTYLE_MAGNIFIC_IMAGE_QUALITY
+        result["image_resolution"] = "2k"
+        result["image_aspect_ratio"] = "9:16"
+        result["reference_count"] = len(refs)
+        return result
     except Exception as exc:
-        return {"creation_id": None, "status": "error", "error": f"xAI image generation failed: {exc}"}
+        return {"creation_id": None, "status": "error", "error": f"Magnific lifestyle image generation failed: {exc}"}
 
 
 def _parse_magnific_creation_response(response) -> dict:
@@ -3569,6 +3546,25 @@ def _parse_magnific_creation_response(response) -> dict:
         result["error"] = "Magnific did not return a creation identifier or output URL."
 
     return result
+
+
+def _is_real_magnific_creation_id(value) -> bool:
+    """Reject template/example IDs that can make the UI think an MCP job was submitted."""
+    candidate = str(value or "").strip()
+    if not candidate:
+        return False
+    lowered = candidate.lower().strip(" <>[]{}()\"\'")
+    invalid = {
+        "identifier", "id", "creation_id", "creationid", "task_id", "taskid",
+        "real_magnific_id", "real-id", "unknown", "null", "none", "queued",
+        "the magnific creation identifier", "the creation identifier",
+    }
+    if lowered in invalid:
+        return False
+    # A real Magnific ID should have useful entropy, not be a one-word placeholder.
+    if len(candidate) < 8:
+        return False
+    return True
 
 
 def generate_lifestyle_kling_magnific(
@@ -4709,18 +4705,19 @@ def generate_avatar_outfit_image_magnific(
 
 
 AVATAR_OUTFIT_KLING_SYSTEM = """You are a video production assistant with access to Magnific tools.
+You MUST actually call the Magnific MCP tools; do not merely describe what you would do and do not return a placeholder identifier.
 Use the same Magnific MCP account already configured in the app.
 1. Upload the ONE approved Avatar Outfit mirror-selfie image with creations_upload_image.
-2. Generate an image-to-video with video_generate using model slug kling_o1.
-3. The uploaded approved image MUST be the source/start frame.
-4. Use 9:16, 720p, EXACTLY 10 seconds, sound off, and the provided Kling prompt.
-5. Magnific only offers 5s or 10s here. You MUST select the 10-second option.
-6. Do not use the original avatar image or original outfit image in this video step.
-7. Submit the generation ONCE and return immediately after you receive the creation identifier. DO NOT call creations_get, DO NOT poll, and DO NOT wait for the video to finish.
-8. Return the Magnific creation identifier.
+2. Call video_generate and explicitly select the Magnific model Kling O1.
+3. Use the uploaded approved image as the FIRST/START frame. Do not use it only as a generic reference image.
+4. Use aspect ratio 9:16, resolution 720p, duration EXACTLY 10 seconds, sound off, and the provided motion prompt.
+5. Magnific offers 5 or 10 seconds for Kling O1 here. You MUST choose 10 seconds.
+6. Do not use the original avatar image or original outfit image in the video step.
+7. Submit exactly ONE video generation. Once Magnific returns the REAL creation/task identifier, stop. DO NOT call creations_get, poll, or wait for completion.
+8. Never return words such as "identifier", "task_id", "creation_id", "unknown", or an example value in place of the real identifier.
 
-Return ONLY valid JSON:
-{"creation_id":"identifier","status":"queued","error":null}
+After the real Magnific tool call succeeds, return ONLY valid JSON:
+{"creation_id":"REAL_MAGNIFIC_ID","status":"queued","error":null}
 """
 
 
@@ -4754,8 +4751,8 @@ def generate_avatar_outfit_kling_magnific(
                 "role": "user",
                 "content": (
                     f"Approved Avatar Outfit start image: {approved_image_url}\n"
-                    "Generate a Kling O1 mirror-selfie try-on video at 720p, 9:16, approximately 8 seconds, sound off. "
-                    "Use the approved image as the start frame.\n\n"
+                    "ACTUALLY SUBMIT this to Magnific now using the MCP tools. Generate a Kling O1 mirror-selfie try-on video at 720p, 9:16, EXACTLY 10 seconds, sound off. "
+                    "Use the approved image as the FIRST/START frame. Return the real Magnific creation ID immediately after submission; do not poll.\n\n"
                     f"Kling prompt:\n{prompt}"
                 ),
             }],
@@ -4763,7 +4760,22 @@ def generate_avatar_outfit_kling_magnific(
             tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
             betas=[MCP_BETA],
         )
-        return _parse_magnific_creation_response(response)
+        result = _parse_magnific_creation_response(response)
+        creation_id = result.get("creation_id")
+        if not _is_real_magnific_creation_id(creation_id):
+            return {
+                "creation_id": None,
+                "status": "error",
+                "url": None,
+                "preview_url": None,
+                "error": "Magnific MCP did not return a real Kling creation ID, so the video was not confirmed as submitted. Click Send to Magnific and try again.",
+            }
+        # Submission is asynchronous. Even if the assistant text mislabeled the state,
+        # a real creation ID with no output URL means the job should remain refreshable.
+        if not (result.get("url") or result.get("preview_url")):
+            result["status"] = "queued"
+        result["submitted_at"] = datetime.now().isoformat(timespec="seconds")
+        return result
     except Exception as exc:
         return {"creation_id": None, "status": "error", "error": str(exc)}
 
@@ -4948,13 +4960,13 @@ def _render_avatar_outfit_bulk_queue(api_key: str, magnific_token: str) -> None:
                                 approved_image_url=image_url,
                                 prompt=job.get("kling_prompt") or "",
                             )
-                        if video_result.get("error"):
-                            st.error(video_result["error"])
+                        if video_result.get("error") or not _is_real_magnific_creation_id(video_result.get("creation_id")):
+                            st.error(video_result.get("error") or "Magnific did not return a real Kling creation ID.")
                         else:
                             job["approved"] = True
                             job["video"] = video_result
                             st.session_state["avatar_outfit_bulk_jobs"] = jobs
-                            st.session_state["avatar_outfit_queue_message"] = "Kling O1 job queued. You can continue working and refresh later."
+                            st.session_state["avatar_outfit_queue_message"] = f"Kling O1 job sent to Magnific: {video_result.get('creation_id')}. Continue working and refresh later."
                             st.rerun()
             else:
                 creation_id = image.get("creation_id")
@@ -5476,7 +5488,7 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
 
     if not creation_id:
         if st.button(
-            "🎬 Step 3 — Generate Kling O1 Mirror Video",
+            "🎬 Send 10s Kling O1 Video to Magnific",
             type="primary",
             use_container_width=True,
             key="avatar_outfit_generate_video",
@@ -5489,32 +5501,41 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
                     approved_image_url=generated_image_url,
                     prompt=kling_prompt,
                 )
-            if result.get("error"):
-                st.error(result["error"])
+            if result.get("error") or not _is_real_magnific_creation_id(result.get("creation_id")):
+                st.error(result.get("error") or "Magnific did not return a real creation ID, so the video was not submitted.")
+                st.session_state.pop("avatar_outfit_video_result", None)
             else:
                 result["avatar_label"] = analysis.get("avatar_label")
                 result["product_name"] = analysis.get("product_name")
+                result["status"] = result.get("status") or "queued"
                 st.session_state["avatar_outfit_video_result"] = result
+                st.success(f"Sent to Magnific. Creation ID: {result['creation_id']}")
                 st.rerun()
         return
 
     st.markdown("### Kling O1 mirror video")
-    if video_status in {"queued", "processing", "running", "unknown"}:
-        st.info(f"Current video status: **{video_status or 'processing'}**")
+    video_url = video_result.get("url") or video_result.get("preview_url")
+
+    # Any real creation ID without a finished URL is an asynchronous job that must
+    # remain refreshable, regardless of whatever status label the MCP returned.
+    if creation_id and not video_url and video_status != "error":
+        st.info(f"Sent to Magnific · Status: **{video_status or 'queued'}** · Creation ID: `{creation_id}`")
         if st.button(
-            "🔄 Check video status",
+            "🔄 Refresh Kling video status",
             key="avatar_outfit_check_video_status",
+            type="primary",
             use_container_width=True,
             disabled=not bool(api_key and magnific_token and creation_id),
         ):
-            with st.spinner("Checking Kling O1 video status..."):
+            with st.spinner("Checking Magnific for the finished Kling O1 video..."):
                 refreshed = check_creation_status(api_key=api_key, magnific_token=magnific_token, creation_id=creation_id)
             merged = {**video_result, **{k: v for k, v in refreshed.items() if v is not None}}
+            if merged.get("status") == "completed" and not (merged.get("url") or merged.get("preview_url")):
+                merged["status"] = "processing"
             st.session_state["avatar_outfit_video_result"] = merged
             st.rerun()
         return
 
-    video_url = video_result.get("url") or video_result.get("preview_url")
     if video_status == "completed" and video_url:
         refreshed_key = f"{creation_id}_{hashlib.sha1(video_url.encode('utf-8')).hexdigest()[:12]}"
         st.video(video_url)
@@ -5567,8 +5588,35 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
 
     if video_status == "error":
         st.error(video_result.get("error") or "Kling O1 failed.")
+        retry_cols = st.columns(2)
+        if retry_cols[0].button(
+            "🎬 Retry Send to Magnific",
+            key="avatar_outfit_retry_failed_video",
+            type="primary",
+            use_container_width=True,
+            disabled=not bool(api_key and magnific_token and generated_image_url),
+        ):
+            st.session_state.pop("avatar_outfit_video_result", None)
+            st.rerun()
+        if retry_cols[1].button(
+            "🧹 Clear video state",
+            key="avatar_outfit_clear_failed_video",
+            use_container_width=True,
+        ):
+            st.session_state.pop("avatar_outfit_video_result", None)
+            st.rerun()
     else:
-        st.warning("No finished video URL is available yet.")
+        st.warning("Magnific has not returned a finished video URL yet.")
+        if st.button(
+            "🔄 Refresh Kling video status",
+            key="avatar_outfit_refresh_missing_url",
+            type="primary",
+            use_container_width=True,
+            disabled=not bool(api_key and magnific_token and creation_id),
+        ):
+            refreshed = check_creation_status(api_key=api_key, magnific_token=magnific_token, creation_id=creation_id)
+            st.session_state["avatar_outfit_video_result"] = {**video_result, **{k: v for k, v in refreshed.items() if v is not None}}
+            st.rerun()
 
 
 def get_secret(key: str) -> str:
@@ -5677,7 +5725,7 @@ def main():
                 )
             with info_col:
                 st.info(
-                    "Lifestyle Animation generates the approval image with the xAI Grok Imagine API in 2k at 9:16, then sends the approved image to Magnific for a 5-second Kling O1 animation at 720p using it as the start frame. "
+                    "Lifestyle Animation generates the approval image in Magnific with Nano Banana 2 at Pro quality in 2k at 9:16, then sends the approved image to Magnific for a 5-second Kling O1 animation at 720p using it as the start frame. "
                     "Choose a product size/type so the scene works for anything from supplements to vacuums, couches, appliances, electronics, fitness gear, and outdoor items. The selected deal/FOMO hook is added afterward with FFmpeg."
                 )
                 st.caption(f"Image model: {LIFESTYLE_IMAGE_MODEL_LABEL}  |  Video model: {LIFESTYLE_VIDEO_MODEL_LABEL}")
@@ -5703,7 +5751,7 @@ def main():
         queue_repo = st.session_state.get("runtime_seedance_queue_repo", "")
         queue_branch = st.session_state.get("runtime_seedance_queue_branch", "main") or "main"
         queue_path = st.session_state.get("runtime_seedance_queue_path", SEEDANCE_QUEUE_PATH_DEFAULT) or SEEDANCE_QUEUE_PATH_DEFAULT
-        status_col_1, status_col_2, status_col_3, status_col_4, status_col_5, status_col_6 = st.columns(6)
+        status_col_1, status_col_2, status_col_3, status_col_4, status_col_5 = st.columns(5)
         if api_key:
             status_col_1.success("Anthropic connected")
         else:
@@ -5712,10 +5760,7 @@ def main():
             status_col_2.success("Magnific connected")
         else:
             status_col_2.info("Magnific needed for video")
-        if xai_api_key:
-            status_col_3.success("Grok images connected")
-        else:
-            status_col_3.info("Grok key needed for image workflows")
+        status_col_3.info("Nano Banana + Kling via Magnific")
         if director_ingest_key:
             status_col_4.success("Director connected")
         else:
@@ -5724,9 +5769,9 @@ def main():
             status_col_5.success("Sniper inbox connected")
         else:
             status_col_5.info("Sniper inbox optional")
-        status_col_6.info(f"{STYLE_LABELS[style]} · {resolved_style_duration(style, duration)}s")
+        st.caption(f"{STYLE_LABELS[style]} · {resolved_style_duration(style, duration)}s")
 
-        required_connections_ready = bool(api_key and magnific_token and (xai_api_key if style in ("lifestyle_animation", "avatar_outfit") else True))
+        required_connections_ready = bool(api_key and magnific_token)
         with st.expander("API connection", expanded=not required_connections_ready):
             if api_key_from_secrets:
                 st.success("Anthropic API key loaded from Streamlit secrets.")
@@ -5738,16 +5783,8 @@ def main():
                     key="runtime_anthropic_api_key_input",
                 )
 
-            if xai_key_from_secrets:
-                st.success("xAI API key loaded from Streamlit secrets.")
-            else:
-                st.session_state["runtime_xai_api_key"] = st.text_input(
-                    "xAI API Key",
-                    type="password",
-                    value=st.session_state.get("runtime_xai_api_key", ""),
-                    key="runtime_xai_api_key_input",
-                    help="Used to generate Lifestyle approval images with Grok Imagine.",
-                )
+            if xai_key_from_secrets or st.session_state.get("runtime_xai_api_key", ""):
+                st.caption("xAI API key is stored, but Lifestyle Animation now uses Magnific Nano Banana 2 instead of Grok.")
 
             st.session_state["runtime_magnific_token"] = st.text_input(
                 "Magnific token",
@@ -5831,7 +5868,7 @@ def main():
             )
 
             st.markdown("**xAI key for image workflows**")
-            st.markdown('Add `XAI_API_KEY = "your-key"` to Streamlit secrets, or paste the key in the field above. Grok is used for Lifestyle approval images.')
+            st.markdown('Lifestyle approval images now use your existing **Magnific** connection with **Nano Banana 2 · Pro · 2k**. No xAI key is required for this workflow.')
 
             st.markdown("**How to refresh the Magnific token**")
             st.markdown("""
@@ -6369,7 +6406,7 @@ def main():
                         help="Describe where the product should realistically be placed. Include the room or outdoor setting and useful scale references.",
                     ).strip()
                     if not custom_scene:
-                        st.info("Describe the custom scene before generating so Grok knows the correct environment and scale.")
+                        st.info("Describe the custom scene before generating so Nano Banana knows the correct environment and scale.")
 
                 appearance_details = st.text_area(
                     "Product appearance and scale details",
@@ -6397,7 +6434,7 @@ def main():
         st.divider()
         st.subheader("③ Generate")
 
-        has_token = bool(xai_api_key) if style == "lifestyle_animation" else bool(magnific_token)
+        has_token = bool(magnific_token)
 
         # ── Build final product list with selected images ──
         final_products = []
@@ -6583,11 +6620,11 @@ def main():
             if has_token:
                 col1, col2 = st.columns(2)
                 auto_label = "🖼️ Step 2 — Generate Lifestyle Image" if style == "lifestyle_animation" else "🎬 Step 2 — Auto-Generate Videos"
-                prompt_label = "📝 Get Grok + Kling Prompts" if style == "lifestyle_animation" else "📝 Just Get Prompts"
+                prompt_label = "📝 Get Nano Banana + Kling Prompts" if style == "lifestyle_animation" else "📝 Just Get Prompts"
                 auto_btn = col1.button(auto_label, type="primary", use_container_width=True)
                 prompt_btn = col2.button(prompt_label, use_container_width=True)
             else:
-                prompt_label = "📝 Get Grok + Kling Prompts" if style == "lifestyle_animation" else "📝 Get Prompts + Images (generate manually in Magnific)"
+                prompt_label = "📝 Get Nano Banana + Kling Prompts" if style == "lifestyle_animation" else "📝 Get Prompts + Images (generate manually in Magnific)"
                 prompt_btn = st.button(prompt_label, type="primary", use_container_width=True)
 
         if (auto_btn or prompt_btn) and not api_key:
@@ -6671,7 +6708,7 @@ def main():
             with col_prompt:
                 if style == "lifestyle_animation":
                     st.text_area(
-                        "Grok lifestyle image prompt",
+                        "Nano Banana lifestyle image prompt",
                         value=result["lifestyle_prompt"],
                         height=210,
                         key=f"lifestyle_prompt_{i}",
@@ -6746,8 +6783,8 @@ def main():
         if style == "lifestyle_animation":
             st.info("""
 **Manual Lifestyle workflow:**
-1. Generate the approval image with xAI Grok Imagine using **grok-imagine-image-quality**.
-2. Use up to three selected product references, the Grok lifestyle prompt, **9:16**, and **2k**.
+1. Generate the approval image in Magnific using **Nano Banana 2** with **Pro** quality.
+2. Use the selected product references, the lifestyle prompt, **9:16**, and **2k**.
 3. Approve and download the resulting image.
 4. Upload that approved image to Magnific as the **start frame** for **Kling O1**.
 5. Set Kling to **720p**, **5 seconds**, **9:16**, and sound off.
@@ -6816,9 +6853,10 @@ def main():
 
             if style == "lifestyle_animation":
                 prompt_text = product["lifestyle_prompt"]
-                with st.spinner(f"Generating lifestyle image for {product['name'][:30]} with Grok Imagine..."):
-                    gen_result = generate_lifestyle_image_grok(
-                        xai_api_key=xai_api_key,
+                with st.spinner(f"Generating lifestyle image for {product['name'][:30]} with Magnific Nano Banana 2..."):
+                    gen_result = generate_lifestyle_image_magnific(
+                        api_key=api_key,
+                        magnific_token=magnific_token,
                         product_name=product["name"],
                         reference_urls=product.get("image_urls", [product["image_url"]]),
                         prompt=prompt_text,
@@ -6839,12 +6877,22 @@ def main():
                 if gen_result.get("status") == "completed":
                     gen_result["status"] = "image_completed"
                     gen_result["lifestyle_image_url"] = gen_result.get("url") or gen_result.get("preview_url")
-                    st.success(f"✅ **{product['name']}** — Grok lifestyle image is ready for approval")
+                    st.success(f"✅ **{product['name']}** — Magnific lifestyle image is ready for approval")
+                elif gen_result.get("status") in {"queued", "processing", "running", "pending", "unknown"} and gen_result.get("creation_id"):
+                    raw_status = gen_result.get("status")
+                    gen_result["status"] = {
+                        "queued": "image_queued",
+                        "pending": "image_queued",
+                        "processing": "image_processing",
+                        "running": "image_processing",
+                        "unknown": "image_queued",
+                    }.get(raw_status, "image_queued")
+                    st.success(f"✅ **{product['name']}** — Lifestyle image submitted to Magnific. Refresh status in the results section.")
                 elif gen_result.get("status") == "error":
                     error_msg = gen_result.get("error", "")
                     st.error(f"❌ **{product['name']}** — {error_msg}")
-                    if any(keyword in error_msg.lower() for keyword in ['401', 'unauthorized', 'auth', 'api key', 'forbidden', '403']):
-                        st.warning("🔄 xAI authentication failed. Add or refresh the XAI_API_KEY in the API connection section.")
+                    if any(keyword in error_msg.lower() for keyword in ['401', 'unauthorized', 'auth', 'api key', 'token', 'forbidden', '403']):
+                        st.warning("🔄 Magnific authentication failed. Refresh the Magnific token in the API connection section.")
                         token_expired = True
                 else:
                     st.warning(f"⚠️ **{product['name']}** — Status: {gen_result.get('status')}")
@@ -7398,21 +7446,30 @@ def main():
                                 use_container_width=True,
                                 disabled=not bool(api_key and magnific_token),
                             ):
-                                with st.spinner("Generating another lifestyle image with Grok Imagine..."):
-                                    image_result = generate_lifestyle_image_grok(
-                                        xai_api_key=xai_api_key,
+                                with st.spinner("Generating another lifestyle image with Magnific Nano Banana 2..."):
+                                    image_result = generate_lifestyle_image_magnific(
+                                        api_key=api_key,
+                                        magnific_token=magnific_token,
                                         product_name=product_name,
                                         reference_urls=result.get("image_urls", [result.get("image_url")]),
                                         prompt=result.get("lifestyle_prompt") or result.get("prompt_used") or result.get("prompt") or "",
                                     )
-                                if image_result.get("creation_id") and image_result.get("url"):
+                                if image_result.get("creation_id"):
                                     saved_gens[i]["creation_id"] = image_result["creation_id"]
                                     saved_gens[i]["lifestyle_creation_id"] = image_result["creation_id"]
                                     saved_gens[i]["pipeline_stage"] = "image"
-                                    saved_gens[i]["status"] = "image_completed"
-                                    saved_gens[i]["lifestyle_image_url"] = image_result["url"]
-                                    saved_gens[i]["provider"] = "xAI"
-                                    saved_gens[i]["image_model"] = image_result.get("image_model", XAI_IMAGE_MODEL)
+                                    saved_gens[i]["status"] = {
+                                        "completed": "image_completed",
+                                        "queued": "image_queued",
+                                        "pending": "image_queued",
+                                        "processing": "image_processing",
+                                        "running": "image_processing",
+                                        "unknown": "image_queued",
+                                    }.get(image_result.get("status"), image_result.get("status") or "image_queued")
+                                    saved_gens[i]["lifestyle_image_url"] = image_result.get("url") or image_result.get("preview_url")
+                                    saved_gens[i]["provider"] = "Magnific"
+                                    saved_gens[i]["image_model"] = image_result.get("image_model", LIFESTYLE_MAGNIFIC_IMAGE_MODEL)
+                                    saved_gens[i]["image_quality"] = image_result.get("image_quality", LIFESTYLE_MAGNIFIC_IMAGE_QUALITY)
                                     saved_gens[i]["image_resolution"] = "2k"
                                     saved_gens[i]["image_aspect_ratio"] = "9:16"
                                     saved_gens[i].pop("approved_at", None)
@@ -7420,7 +7477,7 @@ def main():
                                     save_generations(saved_gens)
                                     st.rerun()
                                 else:
-                                    st.error(image_result.get("error", "xAI did not return a lifestyle image."))
+                                    st.error(image_result.get("error", "Magnific did not return a lifestyle image."))
                     else:
                         current_prompt = result.get("prompt_used") or result.get("prompt")
                         if current_prompt and api_key:
@@ -7651,7 +7708,7 @@ def main():
                                         "custom_scene": result.get("custom_scene", ""),
                                         "product_type": result.get("product_type"),
                                         "appearance_details": result.get("appearance_details", ""),
-                                        "image_model": result.get("image_model", XAI_IMAGE_MODEL),
+                                        "image_model": result.get("image_model", LIFESTYLE_MAGNIFIC_IMAGE_MODEL),
                                         "image_resolution": result.get("image_resolution", "2k"),
                                         "image_aspect_ratio": result.get("image_aspect_ratio", "9:16"),
                                         "creation_id": result.get("lifestyle_creation_id") or result.get("creation_id"),
@@ -7689,7 +7746,7 @@ def main():
                 if prompt_text_field:
                     with st.expander("📋 Generation prompt", expanded=False):
                         if is_lifestyle_result:
-                            st.markdown("**Grok lifestyle image prompt**")
+                            st.markdown("**Nano Banana lifestyle image prompt**")
                             st.code(result.get("lifestyle_prompt") or prompt_text_field, language=None)
                             st.markdown("**Kling O1 animation prompt**")
                             st.code(result.get("kling_prompt") or "", language=None)
@@ -8121,7 +8178,7 @@ def main():
                         "custom_scene": bulk_result.get("custom_scene", ""),
                         "product_type": bulk_result.get("product_type"),
                         "appearance_details": bulk_result.get("appearance_details", ""),
-                        "image_model": bulk_result.get("image_model", XAI_IMAGE_MODEL),
+                        "image_model": bulk_result.get("image_model", LIFESTYLE_MAGNIFIC_IMAGE_MODEL),
                         "image_resolution": bulk_result.get("image_resolution", "2k"),
                         "image_aspect_ratio": bulk_result.get("image_aspect_ratio", "9:16"),
                         "creation_id": bulk_result.get("lifestyle_creation_id") or bulk_result.get("creation_id"),
