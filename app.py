@@ -2442,7 +2442,7 @@ STYLE_LABELS = {
 LIFESTYLE_IMAGE_MODEL_LABEL = "Grok Imagine Image Quality · 2k · 9:16"
 LIFESTYLE_VIDEO_MODEL_LABEL = "Kling O1 · 720p · 5s · start frame"
 AVATAR_OUTFIT_IMAGE_MODEL_LABEL = "GPT Image 2 · 2k · High · 9:16 · Magnific · 2 references"
-AVATAR_OUTFIT_VIDEO_MODEL_LABEL = "Kling O1 · 720p · ~8s · start frame"
+AVATAR_OUTFIT_VIDEO_MODEL_LABEL = "Kling O1 · 720p · 10s · start frame"
 
 
 def resolved_style_duration(style: str, selected_duration: int = 15) -> int:
@@ -4581,7 +4581,7 @@ def build_avatar_outfit_kling_prompt(
     outfit_description: str,
     shoes_description: str,
 ) -> str:
-    """Build a Kling O1 prompt from the kling-mirror-tryon skill and keep it under 1,900 chars."""
+    """Build a Kling O1 10-second prompt from the kling-mirror-tryon skill and keep it under 1,900 chars."""
     avatar = re.sub(r"\s+", " ", avatar_description.strip())[:180]
     outfit = re.sub(r"\s+", " ", outfit_description.strip())[:330]
     shoes = re.sub(r"\s+", " ", shoes_description.strip())[:100] or "clean white sneakers"
@@ -4594,12 +4594,13 @@ def build_avatar_outfit_kling_prompt(
 
 [00:04-00:06] Step back for a wider full-body view, shift between legs and turn to show the outfit from the side. Free arm gestures casually. Full outfit remains visible head-to-toe.
 
-[00:06-00:08] Settle into a confident final pose at a slight angle and adjust the watch or chain. Outfit fully displayed. End cleanly.
+[00:06-00:08] Move back into a centered confident pose at a slight angle and lightly adjust the watch, chain, or hemline. Outfit fully displayed.
+
+[00:08-00:10] Hold a clean final pose with a subtle sway and a tiny finishing garment adjustment so the last two seconds feel natural. Keep the full outfit visible and end calmly without freezing.
 
 Preserve the exact avatar identity, outfit colors/pattern/fit, shoes, penthouse environment and lighting from the approved start image. One person only. No animals. No voiceover, on-screen text, captions, subtitles, watermarks, music or sound. Photorealistic iPhone UGC realism."""
     prompt = re.sub(r"\s+", " ", prompt).strip()
 
-    # The skill requires < 1,900 characters. Trim descriptions before touching the beat structure.
     if len(prompt) >= 1900:
         avatar = avatar[:110]
         outfit = outfit[:220]
@@ -4607,7 +4608,8 @@ Preserve the exact avatar identity, outfit colors/pattern/fit, shoes, penthouse 
 [00:00-00:02] Full body head-to-toe, front view, upright and still, gentle handheld sway.
 [00:02-00:04] Shift weight, free hand touches garment front, slight quarter-turn. Phone remains at face level.
 [00:04-00:06] Step back, wider full-body view, turn to show the outfit from the side, casual free-arm gesture.
-[00:06-00:08] Confident final pose at a slight angle, adjust watch or chain, clean ending.
+[00:06-00:08] Return to a confident slight-angle pose and lightly adjust watch, chain, or hemline.
+[00:08-00:10] Hold a natural final pose with subtle sway and a tiny finishing garment adjustment. End calmly, no freeze.
 Preserve exact identity, outfit, shoes, setting and lighting from the approved start image. One person only. No animals. No voiceover, text, captions, subtitles, watermarks, music or sound. Photorealistic iPhone UGC."""
         prompt = re.sub(r"\s+", " ", prompt).strip()
     return prompt[:1899]
@@ -4711,10 +4713,11 @@ Use the same Magnific MCP account already configured in the app.
 1. Upload the ONE approved Avatar Outfit mirror-selfie image with creations_upload_image.
 2. Generate an image-to-video with video_generate using model slug kling_o1.
 3. The uploaded approved image MUST be the source/start frame.
-4. Use 9:16, 720p, approximately 8 seconds, sound off, and the provided Kling prompt.
-5. Do not use the original avatar image or original outfit image in this video step.
-6. Submit the generation ONCE and return immediately after you receive the creation identifier. DO NOT call creations_get, DO NOT poll, and DO NOT wait for the video to finish.
-7. Return the Magnific creation identifier.
+4. Use 9:16, 720p, EXACTLY 10 seconds, sound off, and the provided Kling prompt.
+5. Magnific only offers 5s or 10s here. You MUST select the 10-second option.
+6. Do not use the original avatar image or original outfit image in this video step.
+7. Submit the generation ONCE and return immediately after you receive the creation identifier. DO NOT call creations_get, DO NOT poll, and DO NOT wait for the video to finish.
+8. Return the Magnific creation identifier.
 
 Return ONLY valid JSON:
 {"creation_id":"identifier","status":"queued","error":null}
@@ -4840,6 +4843,15 @@ def _refresh_avatar_outfit_bulk_jobs(api_key: str, magnific_token: str) -> int:
     return checked
 
 
+def _refresh_avatar_outfit_step(result: dict, api_key: str, magnific_token: str) -> dict:
+    """Refresh one Avatar Outfit image/video result by creation_id."""
+    creation_id = str((result or {}).get("creation_id") or "").strip()
+    if not creation_id:
+        return result or {}
+    refreshed = check_creation_status(api_key=api_key, magnific_token=magnific_token, creation_id=creation_id)
+    return {**(result or {}), **{k: v for k, v in (refreshed or {}).items() if v is not None}}
+
+
 def _render_avatar_outfit_bulk_queue(api_key: str, magnific_token: str) -> None:
     """Render queued Avatar Outfit images/videos and allow one-click refresh."""
     jobs = _get_avatar_outfit_bulk_jobs()
@@ -4893,6 +4905,28 @@ def _render_avatar_outfit_bulk_queue(api_key: str, magnific_token: str) -> None:
         title = f"{job.get('product_name', 'Outfit')} · {job.get('avatar_label', 'Avatar')}"
         with st.expander(title, expanded=(index == 0)):
             st.caption(f"Queued: {job.get('created_at', '')} · Image: {image_status or 'unknown'}" + (f" · Video: {video_status}" if video else ""))
+
+            action_cols = st.columns([1, 1, 1])
+            if action_cols[0].button(
+                "🔄 Refresh image",
+                key=f"ao_bulk_refresh_image_{job['job_id']}",
+                use_container_width=True,
+                disabled=not bool(api_key and magnific_token and (image.get('creation_id'))),
+            ):
+                with st.spinner("Refreshing image status..."):
+                    job["image"] = _refresh_avatar_outfit_step(image, api_key, magnific_token)
+                st.session_state["avatar_outfit_bulk_jobs"] = jobs
+                st.rerun()
+            if video.get("creation_id") and action_cols[1].button(
+                "🔄 Refresh video",
+                key=f"ao_bulk_refresh_video_{job['job_id']}",
+                use_container_width=True,
+                disabled=not bool(api_key and magnific_token),
+            ):
+                with st.spinner("Refreshing video status..."):
+                    job["video"] = _refresh_avatar_outfit_step(video, api_key, magnific_token)
+                st.session_state["avatar_outfit_bulk_jobs"] = jobs
+                st.rerun()
 
             image_url = image.get("url") or image.get("preview_url")
             if image_status == "error":
@@ -5380,9 +5414,24 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
                 key="avatar_outfit_download_image",
                 use_container_width=True,
             )
+        else:
+            st.caption("If the preview below looks broken but the creation finished in Magnific, click **Refresh image result** on the right to fetch the latest output URL.")
     with action_col:
         st.success("Review identity, outfit accuracy, shoes, full-body framing, and mirror realism before approving.")
         st.caption(f"Magnific used {image_result.get('outfit_reference_count', len(saved_outfit_refs))} outfit reference(s).")
+        st.caption(f"Image status: {image_result.get('status', 'unknown')} · Creation ID: {image_result.get('creation_id', 'n/a')}")
+        if generated_image_url:
+            st.link_button("🔗 Open image in browser", generated_image_url, use_container_width=True)
+        if st.button(
+            "🔄 Refresh image result",
+            use_container_width=True,
+            key="avatar_outfit_refresh_completed_image",
+            disabled=not bool(api_key and magnific_token and image_result.get('creation_id')),
+        ):
+            with st.spinner("Refreshing Magnific image status..."):
+                merged = _refresh_avatar_outfit_step(image_result, api_key, magnific_token)
+            st.session_state["avatar_outfit_image_result"] = merged
+            st.rerun()
         regen_col, approve_col = st.columns(2)
         if regen_col.button(
             "🔁 Regenerate image",
