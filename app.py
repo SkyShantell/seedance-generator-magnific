@@ -4625,7 +4625,8 @@ Use the same Magnific MCP account already configured in the app.
 8. You MUST use resolution 2k.
 9. You MUST use aspect ratio 9:16.
 10. Do not use GPT Image 1 or any default fallback image model.
-11. Return ONLY valid JSON (no markdown): {"creation_id":"the magnific creation identifier","status":"queued","url":null,"preview_url":null,"error":null}
+11. Submit the generation ONCE and return immediately after you receive the creation identifier. DO NOT call creations_get, DO NOT poll, and DO NOT wait for the image to finish.
+12. Return ONLY valid JSON (no markdown): {"creation_id":"the magnific creation identifier","status":"queued","url":null,"preview_url":null,"error":null}
 """
 
 
@@ -4712,7 +4713,8 @@ Use the same Magnific MCP account already configured in the app.
 3. The uploaded approved image MUST be the source/start frame.
 4. Use 9:16, 720p, approximately 8 seconds, sound off, and the provided Kling prompt.
 5. Do not use the original avatar image or original outfit image in this video step.
-6. Return the Magnific creation identifier.
+6. Submit the generation ONCE and return immediately after you receive the creation identifier. DO NOT call creations_get, DO NOT poll, and DO NOT wait for the video to finish.
+7. Return the Magnific creation identifier.
 
 Return ONLY valid JSON:
 {"creation_id":"identifier","status":"queued","error":null}
@@ -4775,6 +4777,189 @@ def _reset_avatar_outfit_generated_state() -> None:
         st.session_state.pop(key, None)
 
 
+
+AVATAR_OUTFIT_PENDING_STATUSES = {"", "queued", "pending", "processing", "running", "unknown"}
+
+
+def _get_avatar_outfit_bulk_jobs() -> list[dict]:
+    """Return the in-session Avatar Outfit queue."""
+    jobs = st.session_state.get("avatar_outfit_bulk_jobs")
+    if not isinstance(jobs, list):
+        jobs = []
+        st.session_state["avatar_outfit_bulk_jobs"] = jobs
+    return jobs
+
+
+def _queue_avatar_outfit_image_job(
+    image_result: dict,
+    avatar_label: str,
+    product_name: str,
+    kling_prompt: str,
+) -> dict:
+    """Save a submitted image generation so the member can immediately start another outfit."""
+    creation_id = str(image_result.get("creation_id") or "").strip()
+    seed = f"{creation_id}|{avatar_label}|{product_name}|{time.time_ns()}"
+    job = {
+        "job_id": hashlib.sha1(seed.encode("utf-8")).hexdigest()[:14],
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "avatar_label": avatar_label or "Avatar",
+        "product_name": product_name or "Outfit",
+        "kling_prompt": kling_prompt,
+        "approved": False,
+        "image": dict(image_result or {}),
+        "video": {},
+    }
+    jobs = _get_avatar_outfit_bulk_jobs()
+    jobs.insert(0, job)
+    # Keep the live session manageable while preserving plenty of recent work.
+    del jobs[50:]
+    st.session_state["avatar_outfit_bulk_jobs"] = jobs
+    return job
+
+
+def _refresh_avatar_outfit_bulk_jobs(api_key: str, magnific_token: str) -> int:
+    """Refresh every pending image/video job with one button."""
+    jobs = _get_avatar_outfit_bulk_jobs()
+    checked = 0
+    for job in jobs:
+        for step in ("image", "video"):
+            result = job.get(step) or {}
+            creation_id = str(result.get("creation_id") or "").strip()
+            status = str(result.get("status") or "").strip().lower()
+            if not creation_id or status not in AVATAR_OUTFIT_PENDING_STATUSES:
+                continue
+            refreshed = check_creation_status(
+                api_key=api_key,
+                magnific_token=magnific_token,
+                creation_id=creation_id,
+            )
+            merged = {**result, **{k: v for k, v in (refreshed or {}).items() if v is not None}}
+            job[step] = merged
+            checked += 1
+    st.session_state["avatar_outfit_bulk_jobs"] = jobs
+    return checked
+
+
+def _render_avatar_outfit_bulk_queue(api_key: str, magnific_token: str) -> None:
+    """Render queued Avatar Outfit images/videos and allow one-click refresh."""
+    jobs = _get_avatar_outfit_bulk_jobs()
+    st.markdown("### 📦 Bulk Avatar Outfit Queue")
+
+    message = st.session_state.pop("avatar_outfit_queue_message", None)
+    if message:
+        st.success(message)
+
+    if not jobs:
+        st.caption("Queue Avatar Outfit images below. You can immediately start the next outfit, then use **Refresh All** here later.")
+        return
+
+    pending_count = 0
+    completed_images = 0
+    completed_videos = 0
+    for job in jobs:
+        image = job.get("image") or {}
+        video = job.get("video") or {}
+        image_status = str(image.get("status") or "").lower()
+        video_status = str(video.get("status") or "").lower()
+        if image.get("creation_id") and image_status in AVATAR_OUTFIT_PENDING_STATUSES:
+            pending_count += 1
+        if video.get("creation_id") and video_status in AVATAR_OUTFIT_PENDING_STATUSES:
+            pending_count += 1
+        if image_status == "completed" and (image.get("url") or image.get("preview_url")):
+            completed_images += 1
+        if video_status == "completed" and (video.get("url") or video.get("preview_url")):
+            completed_videos += 1
+
+    top1, top2, top3 = st.columns([1.4, 1, 1])
+    if top1.button(
+        f"🔄 Refresh All ({pending_count} pending)",
+        key="avatar_outfit_bulk_refresh_all",
+        use_container_width=True,
+        type="primary",
+        disabled=not bool(api_key and magnific_token and pending_count),
+    ):
+        with st.spinner("Refreshing queued Avatar Outfit jobs..."):
+            checked = _refresh_avatar_outfit_bulk_jobs(api_key, magnific_token)
+        st.session_state["avatar_outfit_queue_message"] = f"Refreshed {checked} pending creation{'s' if checked != 1 else ''}."
+        st.rerun()
+    top2.metric("Images ready", completed_images)
+    top3.metric("Videos ready", completed_videos)
+
+    for index, job in enumerate(list(jobs)):
+        image = job.get("image") or {}
+        video = job.get("video") or {}
+        image_status = str(image.get("status") or "unknown").lower()
+        video_status = str(video.get("status") or "").lower()
+        title = f"{job.get('product_name', 'Outfit')} · {job.get('avatar_label', 'Avatar')}"
+        with st.expander(title, expanded=(index == 0)):
+            st.caption(f"Queued: {job.get('created_at', '')} · Image: {image_status or 'unknown'}" + (f" · Video: {video_status}" if video else ""))
+
+            image_url = image.get("url") or image.get("preview_url")
+            if image_status == "error":
+                st.error(image.get("error") or "Image generation failed.")
+            elif image_url:
+                st.image(image_url, caption="Generated try-on image", use_container_width=True)
+                if not job.get("approved"):
+                    if st.button(
+                        "✅ Approve image & queue Kling O1",
+                        key=f"ao_bulk_approve_{job['job_id']}",
+                        type="primary",
+                        use_container_width=True,
+                        disabled=not bool(api_key and magnific_token),
+                    ):
+                        with st.spinner("Submitting Kling O1 video job..."):
+                            video_result = generate_avatar_outfit_kling_magnific(
+                                api_key=api_key,
+                                magnific_token=magnific_token,
+                                approved_image_url=image_url,
+                                prompt=job.get("kling_prompt") or "",
+                            )
+                        if video_result.get("error"):
+                            st.error(video_result["error"])
+                        else:
+                            job["approved"] = True
+                            job["video"] = video_result
+                            st.session_state["avatar_outfit_bulk_jobs"] = jobs
+                            st.session_state["avatar_outfit_queue_message"] = "Kling O1 job queued. You can continue working and refresh later."
+                            st.rerun()
+            else:
+                creation_id = image.get("creation_id")
+                if creation_id:
+                    st.info(f"Image job submitted: `{creation_id}` · {image_status or 'processing'}")
+                else:
+                    st.warning("This queued item has no image creation ID.")
+
+            if job.get("approved"):
+                if not video:
+                    st.info("Image approved. Kling O1 has not been queued yet.")
+                elif video_status == "error":
+                    st.error(video.get("error") or "Kling O1 generation failed.")
+                else:
+                    video_url = video.get("url") or video.get("preview_url")
+                    if video_url:
+                        st.video(video_url)
+                        video_bytes = fetch_video_bytes(video_url)
+                        if video_bytes:
+                            st.download_button(
+                                "⬇️ Download Avatar Outfit video",
+                                data=video_bytes,
+                                file_name=f"avatar_outfit_{video.get('creation_id', job['job_id'])}.mp4",
+                                mime="video/mp4",
+                                key=f"ao_bulk_download_{job['job_id']}",
+                                use_container_width=True,
+                            )
+                    elif video.get("creation_id"):
+                        st.info(f"Kling O1 submitted: `{video.get('creation_id')}` · {video_status or 'processing'}")
+
+            if st.button(
+                "🗑️ Remove from queue",
+                key=f"ao_bulk_remove_{job['job_id']}",
+                use_container_width=True,
+            ):
+                st.session_state["avatar_outfit_bulk_jobs"] = [j for j in jobs if j.get("job_id") != job.get("job_id")]
+                st.rerun()
+
+
 def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: str) -> None:
     """Avatar Outfit: saved avatar + multi-photo TikTok outfit/review references."""
     st.markdown("## 🪞 Avatar Outfit")
@@ -4787,6 +4972,9 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
     st.caption(
         "Large avatar/outfit files are optimized automatically. Claude analysis gets a resized copy, and local images get a separate compact reference copy for the Magnific MCP request so base64 data cannot overflow the prompt limit."
     )
+
+    _render_avatar_outfit_bulk_queue(api_key, magnific_token)
+    st.divider()
 
     avatar_records, avatar_library_dir = load_avatar_library()
     outfit_mode = st.radio(
@@ -5119,14 +5307,23 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
                 if merged.get("status") == "error" and merged.get("error"):
                     st.error(merged["error"])
                 st.rerun()
-        if st.button(
-            "🖼️ Step 2 — Generate Avatar Outfit Image",
+        submit_col, single_col = st.columns(2)
+        queue_submit = submit_col.button(
+            "➕ Queue image & start next",
             type="primary",
+            use_container_width=True,
+            key="avatar_outfit_queue_image",
+            disabled=not bool(api_key and magnific_token and saved_avatar_ref and saved_outfit_refs),
+        )
+        single_submit = single_col.button(
+            "🖼️ Generate here",
             use_container_width=True,
             key="avatar_outfit_generate_image",
             disabled=not bool(api_key and magnific_token and saved_avatar_ref and saved_outfit_refs),
-        ):
-            with st.spinner(f"Generating with Magnific GPT Image 2 using {len(saved_outfit_refs)} outfit reference(s)..."):
+        )
+
+        if queue_submit or single_submit:
+            with st.spinner(f"Submitting Magnific GPT Image 2 with {len(saved_outfit_refs)} outfit reference(s)..."):
                 result = generate_avatar_outfit_image_magnific(
                     api_key=api_key,
                     magnific_token=magnific_token,
@@ -5136,6 +5333,30 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
                 )
             if result.get("error"):
                 st.error(result["error"])
+            elif queue_submit:
+                _queue_avatar_outfit_image_job(
+                    image_result=result,
+                    avatar_label=analysis.get("avatar_label") or avatar_source_label or "Avatar",
+                    product_name=analysis.get("product_name") or outfit_name_prefill or "Outfit",
+                    kling_prompt=kling_prompt,
+                )
+                # Clear only the active work item; queued jobs remain available above.
+                for key in (
+                    "avatar_outfit_analysis",
+                    "avatar_outfit_image_result",
+                    "avatar_outfit_image_approved",
+                    "avatar_outfit_video_result",
+                    "avatar_outfit_input_signature",
+                    "avatar_outfit_scraped_product",
+                    "avatar_outfit_scraped_source_url",
+                    "avatar_outfit_magnific_references",
+                    "avatar_outfit_avatar_reference",
+                ):
+                    st.session_state.pop(key, None)
+                st.session_state["avatar_outfit_queue_message"] = (
+                    f"Queued {analysis.get('product_name') or outfit_name_prefill or 'outfit'} for {analysis.get('avatar_label') or avatar_source_label or 'avatar'}. Start the next outfit below, then use Refresh All later."
+                )
+                st.rerun()
             else:
                 st.session_state["avatar_outfit_image_result"] = result
                 if result.get("omitted_reference_count"):
@@ -5213,7 +5434,7 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
             disabled=not bool(api_key and magnific_token and generated_image_url),
         ):
             with st.spinner("Sending the approved mirror image to Kling O1 as the start frame..."):
-                result = generate_avatar_outfit_kling_video(
+                result = generate_avatar_outfit_kling_magnific(
                     api_key=api_key,
                     magnific_token=magnific_token,
                     approved_image_url=generated_image_url,
@@ -5266,7 +5487,7 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
             disabled=not bool(api_key and magnific_token and generated_image_url),
         ):
             with st.spinner("Generating a fresh Kling O1 mirror video from the approved image..."):
-                result = generate_avatar_outfit_kling_video(
+                result = generate_avatar_outfit_kling_magnific(
                     api_key=api_key,
                     magnific_token=magnific_token,
                     approved_image_url=generated_image_url,
