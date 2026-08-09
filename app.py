@@ -4129,32 +4129,114 @@ def _remote_image_payload(image_url: str) -> tuple[bytes, str, str]:
     return data, mime, data_uri
 
 
+def _prepare_image_for_avatar_analysis(
+    image_bytes: bytes,
+    mime_type: str,
+    max_bytes: int = 3 * 1024 * 1024,
+    max_edge: int = 1600,
+) -> tuple[bytes, str]:
+    """Resize/compress a reference image for Claude vision only.
+
+    The original image bytes are left untouched elsewhere and are still used for
+    Magnific GPT Image 2 generation. This only prevents oversized base64 images
+    from exceeding the vision request limit during avatar/outfit analysis.
+    """
+    if not image_bytes:
+        return b"", mime_type or "image/jpeg"
+
+    # Already comfortably below the request limit; still normalize very large
+    # pixel dimensions because camera photos can be unnecessarily expensive.
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            img.load()
+            width, height = img.size
+            needs_resize = max(width, height) > max_edge
+            needs_compress = len(image_bytes) > max_bytes
+            if not needs_resize and not needs_compress:
+                return image_bytes, mime_type or "image/jpeg"
+
+            # Correct phone EXIF orientation when available without requiring ImageOps.
+            try:
+                exif = img.getexif()
+                orientation = exif.get(274) if exif else None
+                if orientation == 3:
+                    img = img.rotate(180, expand=True)
+                elif orientation == 6:
+                    img = img.rotate(270, expand=True)
+                elif orientation == 8:
+                    img = img.rotate(90, expand=True)
+            except Exception:
+                pass
+
+            if img.mode not in ("RGB", "L"):
+                # Composite transparent images onto white so clothing/avatar edges
+                # remain clean after JPEG compression.
+                if "A" in img.getbands():
+                    rgba = img.convert("RGBA")
+                    bg = Image.new("RGB", rgba.size, "white")
+                    bg.paste(rgba, mask=rgba.getchannel("A"))
+                    img = bg
+                else:
+                    img = img.convert("RGB")
+            elif img.mode == "L":
+                img = img.convert("RGB")
+
+            if max(img.size) > max_edge:
+                scale = max_edge / float(max(img.size))
+                img = img.resize(
+                    (max(1, int(img.width * scale)), max(1, int(img.height * scale))),
+                    Image.Resampling.LANCZOS,
+                )
+
+            # Try a few JPEG qualities. 3 MB leaves a comfortable margin below
+            # the 10 MB per-image vision limit shown by the API error.
+            for quality in (90, 85, 80, 75, 70, 65):
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=quality, optimize=True)
+                output = buf.getvalue()
+                if len(output) <= max_bytes:
+                    return output, "image/jpeg"
+
+            # Extremely detailed images: scale down once more and save compactly.
+            scale = 0.75
+            img = img.resize(
+                (max(1, int(img.width * scale)), max(1, int(img.height * scale))),
+                Image.Resampling.LANCZOS,
+            )
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=65, optimize=True)
+            return buf.getvalue(), "image/jpeg"
+    except Exception:
+        # If Pillow cannot decode it, return the original and let the API report
+        # the actual format problem rather than silently dropping the image.
+        return image_bytes, mime_type or "image/jpeg"
+
+
 def analyze_avatar_outfit_images(
     api_key: str,
     avatar_bytes: bytes,
     avatar_mime: str,
-    outfit_bytes: bytes,
-    outfit_mime: str,
+    outfit_images: list[dict],
 ) -> dict:
-    """Analyze the two skill inputs using the uploaded-skill rules."""
+    """Analyze one avatar plus multiple outfit/listing/review references."""
     if not api_key:
         return {"error": "Anthropic API key is missing."}
-    if not avatar_bytes or not outfit_bytes:
-        return {"error": "Upload both the avatar image and the outfit image."}
+    if not avatar_bytes or not outfit_images:
+        return {"error": "Choose an avatar and at least one outfit image."}
 
-    system = """You analyze two images for an AI-avatar clothing try-on workflow.
-Image 1 is the AVATAR. Image 2 is the OUTFIT.
+    system = """You analyze images for an AI-avatar clothing try-on workflow.
+Image 1 is always the AVATAR. Every later image is an OUTFIT REFERENCE. Outfit references may include official listing photos and customer review photos showing the same product from different angles or in real use.
 
 For the avatar, describe ONLY visible physical appearance: build, descriptive skin tone, hair style/length/color, visible facial hair, visible face details, and clearly visible tattoos/piercings/features. Do NOT describe the avatar's current clothing. Do NOT use age words. Do NOT use race or ethnicity labels. Do not guess.
 
-For the outfit, describe ONLY the clothing/footwear product, never the person modeling it. Capture garment pieces, silhouette/fit, neckline/collar, visible material look, colors, pattern/print, buttons/zippers/drawstrings/pockets and other visible construction. Do NOT use brand names; describe visual design instead.
+For the outfit, combine evidence from ALL outfit references. Describe ONLY the clothing/footwear product, never the people modeling it. Use repeated views to improve accuracy for garment pieces, silhouette/fit, neckline/collar, visible material look, colors, pattern/print, buttons/zippers/drawstrings/pockets, front/back/side construction, and footwear. If a customer review image conflicts with a clearer official listing image, prioritize the official listing image for product color/design while using review photos for real-world fit and details. Do NOT use brand names; describe visual design instead.
 
-Also determine whether shoes are visibly included. If shoes are visible, describe them. If not, return clean white sneakers as the default. If only a top is visible with no matching bottom, set bottom_fallback to black fitted jogger pants; otherwise leave bottom_fallback empty.
+Determine whether shoes are visibly included in any selected outfit reference. If shoes are visible, describe them. If not, return clean white sneakers as the default. If only a top is visible across all selected references with no matching bottom, set bottom_fallback to black fitted jogger pants; otherwise leave bottom_fallback empty.
 
 Return ONLY valid JSON:
 {
   "avatar_description":"concise visible physical description",
-  "outfit_description":"rich but concise outfit description",
+  "outfit_description":"rich but concise combined outfit description from all selected references",
   "shoes_description":"visible shoes or clean white sneakers",
   "bottom_fallback":"black fitted jogger pants or empty string",
   "outfit_has_shoes":true,
@@ -4162,34 +4244,55 @@ Return ONLY valid JSON:
 }"""
 
     try:
+        analysis_avatar_bytes, analysis_avatar_mime = _prepare_image_for_avatar_analysis(avatar_bytes, avatar_mime)
+        content = [
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": analysis_avatar_mime,
+                    "data": base64.b64encode(analysis_avatar_bytes).decode("ascii"),
+                },
+            },
+            {"type": "text", "text": "IMAGE 1 — AVATAR. Analyze identity/appearance only. Ignore current clothing."},
+        ]
+
+        usable_count = 0
+        for index, item in enumerate(outfit_images[:10], start=2):
+            raw_bytes = item.get("bytes") or b""
+            raw_mime = item.get("mime") or "image/jpeg"
+            if not raw_bytes:
+                continue
+            prepared_bytes, prepared_mime = _prepare_image_for_avatar_analysis(raw_bytes, raw_mime)
+            if not prepared_bytes:
+                continue
+            usable_count += 1
+            label = str(item.get("label") or f"Outfit reference {usable_count}")
+            source_type = str(item.get("source_type") or "outfit reference")
+            content.extend([
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": prepared_mime,
+                        "data": base64.b64encode(prepared_bytes).decode("ascii"),
+                    },
+                },
+                {
+                    "type": "text",
+                    "text": f"IMAGE {index} — OUTFIT REFERENCE ({source_type}): {label}. Analyze clothing/footwear only; ignore any person wearing it.",
+                },
+            ])
+
+        if usable_count == 0:
+            return {"error": "None of the selected outfit images could be loaded for analysis."}
+
         client = anthropic.Anthropic(api_key=api_key)
         response = client.messages.create(
             model=MODEL,
-            max_tokens=900,
+            max_tokens=1000,
             system=system,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": avatar_mime,
-                            "data": base64.b64encode(avatar_bytes).decode("ascii"),
-                        },
-                    },
-                    {"type": "text", "text": "IMAGE 1 — AVATAR. Analyze identity/appearance only. Ignore current clothing."},
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": outfit_mime,
-                            "data": base64.b64encode(outfit_bytes).decode("ascii"),
-                        },
-                    },
-                    {"type": "text", "text": "IMAGE 2 — OUTFIT. Analyze garment/footwear only. Ignore any model wearing it."},
-                ],
-            }],
+            messages=[{"role": "user", "content": content}],
         )
         text_blocks = [block.text for block in response.content if getattr(block, "type", "") == "text"]
         parsed = _extract_json_object("\n".join(text_blocks)) or {}
@@ -4197,10 +4300,10 @@ Return ONLY valid JSON:
             return {"error": "Could not extract both avatar and outfit descriptions."}
         parsed["shoes_description"] = (parsed.get("shoes_description") or "clean white sneakers").strip()
         parsed["bottom_fallback"] = (parsed.get("bottom_fallback") or "").strip()
+        parsed["outfit_reference_count"] = usable_count
         return parsed
     except Exception as exc:
         return {"error": f"Avatar/outfit analysis failed: {exc}"}
-
 
 def build_avatar_outfit_image_prompt(
     avatar_description: str,
@@ -4268,34 +4371,39 @@ Preserve exact identity, outfit, shoes, setting and lighting from the approved s
 
 AVATAR_OUTFIT_IMAGE_GENERATE_SYSTEM = """You are an image production assistant with access to Magnific tools.
 Use the same Magnific MCP account already configured in the app.
-1. Upload BOTH provided reference images to Magnific using creations_upload_image.
+1. Upload EVERY provided reference image to Magnific using creations_upload_image.
 2. Reference image 1 is the avatar/identity reference. Preserve this exact person's appearance and identity.
-3. Reference image 2 is the outfit/clothing reference. Use it only for the clothing, shoes, and wearable styling.
-4. Generate EXACTLY ONE final mirror-selfie try-on image.
-5. You MUST use model slug gpt_image_2.
-6. You MUST use quality high.
-7. You MUST use resolution 2k.
-8. You MUST use aspect ratio 9:16.
-9. Do not use GPT Image 1 or any default fallback image model.
-10. Return ONLY valid JSON (no markdown): {"creation_id":"the magnific creation identifier","status":"queued","url":null,"preview_url":null,"error":null}
+3. Reference images 2+ are outfit/clothing references. They may include official listing photos and customer review photos of the same outfit from different views. Use ALL of them together for clothing, shoes, fit, color, material, and construction accuracy.
+4. If references conflict, prioritize clear official listing photos for exact product design/color and use customer review photos as supporting evidence for real-world fit/details.
+5. Generate EXACTLY ONE final mirror-selfie try-on image.
+6. You MUST use model slug gpt_image_2.
+7. You MUST use quality high.
+8. You MUST use resolution 2k.
+9. You MUST use aspect ratio 9:16.
+10. Do not use GPT Image 1 or any default fallback image model.
+11. Return ONLY valid JSON (no markdown): {"creation_id":"the magnific creation identifier","status":"queued","url":null,"preview_url":null,"error":null}
 """
 
 
 def generate_avatar_outfit_image_magnific(
     api_key: str,
     magnific_token: str,
-    avatar_data_uri: str,
-    outfit_data_uri: str,
+    avatar_reference: str,
+    outfit_references: list[str],
     prompt: str,
 ) -> dict:
-    """Use Magnific GPT Image 2 with two references: avatar first, outfit second."""
+    """Use Magnific GPT Image 2 with one avatar plus multiple outfit references."""
     if not api_key:
         return {"creation_id": None, "status": "error", "error": "The Anthropic API key is missing."}
     if not magnific_token:
         return {"creation_id": None, "status": "error", "error": "The Magnific authorization token is missing."}
-    if not avatar_data_uri or not outfit_data_uri:
-        return {"creation_id": None, "status": "error", "error": "Upload both avatar and outfit images."}
+    outfit_references = [str(ref or "").strip() for ref in (outfit_references or []) if str(ref or "").strip()]
+    if not avatar_reference or not outfit_references:
+        return {"creation_id": None, "status": "error", "error": "Choose an avatar and at least one outfit reference."}
 
+    # Keep the reference set practical for the MCP request while still supporting
+    # multiple official + review views. The UI currently allows up to 10 selected refs.
+    outfit_references = outfit_references[:10]
     mcp_servers = [{
         "type": "url",
         "url": MAGNIFIC_MCP_URL,
@@ -4306,6 +4414,10 @@ def generate_avatar_outfit_image_magnific(
 
     try:
         client = anthropic.Anthropic(api_key=api_key)
+        reference_lines = [f"Reference image 1 (AVATAR identity): {avatar_reference}"]
+        for idx, ref in enumerate(outfit_references, start=2):
+            reference_lines.append(f"Reference image {idx} (OUTFIT reference): {ref}")
+        refs_text = "\n\n".join(reference_lines)
         response = client.beta.messages.create(
             model=MODEL,
             max_tokens=2048,
@@ -4315,11 +4427,8 @@ def generate_avatar_outfit_image_magnific(
                 "content": (
                     "Generate one Avatar Outfit mirror-selfie try-on image.\n"
                     "Required Magnific settings: model slug = gpt_image_2, quality = high, resolution = 2k, aspect ratio = 9:16.\n"
-                    "Reference image 1 below is the avatar identity to preserve exactly.\n"
-                    "Reference image 2 below is the outfit / clothing / shoes reference.\n"
-                    "Upload both references to Magnific using creations_upload_image, then generate the final image.\n\n"
-                    f"Reference image 1 data URI (avatar): {avatar_data_uri}\n\n"
-                    f"Reference image 2 data URI (outfit): {outfit_data_uri}\n\n"
+                    "Upload every reference below to Magnific. Reference 1 is the avatar. Every later reference is the same outfit/product from additional listing or customer-review views.\n\n"
+                    f"{refs_text}\n\n"
                     f"Final image prompt:\n{prompt}"
                 ),
             }],
@@ -4333,7 +4442,8 @@ def generate_avatar_outfit_image_magnific(
         result["image_quality"] = "high"
         result["image_resolution"] = "2k"
         result["image_aspect_ratio"] = "9:16"
-        result["reference_count"] = 2
+        result["reference_count"] = 1 + len(outfit_references)
+        result["outfit_reference_count"] = len(outfit_references)
         return result
     except Exception as exc:
         return {"creation_id": None, "status": "error", "error": f"Avatar Outfit image generation failed: {exc}"}
@@ -4410,19 +4520,22 @@ def _reset_avatar_outfit_generated_state() -> None:
 
 
 def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: str) -> None:
-    """Avatar Outfit workflow: choose a saved avatar + scrape outfit product or upload outfit image."""
+    """Avatar Outfit: saved avatar + multi-photo TikTok outfit/review references."""
     st.markdown("## 🪞 Avatar Outfit")
     st.caption(
-        "Choose a saved avatar from your repo library, then paste a TikTok Shop clothing link or upload an outfit image. The app analyzes both, generates the mirror-selfie try-on image with Magnific GPT Image 2, then animates that approved image with Kling O1."
+        "Choose a saved avatar, then paste a TikTok Shop clothing link or upload outfit photos. You can select multiple official listing photos and customer review photos before generating the try-on."
     )
     st.info(
-        "This workflow intentionally has **no hook text, captions, voiceover, music, or soundtrack** because the uploaded mirror-try-on skill requires a clean silent continuous shot."
+        "Selected outfit photos are analyzed together and sent to Magnific GPT Image 2 as supporting references. The Avatar Outfit video remains a clean, silent Kling O1 mirror try-on with no hook text, captions, voiceover, music, or soundtrack."
+    )
+    st.caption(
+        "Large avatar/outfit files are automatically optimized for Claude analysis only. The original selected references are used for Magnific GPT Image 2."
     )
 
     avatar_records, avatar_library_dir = load_avatar_library()
     outfit_mode = st.radio(
         "Outfit source",
-        ["TikTok Shop link", "Upload image manually"],
+        ["TikTok Shop link", "Upload images manually"],
         horizontal=True,
         key="avatar_outfit_source_mode",
     )
@@ -4436,11 +4549,12 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
                 "Saved avatars",
                 options=list(avatar_options.keys()),
                 key="avatar_outfit_avatar_library_select",
-                help="These avatars are loaded from the repo folder avatar_library/ or avatars/.",
+                help="Loaded from avatar_library/ or avatars/ in the repo.",
             )
             selected_avatar = avatar_options[selected_avatar_label]
             st.image(selected_avatar["path"], caption=f"Selected avatar — {selected_avatar['label']}", use_container_width=True)
             avatar_bytes, avatar_mime, avatar_data_uri = _local_image_payload(selected_avatar["path"])
+            avatar_reference = avatar_data_uri
             st.caption(f"Library folder: {avatar_library_dir}")
             avatar_source_label = selected_avatar["label"]
         else:
@@ -4449,22 +4563,25 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
                 "Fallback avatar image",
                 type=["jpg", "jpeg", "png", "webp"],
                 key="avatar_outfit_avatar_upload_fallback",
-                help="This is temporary. For reusable avatars, add them to avatar_library/ in the GitHub repo.",
             )
             if avatar_file is not None:
                 st.image(avatar_file, caption="Avatar reference — identity / appearance", use_container_width=True)
             avatar_bytes, avatar_mime, avatar_data_uri = _uploaded_image_payload(avatar_file)
+            avatar_reference = avatar_data_uri
             avatar_source_label = getattr(avatar_file, "name", "Uploaded avatar") if avatar_file else ""
 
+    outfit_analysis_images = []
+    outfit_magnific_references = []
+    outfit_name_prefill = ""
+
     with input_col_2:
-        st.markdown("### 2. Choose outfit")
-        outfit_name_prefill = ""
+        st.markdown("### 2. Choose outfit references")
         if outfit_mode == "TikTok Shop link":
             outfit_link = st.text_input(
                 "TikTok Shop clothing link",
                 key="avatar_outfit_tiktok_link",
                 placeholder="https://www.tiktok.com/view/product/...",
-                help="Paste a TikTok Shop outfit/clothing/shoe product link. The app will scrape the product photos and let you choose which one to use.",
+                help="Scrape official product photos and customer review photos, then select multiple references below.",
             ).strip()
             if st.button(
                 "🔎 Scrape outfit product",
@@ -4472,20 +4589,20 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
                 use_container_width=True,
                 disabled=not bool(outfit_link),
             ):
-                with st.spinner("Scraping the TikTok Shop product..."):
+                with st.spinner("Scraping listing and customer review photos..."):
                     scraped = scrape_product(outfit_link, api_key=api_key)
                 if not scraped:
                     st.error("Could not scrape that TikTok Shop outfit link.")
                 else:
                     st.session_state["avatar_outfit_scraped_product"] = scraped
-                    default_image = (scraped.get("listing_images") or scraped.get("images") or [None])[0]
-                    if default_image:
-                        st.session_state["avatar_outfit_selected_image_url"] = default_image
+                    st.session_state["avatar_outfit_scraped_source_url"] = outfit_link
                     st.rerun()
 
             scraped = st.session_state.get("avatar_outfit_scraped_product") or {}
-            if outfit_link and scraped and scraped.get("source_url") != outfit_link:
+            scraped_source = st.session_state.get("avatar_outfit_scraped_source_url", "")
+            if outfit_link and scraped and scraped_source and scraped_source != outfit_link:
                 scraped = {}
+
             if scraped:
                 outfit_name_prefill = scraped.get("name") or ""
                 st.success(f"Scraped product: {scraped.get('name', 'Unknown Product')}")
@@ -4495,36 +4612,87 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
                     "Outfit product name",
                     value=scraped.get("name") or "",
                     key="avatar_outfit_scraped_name_edit",
-                    help="You can edit the recovered product name if needed.",
                 ).strip()
                 if product_name_manual:
                     outfit_name_prefill = product_name_manual
-                image_candidates = (scraped.get("listing_images") or []) + [u for u in (scraped.get("review_images") or []) if u not in (scraped.get("listing_images") or [])]
-                current_selected = st.session_state.get("avatar_outfit_selected_image_url")
-                if current_selected not in image_candidates and image_candidates:
-                    current_selected = image_candidates[0]
-                    st.session_state["avatar_outfit_selected_image_url"] = current_selected
-                if image_candidates:
-                    st.markdown("**Choose which product image to use**")
-                    cols = st.columns(3)
-                    for idx, image_url in enumerate(image_candidates[:12]):
-                        with cols[idx % 3]:
-                            st.image(image_url, use_container_width=True)
-                            label = "✅ Selected" if image_url == current_selected else "Use this image"
-                            if st.button(label, key=f"avatar_outfit_pick_img_{idx}", use_container_width=True):
-                                st.session_state["avatar_outfit_selected_image_url"] = image_url
-                                st.rerun()
-                    if current_selected:
-                        st.caption("Selected outfit image preview")
-                        st.image(current_selected, use_container_width=True)
-                        outfit_bytes, outfit_mime, outfit_data_uri = _remote_image_payload(current_selected)
+
+                listing_images = list(scraped.get("listing_images") or [])
+                review_images = list(scraped.get("review_images") or [])
+                product_key = re.sub(r"[^a-zA-Z0-9]+", "_", str(scraped.get("product_id") or hashlib.sha1((outfit_link or 'outfit').encode()).hexdigest()[:10]))
+
+                st.markdown("**Select multiple outfit references**")
+                st.caption("Choose up to 10 total. Listing photos are best for exact color/design; review photos help with real-world fit and alternate angles.")
+                listing_tab, review_tab = st.tabs([
+                    f"Product photos ({len(listing_images)})",
+                    f"Customer reviews ({len(review_images)})",
+                ])
+
+                selected_items = []
+                with listing_tab:
+                    if listing_images:
+                        cols = st.columns(3)
+                        for idx, image_url in enumerate(listing_images[:18]):
+                            with cols[idx % 3]:
+                                st.image(image_url, use_container_width=True)
+                                checked = st.checkbox(
+                                    f"Use product photo {idx + 1}",
+                                    value=(idx == 0),
+                                    key=f"ao_listing_{product_key}_{idx}",
+                                )
+                                if checked:
+                                    selected_items.append({
+                                        "url": image_url,
+                                        "label": f"Product photo {idx + 1}",
+                                        "source_type": "official listing photo",
+                                    })
                     else:
-                        outfit_bytes, outfit_mime, outfit_data_uri = b"", "image/jpeg", ""
+                        st.caption("No official listing photos were found.")
+
+                with review_tab:
+                    if review_images:
+                        cols = st.columns(3)
+                        for idx, image_url in enumerate(review_images[:24]):
+                            with cols[idx % 3]:
+                                st.image(image_url, use_container_width=True)
+                                checked = st.checkbox(
+                                    f"Use review photo {idx + 1}",
+                                    value=False,
+                                    key=f"ao_review_{product_key}_{idx}",
+                                )
+                                if checked:
+                                    selected_items.append({
+                                        "url": image_url,
+                                        "label": f"Customer review photo {idx + 1}",
+                                        "source_type": "customer review photo",
+                                    })
+                    else:
+                        st.caption("No customer review photos were found for this product.")
+
+                if len(selected_items) > 10:
+                    st.warning(f"You selected {len(selected_items)} images. The first 10 selected references will be used.")
+                    selected_items = selected_items[:10]
+
+                if selected_items:
+                    st.success(f"{len(selected_items)} outfit reference image{'s' if len(selected_items) != 1 else ''} selected")
+                    preview_cols = st.columns(min(4, len(selected_items)))
+                    for idx, item in enumerate(selected_items):
+                        with preview_cols[idx % len(preview_cols)]:
+                            st.image(item["url"], caption=item["label"], use_container_width=True)
+                    for item in selected_items:
+                        raw_bytes, raw_mime, _data_uri = _remote_image_payload(item["url"])
+                        if raw_bytes:
+                            outfit_analysis_images.append({
+                                "bytes": raw_bytes,
+                                "mime": raw_mime,
+                                "label": item["label"],
+                                "source_type": item["source_type"],
+                            })
+                            # Use the hosted TikTok CDN URL for Magnific; this keeps the MCP request much smaller than embedding base64.
+                            outfit_magnific_references.append(item["url"])
                 else:
-                    st.warning("This product link was scraped, but no usable product images were found.")
-                    outfit_bytes, outfit_mime, outfit_data_uri = b"", "image/jpeg", ""
+                    st.warning("Select at least one product or customer-review photo.")
             else:
-                outfit_bytes, outfit_mime, outfit_data_uri = b"", "image/jpeg", ""
+                st.caption("Paste a clothing product link and scrape it to choose images.")
         else:
             manual_name = st.text_input(
                 "Outfit name (optional)",
@@ -4533,19 +4701,41 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
             ).strip()
             if manual_name:
                 outfit_name_prefill = manual_name
-            outfit_file = st.file_uploader(
-                "Outfit image",
+            outfit_files = st.file_uploader(
+                "Outfit images",
                 type=["jpg", "jpeg", "png", "webp"],
-                key="avatar_outfit_outfit_upload",
-                help="The clothing product. A flat lay, mannequin, listing image, or model photo is fine; the person in this image is ignored.",
+                accept_multiple_files=True,
+                key="avatar_outfit_outfit_upload_multi",
+                help="Upload multiple listing, flat-lay, modeled, detail, or customer-review images of the same outfit.",
             )
-            if outfit_file is not None:
-                st.image(outfit_file, caption="Outfit reference — clothing / shoes only", use_container_width=True)
-            outfit_bytes, outfit_mime, outfit_data_uri = _uploaded_image_payload(outfit_file)
+            if outfit_files:
+                if len(outfit_files) > 10:
+                    st.warning(f"You uploaded {len(outfit_files)} images. The first 10 will be used.")
+                outfit_files = outfit_files[:10]
+                cols = st.columns(min(4, len(outfit_files)))
+                for idx, outfit_file in enumerate(outfit_files):
+                    with cols[idx % len(cols)]:
+                        st.image(outfit_file, caption=outfit_file.name, use_container_width=True)
+                    raw_bytes, raw_mime, raw_uri = _uploaded_image_payload(outfit_file)
+                    if raw_bytes:
+                        outfit_analysis_images.append({
+                            "bytes": raw_bytes,
+                            "mime": raw_mime,
+                            "label": outfit_file.name,
+                            "source_type": "uploaded outfit reference",
+                        })
+                        outfit_magnific_references.append(raw_uri)
+                st.success(f"{len(outfit_analysis_images)} outfit reference image{'s' if len(outfit_analysis_images) != 1 else ''} selected")
 
-    if avatar_bytes and outfit_bytes:
-        outfit_name_for_state = (outfit_name_prefill or "").strip()
-        input_signature = hashlib.sha1(avatar_bytes + b"|AVATAR_OUTFIT|" + outfit_bytes + b"|" + outfit_name_for_state.encode("utf-8", "ignore")).hexdigest()
+    # Track the exact avatar + selected outfit set so changing references clears stale generations.
+    if avatar_bytes and outfit_analysis_images:
+        signature_hasher = hashlib.sha1()
+        signature_hasher.update(avatar_bytes)
+        signature_hasher.update(b"|AVATAR_OUTFIT_MULTI|")
+        for item in outfit_analysis_images:
+            signature_hasher.update(item.get("bytes") or b"")
+        signature_hasher.update((outfit_name_prefill or "").encode("utf-8", "ignore"))
+        input_signature = signature_hasher.hexdigest()
         previous_signature = st.session_state.get("avatar_outfit_input_signature")
         if previous_signature and previous_signature != input_signature:
             for key in (
@@ -4557,21 +4747,20 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
                 st.session_state.pop(key, None)
         st.session_state["avatar_outfit_input_signature"] = input_signature
 
-    analyze_disabled = not (avatar_bytes and outfit_bytes and api_key)
+    analyze_disabled = not (avatar_bytes and outfit_analysis_images and api_key)
     if st.button(
-        "🔎 Step 1 — Analyze Avatar + Outfit",
+        "🔎 Step 1 — Analyze Avatar + Selected Outfit Photos",
         type="primary",
         use_container_width=True,
         key="avatar_outfit_analyze_btn",
         disabled=analyze_disabled,
     ):
-        with st.spinner("Analyzing the avatar and outfit using the uploaded try-on rules..."):
+        with st.spinner(f"Analyzing the avatar plus {len(outfit_analysis_images)} selected outfit reference(s)..."):
             analysis = analyze_avatar_outfit_images(
                 api_key=api_key,
                 avatar_bytes=avatar_bytes,
                 avatar_mime=avatar_mime,
-                outfit_bytes=outfit_bytes,
-                outfit_mime=outfit_mime,
+                outfit_images=outfit_analysis_images,
             )
         if analysis.get("error"):
             st.error(analysis["error"])
@@ -4580,45 +4769,52 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
                 analysis["product_name"] = outfit_name_prefill[:100]
             if avatar_source_label:
                 analysis["avatar_label"] = avatar_source_label
+            # Save current references so reruns after analysis/approval still know exactly what to send to Magnific.
             st.session_state["avatar_outfit_analysis"] = analysis
+            st.session_state["avatar_outfit_magnific_references"] = list(outfit_magnific_references)
+            st.session_state["avatar_outfit_avatar_reference"] = avatar_reference
             st.session_state.pop("avatar_outfit_image_result", None)
             st.session_state.pop("avatar_outfit_image_approved", None)
             st.session_state.pop("avatar_outfit_video_result", None)
             st.rerun()
 
     if not api_key:
-        st.warning("Connect the Anthropic API key above to analyze the avatar and outfit.")
+        st.warning("Connect the Anthropic API key above to analyze the avatar and outfit references.")
     if not magnific_token:
-        st.warning("Connect Magnific above to generate the Avatar Outfit try-on image and to run the Kling O1 video step.")
+        st.warning("Connect Magnific above to generate the Avatar Outfit try-on image and run the Kling O1 video step.")
 
     analysis = st.session_state.get("avatar_outfit_analysis") or {}
     if not analysis:
-        st.caption("Tip: add reusable avatar images to `avatar_library/` in the repo so you can select them here without re-uploading each time.")
+        st.caption("Tip: select several angles or detail shots when the clothing has important front/back details, matching pieces, or shoes.")
         return
+
+    saved_outfit_refs = st.session_state.get("avatar_outfit_magnific_references") or outfit_magnific_references
+    saved_avatar_ref = st.session_state.get("avatar_outfit_avatar_reference") or avatar_reference
 
     st.markdown("### Reference analysis")
     if analysis.get("product_name"):
         st.caption(f"Outfit product: **{analysis.get('product_name')}**")
     if analysis.get("avatar_label"):
         st.caption(f"Avatar: **{analysis.get('avatar_label')}**")
+    if analysis.get("outfit_reference_count"):
+        st.caption(f"Outfit references analyzed: **{analysis.get('outfit_reference_count')}**")
     avatar_desc = st.text_area(
         "Avatar description",
         value=analysis.get("avatar_description", ""),
         height=90,
         key="avatar_outfit_avatar_description",
-        help="The avatar's original clothing is intentionally excluded.",
     ).strip()
     outfit_desc = st.text_area(
-        "Outfit description",
+        "Combined outfit description",
         value=analysis.get("outfit_description", ""),
-        height=120,
+        height=130,
         key="avatar_outfit_outfit_description",
+        help="This description combines all selected listing and customer-review images.",
     ).strip()
     shoes_desc = st.text_input(
         "Shoes",
         value=analysis.get("shoes_description") or "clean white sneakers",
         key="avatar_outfit_shoes_description",
-        help="Detected from the outfit image when visible; otherwise defaults to clean white sneakers.",
     ).strip() or "clean white sneakers"
     bottom_fallback = analysis.get("bottom_fallback", "")
     if bottom_fallback:
@@ -4639,7 +4835,7 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
     with st.expander("📋 Skill prompts", expanded=False):
         st.markdown("**Try-on image prompt**")
         st.code(image_prompt, language=None)
-        st.caption(f"Image model: {AVATAR_OUTFIT_IMAGE_MODEL_LABEL}")
+        st.caption(f"Image model: {AVATAR_OUTFIT_IMAGE_MODEL_LABEL} · Outfit refs: {len(saved_outfit_refs)}")
         st.markdown("**Kling O1 mirror prompt**")
         st.code(kling_prompt, language=None)
         st.caption(f"Kling prompt characters: {len(kling_prompt)}/1900 · {AVATAR_OUTFIT_VIDEO_MODEL_LABEL}")
@@ -4670,14 +4866,14 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
             type="primary",
             use_container_width=True,
             key="avatar_outfit_generate_image",
-            disabled=not bool(api_key and magnific_token and avatar_data_uri and outfit_data_uri),
+            disabled=not bool(api_key and magnific_token and saved_avatar_ref and saved_outfit_refs),
         ):
-            with st.spinner("Generating the mirror-selfie try-on image with Magnific GPT Image 2..."):
+            with st.spinner(f"Generating with Magnific GPT Image 2 using {len(saved_outfit_refs)} outfit reference(s)..."):
                 result = generate_avatar_outfit_image_magnific(
                     api_key=api_key,
                     magnific_token=magnific_token,
-                    avatar_data_uri=avatar_data_uri,
-                    outfit_data_uri=outfit_data_uri,
+                    avatar_reference=saved_avatar_ref,
+                    outfit_references=saved_outfit_refs,
                     prompt=image_prompt,
                 )
             if result.get("error"):
@@ -4705,19 +4901,20 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
             )
     with action_col:
         st.success("Review identity, outfit accuracy, shoes, full-body framing, and mirror realism before approving.")
+        st.caption(f"Magnific used {image_result.get('outfit_reference_count', len(saved_outfit_refs))} outfit reference(s).")
         regen_col, approve_col = st.columns(2)
         if regen_col.button(
             "🔁 Regenerate image",
             use_container_width=True,
             key="avatar_outfit_regen_image",
-            disabled=not bool(api_key and magnific_token),
+            disabled=not bool(api_key and magnific_token and saved_avatar_ref and saved_outfit_refs),
         ):
-            with st.spinner("Generating another Magnific GPT Image 2 try-on image with the same two references..."):
+            with st.spinner("Generating another GPT Image 2 try-on with the same selected references..."):
                 result = generate_avatar_outfit_image_magnific(
                     api_key=api_key,
                     magnific_token=magnific_token,
-                    avatar_data_uri=avatar_data_uri,
-                    outfit_data_uri=outfit_data_uri,
+                    avatar_reference=saved_avatar_ref,
+                    outfit_references=saved_outfit_refs,
                     prompt=image_prompt,
                 )
             if result.get("error"):
@@ -4826,8 +5023,13 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
             use_container_width=True,
         ):
             _reset_avatar_outfit_generated_state()
-            st.session_state.pop("avatar_outfit_scraped_product", None)
-            st.session_state.pop("avatar_outfit_selected_image_url", None)
+            for key in (
+                "avatar_outfit_scraped_product",
+                "avatar_outfit_scraped_source_url",
+                "avatar_outfit_magnific_references",
+                "avatar_outfit_avatar_reference",
+            ):
+                st.session_state.pop(key, None)
             st.rerun()
         return
 
