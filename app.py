@@ -3429,6 +3429,148 @@ def generate_lifestyle_image_grok(
         return {"creation_id": None, "status": "error", "error": f"xAI image generation failed: {exc}"}
 
 
+def _parse_magnific_creation_response(response) -> dict:
+    """Normalize Magnific MCP creation responses from image/video generation calls."""
+    result = {
+        "creation_id": None,
+        "status": "unknown",
+        "url": None,
+        "preview_url": None,
+        "error": None,
+    }
+
+    status_aliases = {
+        "succeeded": "completed",
+        "success": "completed",
+        "done": "completed",
+        "finished": "completed",
+        "pending": "queued",
+        "running": "processing",
+        "failed": "error",
+        "failure": "error",
+    }
+
+    def absorb(payload):
+        if not isinstance(payload, (dict, list)):
+            return
+
+        url_candidates = []
+
+        def walk(value, path=()):
+            if isinstance(value, dict):
+                # Common creation ID fields.
+                for id_key in ("identifier", "creation_id", "creationId", "id"):
+                    candidate = value.get(id_key)
+                    if candidate and not result.get("creation_id"):
+                        result["creation_id"] = str(candidate)
+                        break
+
+                # Common status fields.
+                for status_key in ("status", "state", "creation_status", "creationStatus"):
+                    candidate = value.get(status_key)
+                    if isinstance(candidate, str) and candidate.strip():
+                        normalized = candidate.strip().lower()
+                        result["status"] = status_aliases.get(normalized, normalized)
+                        break
+
+                # Error/message fields, but only keep them as errors when the payload
+                # actually represents an error rather than a normal descriptive message.
+                if result.get("status") == "error":
+                    for error_key in ("error", "error_message", "errorMessage", "message"):
+                        candidate = value.get(error_key)
+                        if candidate:
+                            if isinstance(candidate, dict):
+                                candidate = candidate.get("message") or candidate.get("detail") or str(candidate)
+                            result["error"] = str(candidate)[:1000]
+                            break
+
+                for key, child in value.items():
+                    key_lower = str(key).lower()
+                    child_path = path + (key_lower,)
+                    if isinstance(child, str) and child.startswith(("http://", "https://")):
+                        path_text = " ".join(child_path)
+                        score = 0
+                        is_preview = "preview" in key_lower or "preview" in path_text
+                        if key_lower in {"imageurl", "image_url", "videourl", "video_url", "downloadurl", "download_url"}:
+                            score += 130
+                        elif key_lower in {"outputurl", "output_url", "resulturl", "result_url", "mediaurl", "media_url"}:
+                            score += 115
+                        elif key_lower in {"url", "fileurl", "file_url"}:
+                            score += 80
+                        elif is_preview:
+                            score += 60
+                        if any(token in path_text for token in ("output", "result", "image", "video", "media", "asset", "download")):
+                            score += 25
+                        if any(token in path_text for token in ("input", "reference", "source", "uploaded")):
+                            score -= 90
+                        url_candidates.append((score, is_preview, child))
+                    walk(child, child_path)
+            elif isinstance(value, list):
+                for index, child in enumerate(value):
+                    walk(child, path + (str(index),))
+
+        walk(payload)
+        if url_candidates:
+            url_candidates.sort(key=lambda item: item[0], reverse=True)
+            for _score, is_preview, url in url_candidates:
+                if is_preview and not result.get("preview_url"):
+                    result["preview_url"] = url
+                elif not is_preview and not result.get("url"):
+                    result["url"] = url
+            if not result.get("url"):
+                result["url"] = url_candidates[0][2]
+
+    for block in getattr(response, "content", []) or []:
+        block_type = getattr(block, "type", "")
+        if block_type == "text":
+            raw = getattr(block, "text", "") or ""
+            try:
+                cleaned = re.sub(r'```json\s*|```\s*', '', raw)
+                start = cleaned.find("{")
+                end = cleaned.rfind("}") + 1
+                if start >= 0 and end > start:
+                    parsed = json.loads(cleaned[start:end])
+                    if isinstance(parsed, dict):
+                        # The assistant's small JSON response is authoritative for
+                        # creation_id/status/error, then nested parsing fills URLs.
+                        if parsed.get("creation_id"):
+                            result["creation_id"] = parsed["creation_id"]
+                        if parsed.get("identifier") and not result.get("creation_id"):
+                            result["creation_id"] = parsed["identifier"]
+                        if parsed.get("status"):
+                            normalized = str(parsed["status"]).strip().lower()
+                            result["status"] = status_aliases.get(normalized, normalized)
+                        if parsed.get("url"):
+                            result["url"] = parsed["url"]
+                        if parsed.get("preview_url"):
+                            result["preview_url"] = parsed["preview_url"]
+                        if parsed.get("error"):
+                            result["error"] = str(parsed["error"])
+                        absorb(parsed)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+
+        elif block_type == "mcp_tool_result" and getattr(block, "content", None):
+            for sub in block.content:
+                raw = getattr(sub, "text", None)
+                if not raw:
+                    continue
+                try:
+                    absorb(json.loads(raw))
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    continue
+
+    # Some Magnific generation calls return a creation ID with an otherwise
+    # ambiguous status. Treat that as queued so the UI exposes its status checker.
+    if result.get("creation_id") and result.get("status") in {None, "", "unknown"}:
+        result["status"] = "queued"
+
+    if not result.get("creation_id") and not result.get("url") and not result.get("preview_url") and not result.get("error"):
+        result["error"] = "Magnific did not return a creation identifier or output URL."
+
+    return result
+
+
 def generate_lifestyle_kling_magnific(
     api_key: str,
     magnific_token: str,
