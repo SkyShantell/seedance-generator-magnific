@@ -4212,6 +4212,108 @@ def _prepare_image_for_avatar_analysis(
         return image_bytes, mime_type or "image/jpeg"
 
 
+def _prepare_image_for_magnific_mcp_reference(
+    image_bytes: bytes,
+    mime_type: str = "image/jpeg",
+    max_bytes: int = 80 * 1024,
+    max_edge: int = 900,
+) -> tuple[bytes, str, str]:
+    """Create a compact reference copy for Magnific MCP transport.
+
+    Local images cannot be referenced by a public URL, so the MCP bridge needs a
+    data URI. Sending the original multi-megabyte file inside the Claude message
+    can blow past the prompt-token limit. This makes a small JPEG reference copy
+    while leaving the original source file untouched.
+    """
+    if not image_bytes:
+        return b"", "image/jpeg", ""
+
+    if not PIL_AVAILABLE:
+        # Last-resort fallback. The caller's prompt-budget guard will prevent an
+        # enormous payload from being submitted if Pillow is unavailable.
+        mime = mime_type or "image/jpeg"
+        return image_bytes, mime, f"data:{mime};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as source:
+            source.load()
+            try:
+                exif = source.getexif()
+                orientation = exif.get(274) if exif else None
+                if orientation == 3:
+                    source = source.rotate(180, expand=True)
+                elif orientation == 6:
+                    source = source.rotate(270, expand=True)
+                elif orientation == 8:
+                    source = source.rotate(90, expand=True)
+            except Exception:
+                pass
+
+            if source.mode != "RGB":
+                if "A" in source.getbands():
+                    rgba = source.convert("RGBA")
+                    bg = Image.new("RGB", rgba.size, "white")
+                    bg.paste(rgba, mask=rgba.getchannel("A"))
+                    source = bg
+                else:
+                    source = source.convert("RGB")
+
+            if max(source.size) > max_edge:
+                scale = max_edge / float(max(source.size))
+                source = source.resize(
+                    (max(1, int(source.width * scale)), max(1, int(source.height * scale))),
+                    Image.Resampling.LANCZOS,
+                )
+
+            best = b""
+            working = source
+            for pass_index in range(4):
+                for quality in (72, 64, 56, 48, 40, 34):
+                    buf = io.BytesIO()
+                    working.save(buf, format="JPEG", quality=quality, optimize=True, progressive=True)
+                    candidate = buf.getvalue()
+                    best = candidate
+                    if len(candidate) <= max_bytes:
+                        uri = "data:image/jpeg;base64," + base64.b64encode(candidate).decode("ascii")
+                        return candidate, "image/jpeg", uri
+                # If quality alone is not enough, reduce dimensions and try again.
+                working = working.resize(
+                    (max(1, int(working.width * 0.82)), max(1, int(working.height * 0.82))),
+                    Image.Resampling.LANCZOS,
+                )
+
+            uri = "data:image/jpeg;base64," + base64.b64encode(best).decode("ascii")
+            return best, "image/jpeg", uri
+    except Exception:
+        mime = mime_type or "image/jpeg"
+        return image_bytes, mime, f"data:{mime};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+
+
+def _trim_magnific_reference_payload(avatar_reference: str, outfit_references: list[str], max_data_uri_chars: int = 520_000) -> tuple[str, list[str], int]:
+    """Keep MCP reference payload safely below Claude's prompt limit.
+
+    Hosted HTTP(S) URLs are tiny and are always retained. Data-URI references are
+    retained in priority order until the conservative character budget is reached.
+    Returns avatar ref, kept outfit refs, and number of omitted outfit refs.
+    """
+    def is_data_uri(value: str) -> bool:
+        return str(value or "").startswith("data:")
+
+    avatar_reference = str(avatar_reference or "").strip()
+    refs = [str(ref or "").strip() for ref in (outfit_references or []) if str(ref or "").strip()]
+    used = len(avatar_reference) if is_data_uri(avatar_reference) else 0
+    kept = []
+    omitted = 0
+    for ref in refs:
+        cost = len(ref) if is_data_uri(ref) else 0
+        if cost and used + cost > max_data_uri_chars:
+            omitted += 1
+            continue
+        kept.append(ref)
+        used += cost
+    return avatar_reference, kept, omitted
+
+
 def analyze_avatar_outfit_images(
     api_key: str,
     avatar_bytes: bytes,
@@ -4402,8 +4504,19 @@ def generate_avatar_outfit_image_magnific(
         return {"creation_id": None, "status": "error", "error": "Choose an avatar and at least one outfit reference."}
 
     # Keep the reference set practical for the MCP request while still supporting
-    # multiple official + review views. The UI currently allows up to 10 selected refs.
+    # multiple official + review views. Hosted TikTok URLs are tiny; local images
+    # are compact data URIs. Apply a conservative prompt-payload budget as a final
+    # guard so a large manual upload set cannot recreate the multi-million-token error.
     outfit_references = outfit_references[:10]
+    avatar_reference, outfit_references, omitted_reference_count = _trim_magnific_reference_payload(
+        avatar_reference, outfit_references
+    )
+    if not outfit_references:
+        return {
+            "creation_id": None,
+            "status": "error",
+            "error": "The selected local reference images are still too large for the MCP request. Try fewer manual images or use the TikTok-hosted product photos.",
+        }
     mcp_servers = [{
         "type": "url",
         "url": MAGNIFIC_MCP_URL,
@@ -4444,6 +4557,7 @@ def generate_avatar_outfit_image_magnific(
         result["image_aspect_ratio"] = "9:16"
         result["reference_count"] = 1 + len(outfit_references)
         result["outfit_reference_count"] = len(outfit_references)
+        result["omitted_reference_count"] = omitted_reference_count
         return result
     except Exception as exc:
         return {"creation_id": None, "status": "error", "error": f"Avatar Outfit image generation failed: {exc}"}
@@ -4529,7 +4643,7 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
         "Selected outfit photos are analyzed together and sent to Magnific GPT Image 2 as supporting references. The Avatar Outfit video remains a clean, silent Kling O1 mirror try-on with no hook text, captions, voiceover, music, or soundtrack."
     )
     st.caption(
-        "Large avatar/outfit files are automatically optimized for Claude analysis only. The original selected references are used for Magnific GPT Image 2."
+        "Large avatar/outfit files are optimized automatically. Claude analysis gets a resized copy, and local images get a separate compact reference copy for the Magnific MCP request so base64 data cannot overflow the prompt limit."
     )
 
     avatar_records, avatar_library_dir = load_avatar_library()
@@ -4554,7 +4668,7 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
             selected_avatar = avatar_options[selected_avatar_label]
             st.image(selected_avatar["path"], caption=f"Selected avatar — {selected_avatar['label']}", use_container_width=True)
             avatar_bytes, avatar_mime, avatar_data_uri = _local_image_payload(selected_avatar["path"])
-            avatar_reference = avatar_data_uri
+            _avatar_mcp_bytes, _avatar_mcp_mime, avatar_reference = _prepare_image_for_magnific_mcp_reference(avatar_bytes, avatar_mime)
             st.caption(f"Library folder: {avatar_library_dir}")
             avatar_source_label = selected_avatar["label"]
         else:
@@ -4567,7 +4681,7 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
             if avatar_file is not None:
                 st.image(avatar_file, caption="Avatar reference — identity / appearance", use_container_width=True)
             avatar_bytes, avatar_mime, avatar_data_uri = _uploaded_image_payload(avatar_file)
-            avatar_reference = avatar_data_uri
+            _avatar_mcp_bytes, _avatar_mcp_mime, avatar_reference = _prepare_image_for_magnific_mcp_reference(avatar_bytes, avatar_mime)
             avatar_source_label = getattr(avatar_file, "name", "Uploaded avatar") if avatar_file else ""
 
     outfit_analysis_images = []
@@ -4724,7 +4838,9 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
                             "label": outfit_file.name,
                             "source_type": "uploaded outfit reference",
                         })
-                        outfit_magnific_references.append(raw_uri)
+                        _mcp_bytes, _mcp_mime, compact_mcp_uri = _prepare_image_for_magnific_mcp_reference(raw_bytes, raw_mime)
+                        if compact_mcp_uri:
+                            outfit_magnific_references.append(compact_mcp_uri)
                 st.success(f"{len(outfit_analysis_images)} outfit reference image{'s' if len(outfit_analysis_images) != 1 else ''} selected")
 
     # Track the exact avatar + selected outfit set so changing references clears stale generations.
@@ -4880,6 +4996,8 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
                 st.error(result["error"])
             else:
                 st.session_state["avatar_outfit_image_result"] = result
+                if result.get("omitted_reference_count"):
+                    st.warning(f"{result.get('omitted_reference_count')} oversized local outfit reference(s) were skipped to keep the MCP request within its prompt limit. All hosted TikTok references were retained.")
                 st.session_state["avatar_outfit_image_approved"] = False
                 st.session_state.pop("avatar_outfit_video_result", None)
                 st.rerun()
@@ -4921,6 +5039,8 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
                 st.error(result["error"])
             else:
                 st.session_state["avatar_outfit_image_result"] = result
+                if result.get("omitted_reference_count"):
+                    st.warning(f"{result.get('omitted_reference_count')} oversized local outfit reference(s) were skipped to keep the MCP request within its prompt limit. All hosted TikTok references were retained.")
                 st.session_state["avatar_outfit_image_approved"] = False
                 st.session_state.pop("avatar_outfit_video_result", None)
                 st.rerun()
