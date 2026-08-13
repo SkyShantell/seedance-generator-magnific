@@ -3280,7 +3280,6 @@ def generate_video(
             }],
             mcp_servers=mcp_servers,
             tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
-            tool_choice={"type": "any"},
             betas=[MCP_BETA],
         )
 
@@ -3393,7 +3392,6 @@ def generate_lifestyle_image_magnific(
             }],
             mcp_servers=mcp_servers,
             tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
-            tool_choice={"type": "any"},
             betas=[MCP_BETA],
         )
         result = _parse_magnific_creation_response(response)
@@ -3658,7 +3656,6 @@ def generate_lifestyle_kling_magnific(
             }],
             mcp_servers=mcp_servers,
             tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
-            tool_choice={"type": "any"},
             betas=[MCP_BETA],
         )
         return _parse_magnific_creation_response(response)
@@ -3764,7 +3761,6 @@ def check_creation_status(api_key: str, magnific_token: str, creation_id: str) -
             }],
             mcp_servers=mcp_servers,
             tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
-            tool_choice={"type": "any"},
             betas=[MCP_BETA],
         )
 
@@ -4746,7 +4742,6 @@ def generate_avatar_outfit_image_magnific(
             }],
             mcp_servers=mcp_servers,
             tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
-            tool_choice={"type": "any"},
             betas=[MCP_BETA],
         )
         result = _parse_magnific_creation_response(response)
@@ -4817,7 +4812,6 @@ def generate_avatar_outfit_kling_magnific(
             }],
             mcp_servers=mcp_servers,
             tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
-            tool_choice={"type": "any"},
             betas=[MCP_BETA],
         )
         result = _parse_magnific_creation_response(response)
