@@ -3728,8 +3728,35 @@ def _run_magnific_mcp_sequence(
             return parsed
 
         assistant_content = _anthropic_blocks_to_message_params(getattr(response, "content", []) or [])
+        stop_reason = str(getattr(response, "stop_reason", "") or "").strip().lower()
+
+        # Remote MCP calls are server-executed tools. If Anthropic pauses the
+        # server-side loop (or returns an MCP tool-use block whose result has not
+        # arrived yet), resume by passing the paused assistant content back AS-IS.
+        # Do not add a user continuation message until every mcp_tool_use has a
+        # corresponding mcp_tool_result, or the API rejects the request with 400.
+        pending_tool_ids = set()
+        completed_tool_ids = set()
+        for block in assistant_content:
+            block_type = str(block.get("type") or "") if isinstance(block, dict) else ""
+            if block_type == "mcp_tool_use" and block.get("id"):
+                pending_tool_ids.add(str(block.get("id")))
+            elif block_type == "mcp_tool_result" and block.get("tool_use_id"):
+                completed_tool_ids.add(str(block.get("tool_use_id")))
+        unresolved_mcp_ids = pending_tool_ids - completed_tool_ids
+
         if assistant_content:
             messages.append({"role": "assistant", "content": assistant_content})
+
+        if stop_reason == "pause_turn" or unresolved_mcp_ids:
+            # Resume the still-open server-tool turn with the same MCP toolset.
+            # No user message is allowed here.
+            continue
+
+        # The previous assistant turn is complete, but it only made partial
+        # progress (for example, uploaded references and then narrated). Now it
+        # is safe to send a fresh user instruction telling Claude to perform the
+        # remaining Magnific generation action without repeating completed work.
         messages.append({
             "role": "user",
             "content": continuation_instruction + "\nContinue from the successful MCP results above; do not restart or repeat completed uploads.",
