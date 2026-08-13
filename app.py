@@ -3624,6 +3624,130 @@ def _is_real_magnific_creation_id(value) -> bool:
     return True
 
 
+
+def _anthropic_blocks_to_message_params(blocks) -> list[dict]:
+    """Serialize Anthropic response blocks so completed MCP results can be round-tripped."""
+    serialized = []
+    for block in blocks or []:
+        try:
+            if hasattr(block, "model_dump"):
+                data = block.model_dump(mode="json", exclude_none=True)
+            elif isinstance(block, dict):
+                data = dict(block)
+            else:
+                continue
+            if isinstance(data, dict) and data.get("type"):
+                serialized.append(data)
+        except Exception:
+            continue
+    return serialized
+
+
+def _magnific_result_is_incomplete_only(result: dict) -> bool:
+    """Return True when MCP made progress but generation has not been submitted yet."""
+    if not isinstance(result, dict):
+        return True
+    if _is_real_magnific_creation_id(result.get("creation_id")) or result.get("url") or result.get("preview_url"):
+        return False
+    error = str(result.get("error") or "")
+    if not error:
+        return True
+    markers = (
+        "Magnific MCP tool(s) ran",
+        "Claude did not call any Magnific MCP tool",
+        "no creation/task ID or output URL was returned",
+    )
+    return any(marker in error for marker in markers)
+
+
+def _run_magnific_mcp_sequence(
+    client,
+    system: str,
+    initial_content: str,
+    mcp_servers: list[dict],
+    continuation_instruction: str,
+    max_turns: int = 8,
+) -> dict:
+    """Continue dependent Magnific MCP actions across Claude turns until generation is submitted.
+
+    Some Magnific tasks require upload -> generate. The remote MCP connector can finish an
+    upload and let Claude end the turn. We round-trip that MCP result and tell Claude to
+    continue, rather than incorrectly treating the upload as the end of the workflow.
+    """
+    messages = [{"role": "user", "content": initial_content}]
+    tools = [{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}]
+    all_tools = []
+    last_text = ""
+    last_result = {}
+
+    for turn_index in range(max(1, int(max_turns))):
+        try:
+            response = client.beta.messages.create(
+                model=MODEL,
+                max_tokens=2048,
+                system=system,
+                messages=messages,
+                mcp_servers=mcp_servers,
+                tools=tools,
+                betas=[MCP_BETA],
+            )
+        except Exception as exc:
+            return {
+                "creation_id": None,
+                "status": "error",
+                "error": f"Magnific MCP sequence failed on step {turn_index + 1}: {exc}",
+                "mcp_tools_called": all_tools,
+                "mcp_turns": turn_index + 1,
+            }
+
+        parsed = _parse_magnific_creation_response(response)
+        last_result = dict(parsed or {})
+        for tool_name in parsed.get("mcp_tools_called") or []:
+            if tool_name not in all_tools:
+                all_tools.append(tool_name)
+
+        text_parts = []
+        for block in getattr(response, "content", []) or []:
+            if getattr(block, "type", "") == "text":
+                value = str(getattr(block, "text", "") or "").strip()
+                if value:
+                    text_parts.append(value)
+        if text_parts:
+            last_text = text_parts[-1][:1400]
+
+        if _is_real_magnific_creation_id(parsed.get("creation_id")) or parsed.get("url") or parsed.get("preview_url"):
+            parsed["mcp_tools_called"] = all_tools
+            parsed["mcp_turns"] = turn_index + 1
+            return parsed
+
+        # Stop only for a real MCP error. Generic "upload happened but no ID yet"
+        # means the dependent workflow needs another Claude turn.
+        if parsed.get("error") and not _magnific_result_is_incomplete_only(parsed):
+            parsed["mcp_tools_called"] = all_tools
+            parsed["mcp_turns"] = turn_index + 1
+            return parsed
+
+        assistant_content = _anthropic_blocks_to_message_params(getattr(response, "content", []) or [])
+        if assistant_content:
+            messages.append({"role": "assistant", "content": assistant_content})
+        messages.append({
+            "role": "user",
+            "content": continuation_instruction + "\nContinue from the successful MCP results above; do not restart or repeat completed uploads.",
+        })
+
+    return {
+        "creation_id": None,
+        "status": "error",
+        "error": (
+            f"Magnific MCP made progress but did not reach the generation call after {max_turns} turns. "
+            f"Tools seen: {', '.join(all_tools) or 'none'}."
+            + (f" Last response: {last_text}" if last_text else "")
+        ),
+        "mcp_tools_called": all_tools,
+        "mcp_turns": max_turns,
+        "last_partial_result": last_result,
+    }
+
 def generate_lifestyle_kling_magnific(
     api_key: str,
     magnific_token: str,
@@ -4669,16 +4793,16 @@ Preserve exact identity, outfit, shoes, setting and lighting from the approved s
 
 
 AVATAR_OUTFIT_IMAGE_GENERATE_SYSTEM = """You are an image production assistant with access to Magnific MCP tools.
-You MUST actually call the Magnific MCP tools in this turn. Do not merely describe the steps and do not return a made-up identifier.
-1. Upload EVERY provided local/data-URI reference image using the available Magnific image-upload tool. Hosted HTTP(S) product references may be used directly if the Magnific tool accepts them.
+This is a dependent, MULTI-STEP MCP workflow. The task is NOT complete after an upload.
+1. Upload local/data-URI references with Magnific's available upload tool (currently exposed as creations_upload_file). Hosted HTTP(S) references may be usable directly.
 2. Reference image 1 is the avatar identity. Preserve this exact person's appearance and identity.
-3. Reference images 2+ are outfit/clothing references from official listings and/or customer reviews. Use them together for clothing, shoes, fit, color, material and construction accuracy.
-4. Generate EXACTLY ONE mirror-selfie try-on image in Magnific.
-5. Explicitly choose **Google Nano Banana Pro** as the Magnific image model. Do not use Auto, GPT Image, Grok, or another model.
-6. Set output resolution to **2K** and aspect ratio to **9:16**.
-7. Submit the generation exactly once. After Magnific returns the real creation/task identifier, stop. Do not poll or wait for completion.
-8. Return ONLY valid JSON containing the REAL identifier returned by Magnific: {"creation_id":"REAL_ID_FROM_MAGNIFIC","status":"queued","url":null,"preview_url":null,"error":null}
-If an MCP tool returns an error, return that actual error message in the error field instead of inventing an ID.
+3. References 2+ are outfit/clothing references from official listings and/or customer reviews.
+4. After the required uploads succeed, CONTINUE and call Magnific's image-generation tool.
+5. Generate exactly ONE mirror-selfie try-on image with **Nano Banana Pro** at **2K**, **9:16**.
+6. Do not use Auto, GPT Image, Grok, or another model.
+7. Do not stop to narrate after an upload. Keep using the MCP tools until the image-generation tool returns the REAL Magnific creation/task ID.
+8. Submit image generation exactly once and stop immediately after the real ID is returned. Do not poll.
+9. Never invent an identifier. Preserve any actual MCP error.
 """
 
 
@@ -4689,36 +4813,37 @@ def generate_avatar_outfit_image_magnific(
     outfit_references: list[str],
     prompt: str,
 ) -> dict:
-    """Use Magnific Google Nano Banana Pro at 2K with one avatar plus multiple outfit references."""
+    """Use Magnific Nano Banana Pro at 2K with one avatar plus outfit references."""
     if not api_key:
         return {"creation_id": None, "status": "error", "error": "The Anthropic API key is missing."}
     if not magnific_token:
         return {"creation_id": None, "status": "error", "error": "The Magnific authorization token is missing."}
+
     outfit_references = [str(ref or "").strip() for ref in (outfit_references or []) if str(ref or "").strip()]
     if not avatar_reference or not outfit_references:
         return {"creation_id": None, "status": "error", "error": "Choose an avatar and at least one outfit reference."}
 
-    # Keep the reference set practical for the MCP request while still supporting
-    # multiple official + review views. Hosted TikTok URLs are tiny; local images
-    # are compact data URIs. Apply a conservative prompt-payload budget as a final
-    # guard so a large manual upload set cannot recreate the multi-million-token error.
-    outfit_references = outfit_references[:10]
-    avatar_reference, outfit_references, omitted_reference_count = _trim_magnific_reference_payload(
+    # Nano Banana Pro supports up to 3 generation references total: avatar + two outfit views.
+    # The separate analysis step can still use all selected listing/review images.
+    original_outfit_count = len(outfit_references)
+    outfit_references = outfit_references[:2]
+    avatar_reference, outfit_references, payload_omitted = _trim_magnific_reference_payload(
         avatar_reference, outfit_references
     )
+    omitted_reference_count = max(0, original_outfit_count - len(outfit_references)) + int(payload_omitted or 0)
     if not outfit_references:
         return {
             "creation_id": None,
             "status": "error",
-            "error": "The selected local reference images are still too large for the MCP request. Try fewer manual images or use the TikTok-hosted product photos.",
+            "error": "The selected local outfit references are still too large for the MCP request. Try fewer manual images or use TikTok-hosted product photos.",
         }
+
     mcp_servers = [{
         "type": "url",
         "url": MAGNIFIC_MCP_URL,
         "name": MAGNIFIC_MCP_NAME,
+        "authorization_token": magnific_token,
     }]
-    if magnific_token:
-        mcp_servers[0]["authorization_token"] = magnific_token
 
     try:
         client = anthropic.Anthropic(api_key=api_key)
@@ -4726,27 +4851,27 @@ def generate_avatar_outfit_image_magnific(
         for idx, ref in enumerate(outfit_references, start=2):
             reference_lines.append(f"Reference image {idx} (OUTFIT reference): {ref}")
         refs_text = "\n\n".join(reference_lines)
-        response = client.beta.messages.create(
-            model=MODEL,
-            max_tokens=2048,
+
+        result = _run_magnific_mcp_sequence(
+            client=client,
             system=AVATAR_OUTFIT_IMAGE_GENERATE_SYSTEM,
-            messages=[{
-                "role": "user",
-                "content": (
-                    "Generate one Avatar Outfit mirror-selfie try-on image in Magnific.\n"
-                    "Required Magnific settings: use Google Nano Banana Pro, resolution = 2K, aspect ratio = 9:16. Do not use Auto or GPT Image.\n"
-                    "Upload every reference below to Magnific. Reference 1 is the avatar. Every later reference is the same outfit/product from additional listing or customer-review views.\n\n"
-                    f"{refs_text}\n\n"
-                    f"Final image prompt:\n{prompt}"
-                ),
-            }],
+            initial_content=(
+                "Generate one Avatar Outfit mirror-selfie try-on image in Magnific now.\n"
+                "Use Nano Banana Pro, resolution 2K, aspect ratio 9:16. Do not use Auto or GPT Image.\n"
+                "This is a multi-step task: upload any local references that need uploading, then CONTINUE to the image-generation tool. Do not stop after upload.\n\n"
+                f"{refs_text}\n\n"
+                f"Final image prompt:\n{prompt}"
+            ),
             mcp_servers=mcp_servers,
-            tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
-            betas=[MCP_BETA],
+            max_turns=8,
+            continuation_instruction=(
+                "Continue the SAME Magnific image task now. Do not repeat successful uploads. "
+                "Use the uploaded file handles/URLs from the previous MCP results, call the Magnific image-generation tool, "
+                "select Nano Banana Pro at 2K and 9:16, and return only after the REAL creation/task ID is returned. Do not narrate."
+            ),
         )
-        result = _parse_magnific_creation_response(response)
         result["provider"] = "Magnific"
-        result["image_model"] = "google_nano_banana_pro"
+        result["image_model"] = "nano_banana_pro"
         result["image_quality"] = "pro"
         result["image_resolution"] = "2K"
         result["image_aspect_ratio"] = "9:16"
@@ -4758,20 +4883,16 @@ def generate_avatar_outfit_image_magnific(
         return {"creation_id": None, "status": "error", "error": f"Avatar Outfit image generation failed: {exc}"}
 
 
-AVATAR_OUTFIT_KLING_SYSTEM = """You are a video production assistant with access to Magnific tools.
-You MUST actually call the Magnific MCP tools; do not merely describe what you would do and do not return a placeholder identifier.
-Use the same Magnific MCP account already configured in the app.
-1. Upload the ONE approved Avatar Outfit mirror-selfie image with creations_upload_image.
-2. Call video_generate and explicitly select the Magnific model Kling O1.
-3. Use the uploaded approved image as the FIRST/START frame. Do not use it only as a generic reference image.
-4. Use aspect ratio 9:16, resolution 720p, duration EXACTLY 10 seconds, sound off, and the provided motion prompt.
-5. Magnific offers 5 or 10 seconds for Kling O1 here. You MUST choose 10 seconds.
-6. Do not use the original avatar image or original outfit image in the video step.
-7. Submit exactly ONE video generation. Once Magnific returns the REAL creation/task identifier, stop. DO NOT call creations_get, poll, or wait for completion.
-8. Never return words such as "identifier", "task_id", "creation_id", "unknown", or an example value in place of the real identifier.
-
-After the real Magnific tool call succeeds, return ONLY valid JSON:
-{"creation_id":"REAL_MAGNIFIC_ID","status":"queued","error":null}
+AVATAR_OUTFIT_KLING_SYSTEM = """You are a video production assistant with access to Magnific MCP tools.
+This is a dependent, MULTI-STEP MCP workflow. The task is NOT complete after the start-frame upload.
+1. Upload the approved Avatar Outfit image with Magnific's available upload tool (currently exposed as creations_upload_file).
+2. After upload succeeds, CONTINUE and call video_generate with **Kling O1**.
+3. Use the uploaded approved image as the FIRST/START frame, not merely a generic reference.
+4. Use 9:16, 720p, EXACTLY 10 seconds, sound off, and the provided motion prompt.
+5. Magnific offers 5 or 10 seconds here; choose 10 seconds.
+6. Do not stop to narrate after upload. Continue until video_generate returns the REAL Magnific creation/task ID.
+7. Submit exactly one video generation and stop immediately after the real ID is returned. Do not poll.
+8. Never invent an identifier. Preserve any actual MCP error.
 """
 
 
@@ -4781,7 +4902,7 @@ def generate_avatar_outfit_kling_magnific(
     approved_image_url: str,
     prompt: str,
 ) -> dict:
-    """Animate the approved try-on image with Kling O1."""
+    """Animate the approved try-on image with Kling O1 using a multi-turn MCP sequence."""
     if not api_key:
         return {"creation_id": None, "status": "error", "error": "Anthropic API key is missing."}
     if not magnific_token:
@@ -4797,35 +4918,36 @@ def generate_avatar_outfit_kling_magnific(
     }]
     try:
         client = anthropic.Anthropic(api_key=api_key)
-        response = client.beta.messages.create(
-            model=MODEL,
-            max_tokens=2048,
+        result = _run_magnific_mcp_sequence(
+            client=client,
             system=AVATAR_OUTFIT_KLING_SYSTEM,
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"Approved Avatar Outfit start image: {approved_image_url}\n"
-                    "ACTUALLY SUBMIT this to Magnific now using the MCP tools. Generate a Kling O1 mirror-selfie try-on video at 720p, 9:16, EXACTLY 10 seconds, sound off. "
-                    "Use the approved image as the FIRST/START frame. Return the real Magnific creation ID immediately after submission; do not poll.\n\n"
-                    f"Kling prompt:\n{prompt}"
-                ),
-            }],
+            initial_content=(
+                f"Approved Avatar Outfit start image: {approved_image_url}\n"
+                "Submit this to Magnific now. This is a multi-step task: upload the approved image, then CONTINUE to video_generate. "
+                "Use Kling O1, 720p, 9:16, EXACTLY 10 seconds, sound off. Use the approved image as the FIRST/START frame. "
+                "Stop only after Magnific returns the REAL creation/task ID. Do not poll.\n\n"
+                f"Kling prompt:\n{prompt}"
+            ),
             mcp_servers=mcp_servers,
-            tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
-            betas=[MCP_BETA],
+            max_turns=6,
+            continuation_instruction=(
+                "Continue the SAME Magnific Kling O1 task now. Do not repeat a successful upload. "
+                "Use the uploaded start-frame handle/URL from the previous MCP result, call video_generate with Kling O1, "
+                "720p, 9:16, 10 seconds, sound off, and stop only after the REAL creation/task ID is returned. Do not narrate."
+            ),
         )
-        result = _parse_magnific_creation_response(response)
         creation_id = result.get("creation_id")
         if not _is_real_magnific_creation_id(creation_id):
+            if result.get("error"):
+                return result
             return {
                 "creation_id": None,
                 "status": "error",
                 "url": None,
                 "preview_url": None,
-                "error": "Magnific MCP did not return a real Kling creation ID, so the video was not confirmed as submitted. Click Send to Magnific and try again.",
+                "error": "Magnific MCP did not return a real Kling creation ID, so the video was not confirmed as submitted.",
+                "mcp_tools_called": result.get("mcp_tools_called", []),
             }
-        # Submission is asynchronous. Even if the assistant text mislabeled the state,
-        # a real creation ID with no output URL means the job should remain refreshable.
         if not (result.get("url") or result.get("preview_url")):
             result["status"] = "queued"
         result["submitted_at"] = datetime.now().isoformat(timespec="seconds")
