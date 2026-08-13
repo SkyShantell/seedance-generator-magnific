@@ -2443,7 +2443,7 @@ STYLE_LABELS = {
 
 LIFESTYLE_IMAGE_MODEL_LABEL = "Nano Banana 2 · Pro · 2k · 9:16"
 LIFESTYLE_VIDEO_MODEL_LABEL = "Kling O1 · 720p · 5s · start frame"
-AVATAR_OUTFIT_IMAGE_MODEL_LABEL = "GPT Image 2 · 2k · High · 9:16 · Magnific · 2 references"
+AVATAR_OUTFIT_IMAGE_MODEL_LABEL = "Google Nano Banana Pro · 2K · 9:16 · Magnific · multi-reference"
 AVATAR_OUTFIT_VIDEO_MODEL_LABEL = "Kling O1 · 720p · 10s · start frame"
 
 
@@ -3280,6 +3280,7 @@ def generate_video(
             }],
             mcp_servers=mcp_servers,
             tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
+            tool_choice={"type": "any"},
             betas=[MCP_BETA],
         )
 
@@ -3392,13 +3393,14 @@ def generate_lifestyle_image_magnific(
             }],
             mcp_servers=mcp_servers,
             tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
+            tool_choice={"type": "any"},
             betas=[MCP_BETA],
         )
         result = _parse_magnific_creation_response(response)
         result["provider"] = "Magnific"
         result["image_model"] = LIFESTYLE_MAGNIFIC_IMAGE_MODEL
         result["image_quality"] = LIFESTYLE_MAGNIFIC_IMAGE_QUALITY
-        result["image_resolution"] = "2k"
+        result["image_resolution"] = "2K"
         result["image_aspect_ratio"] = "9:16"
         result["reference_count"] = len(refs)
         return result
@@ -3407,16 +3409,20 @@ def generate_lifestyle_image_magnific(
 
 
 def _parse_magnific_creation_response(response) -> dict:
-    """Normalize Magnific MCP creation responses from image/video generation calls."""
+    """Normalize Magnific MCP responses and preserve the actual MCP failure when one occurs."""
     result = {
         "creation_id": None,
         "status": "unknown",
         "url": None,
         "preview_url": None,
         "error": None,
+        "mcp_tools_called": [],
+        "mcp_stop_reason": getattr(response, "stop_reason", None),
     }
 
     status_aliases = {
+        "created": "queued",
+        "submitted": "queued",
         "succeeded": "completed",
         "success": "completed",
         "done": "completed",
@@ -3426,40 +3432,44 @@ def _parse_magnific_creation_response(response) -> dict:
         "failed": "error",
         "failure": "error",
     }
+    tool_names_by_id = {}
+    tool_error_messages = []
+    plain_text_messages = []
+
+    def normalize_status(value):
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip().lower()
+        return status_aliases.get(normalized, normalized)
 
     def absorb(payload):
         if not isinstance(payload, (dict, list)):
             return
-
         url_candidates = []
 
         def walk(value, path=()):
             if isinstance(value, dict):
-                # Common creation ID fields.
-                for id_key in ("identifier", "creation_id", "creationId", "id"):
+                for id_key in (
+                    "identifier", "creation_id", "creationId", "task_id", "taskId",
+                    "generation_id", "generationId", "job_id", "jobId", "id",
+                ):
                     candidate = value.get(id_key)
                     if candidate and not result.get("creation_id"):
                         result["creation_id"] = str(candidate)
                         break
 
-                # Common status fields.
                 for status_key in ("status", "state", "creation_status", "creationStatus"):
-                    candidate = value.get(status_key)
-                    if isinstance(candidate, str) and candidate.strip():
-                        normalized = candidate.strip().lower()
-                        result["status"] = status_aliases.get(normalized, normalized)
+                    candidate = normalize_status(value.get(status_key))
+                    if candidate:
+                        result["status"] = candidate
                         break
 
-                # Error/message fields, but only keep them as errors when the payload
-                # actually represents an error rather than a normal descriptive message.
-                if result.get("status") == "error":
-                    for error_key in ("error", "error_message", "errorMessage", "message"):
-                        candidate = value.get(error_key)
-                        if candidate:
-                            if isinstance(candidate, dict):
-                                candidate = candidate.get("message") or candidate.get("detail") or str(candidate)
-                            result["error"] = str(candidate)[:1000]
-                            break
+                for error_key in ("error", "error_message", "errorMessage"):
+                    candidate = value.get(error_key)
+                    if candidate:
+                        if isinstance(candidate, dict):
+                            candidate = candidate.get("message") or candidate.get("detail") or json.dumps(candidate)[:1000]
+                        tool_error_messages.append(str(candidate)[:1200])
 
                 for key, child in value.items():
                     key_lower = str(key).lower()
@@ -3470,13 +3480,13 @@ def _parse_magnific_creation_response(response) -> dict:
                         is_preview = "preview" in key_lower or "preview" in path_text
                         if key_lower in {"imageurl", "image_url", "videourl", "video_url", "downloadurl", "download_url"}:
                             score += 130
-                        elif key_lower in {"outputurl", "output_url", "resulturl", "result_url", "mediaurl", "media_url"}:
+                        elif key_lower in {"outputurl", "output_url", "resulturl", "result_url", "mediaurl", "media_url", "generated"}:
                             score += 115
                         elif key_lower in {"url", "fileurl", "file_url"}:
                             score += 80
                         elif is_preview:
                             score += 60
-                        if any(token in path_text for token in ("output", "result", "image", "video", "media", "asset", "download")):
+                        if any(token in path_text for token in ("output", "result", "generated", "image", "video", "media", "asset", "download")):
                             score += 25
                         if any(token in path_text for token in ("input", "reference", "source", "uploaded")):
                             score -= 90
@@ -3499,54 +3509,103 @@ def _parse_magnific_creation_response(response) -> dict:
 
     for block in getattr(response, "content", []) or []:
         block_type = getattr(block, "type", "")
+
+        if block_type == "mcp_tool_use":
+            tool_name = str(getattr(block, "name", "") or "unknown_tool")
+            tool_id = str(getattr(block, "id", "") or "")
+            if tool_id:
+                tool_names_by_id[tool_id] = tool_name
+            if tool_name not in result["mcp_tools_called"]:
+                result["mcp_tools_called"].append(tool_name)
+            continue
+
         if block_type == "text":
             raw = getattr(block, "text", "") or ""
+            if raw.strip():
+                plain_text_messages.append(raw.strip()[:1500])
             try:
                 cleaned = re.sub(r'```json\s*|```\s*', '', raw)
-                start = cleaned.find("{")
-                end = cleaned.rfind("}") + 1
-                if start >= 0 and end > start:
-                    parsed = json.loads(cleaned[start:end])
+                start_json = cleaned.find("{")
+                end_json = cleaned.rfind("}") + 1
+                if start_json >= 0 and end_json > start_json:
+                    parsed = json.loads(cleaned[start_json:end_json])
                     if isinstance(parsed, dict):
-                        # The assistant's small JSON response is authoritative for
-                        # creation_id/status/error, then nested parsing fills URLs.
                         if parsed.get("creation_id"):
-                            result["creation_id"] = parsed["creation_id"]
+                            result["creation_id"] = str(parsed["creation_id"])
                         if parsed.get("identifier") and not result.get("creation_id"):
-                            result["creation_id"] = parsed["identifier"]
+                            result["creation_id"] = str(parsed["identifier"])
+                        if parsed.get("task_id") and not result.get("creation_id"):
+                            result["creation_id"] = str(parsed["task_id"])
                         if parsed.get("status"):
-                            normalized = str(parsed["status"]).strip().lower()
-                            result["status"] = status_aliases.get(normalized, normalized)
+                            result["status"] = normalize_status(str(parsed["status"])) or result["status"]
                         if parsed.get("url"):
                             result["url"] = parsed["url"]
                         if parsed.get("preview_url"):
                             result["preview_url"] = parsed["preview_url"]
                         if parsed.get("error"):
-                            result["error"] = str(parsed["error"])
+                            tool_error_messages.append(str(parsed["error"])[:1200])
                         absorb(parsed)
             except (json.JSONDecodeError, TypeError, ValueError):
                 pass
+            continue
 
-        elif block_type == "mcp_tool_result" and getattr(block, "content", None):
-            for sub in block.content:
-                raw = getattr(sub, "text", None)
-                if not raw:
-                    continue
-                try:
-                    absorb(json.loads(raw))
-                except (json.JSONDecodeError, TypeError, ValueError):
-                    continue
+        if block_type == "mcp_tool_result":
+            tool_use_id = str(getattr(block, "tool_use_id", "") or "")
+            tool_name = tool_names_by_id.get(tool_use_id, "Magnific MCP tool")
+            is_error = bool(getattr(block, "is_error", False))
+            subcontents = getattr(block, "content", None) or []
+            if isinstance(subcontents, str):
+                subcontents = [subcontents]
 
-    # Some Magnific generation calls return a creation ID with an otherwise
-    # ambiguous status. Treat that as queued so the UI exposes its status checker.
+            raw_parts = []
+            for sub in subcontents:
+                raw = sub if isinstance(sub, str) else getattr(sub, "text", None)
+                if raw:
+                    raw_parts.append(str(raw))
+                    try:
+                        absorb(json.loads(str(raw)))
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        pass
+            raw_joined = "\n".join(raw_parts).strip()
+            if is_error:
+                if raw_joined:
+                    tool_error_messages.append(f"{tool_name}: {raw_joined[:1600]}")
+                else:
+                    tool_error_messages.append(f"{tool_name} returned an MCP error with no message.")
+            elif raw_joined and not result.get("creation_id"):
+                # Some MCP servers return human-readable text instead of JSON.
+                id_patterns = [
+                    r'(?i)(?:creation|task|job|generation)[ _-]?(?:id|identifier)\s*[:=]\s*["\']?([A-Za-z0-9_-]{8,})',
+                    r'(?i)identifier\s*[:=]\s*["\']?([A-Za-z0-9_-]{8,})',
+                ]
+                for pattern in id_patterns:
+                    match = re.search(pattern, raw_joined)
+                    if match:
+                        result["creation_id"] = match.group(1)
+                        break
+
     if result.get("creation_id") and result.get("status") in {None, "", "unknown"}:
         result["status"] = "queued"
 
+    if tool_error_messages:
+        result["error"] = " | ".join(dict.fromkeys(tool_error_messages))[:2200]
+        if result.get("status") in {None, "", "unknown"}:
+            result["status"] = "error"
+
     if not result.get("creation_id") and not result.get("url") and not result.get("preview_url") and not result.get("error"):
-        result["error"] = "Magnific did not return a creation identifier or output URL."
+        if not result.get("mcp_tools_called"):
+            extra = f" Claude stop reason: {result.get('mcp_stop_reason')}." if result.get("mcp_stop_reason") else ""
+            text_hint = f" Response: {plain_text_messages[-1][:800]}" if plain_text_messages else ""
+            result["error"] = (
+                "Claude did not call any Magnific MCP tool, so the image generation was never submitted to Magnific."
+                + extra + text_hint
+            )
+        else:
+            tools = ", ".join(result.get("mcp_tools_called") or [])
+            text_hint = f" Last response: {plain_text_messages[-1][:800]}" if plain_text_messages else ""
+            result["error"] = f"Magnific MCP tool(s) ran ({tools}) but no creation/task ID or output URL was returned.{text_hint}"
 
     return result
-
 
 def _is_real_magnific_creation_id(value) -> bool:
     """Reject template/example IDs that can make the UI think an MCP job was submitted."""
@@ -3599,6 +3658,7 @@ def generate_lifestyle_kling_magnific(
             }],
             mcp_servers=mcp_servers,
             tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
+            tool_choice={"type": "any"},
             betas=[MCP_BETA],
         )
         return _parse_magnific_creation_response(response)
@@ -3704,6 +3764,7 @@ def check_creation_status(api_key: str, magnific_token: str, creation_id: str) -
             }],
             mcp_servers=mcp_servers,
             tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
+            tool_choice={"type": "any"},
             betas=[MCP_BETA],
         )
 
@@ -4611,20 +4672,17 @@ Preserve exact identity, outfit, shoes, setting and lighting from the approved s
     return prompt[:1899]
 
 
-AVATAR_OUTFIT_IMAGE_GENERATE_SYSTEM = """You are an image production assistant with access to Magnific tools.
-Use the same Magnific MCP account already configured in the app.
-1. Upload EVERY provided reference image to Magnific using creations_upload_image.
-2. Reference image 1 is the avatar/identity reference. Preserve this exact person's appearance and identity.
-3. Reference images 2+ are outfit/clothing references. They may include official listing photos and customer review photos of the same outfit from different views. Use ALL of them together for clothing, shoes, fit, color, material, and construction accuracy.
-4. If references conflict, prioritize clear official listing photos for exact product design/color and use customer review photos as supporting evidence for real-world fit/details.
-5. Generate EXACTLY ONE final mirror-selfie try-on image.
-6. You MUST use model slug gpt_image_2.
-7. You MUST use quality high.
-8. You MUST use resolution 2k.
-9. You MUST use aspect ratio 9:16.
-10. Do not use GPT Image 1 or any default fallback image model.
-11. Submit the generation ONCE and return immediately after you receive the creation identifier. DO NOT call creations_get, DO NOT poll, and DO NOT wait for the image to finish.
-12. Return ONLY valid JSON (no markdown): {"creation_id":"the magnific creation identifier","status":"queued","url":null,"preview_url":null,"error":null}
+AVATAR_OUTFIT_IMAGE_GENERATE_SYSTEM = """You are an image production assistant with access to Magnific MCP tools.
+You MUST actually call the Magnific MCP tools in this turn. Do not merely describe the steps and do not return a made-up identifier.
+1. Upload EVERY provided local/data-URI reference image using the available Magnific image-upload tool. Hosted HTTP(S) product references may be used directly if the Magnific tool accepts them.
+2. Reference image 1 is the avatar identity. Preserve this exact person's appearance and identity.
+3. Reference images 2+ are outfit/clothing references from official listings and/or customer reviews. Use them together for clothing, shoes, fit, color, material and construction accuracy.
+4. Generate EXACTLY ONE mirror-selfie try-on image in Magnific.
+5. Explicitly choose **Google Nano Banana Pro** as the Magnific image model. Do not use Auto, GPT Image, Grok, or another model.
+6. Set output resolution to **2K** and aspect ratio to **9:16**.
+7. Submit the generation exactly once. After Magnific returns the real creation/task identifier, stop. Do not poll or wait for completion.
+8. Return ONLY valid JSON containing the REAL identifier returned by Magnific: {"creation_id":"REAL_ID_FROM_MAGNIFIC","status":"queued","url":null,"preview_url":null,"error":null}
+If an MCP tool returns an error, return that actual error message in the error field instead of inventing an ID.
 """
 
 
@@ -4635,7 +4693,7 @@ def generate_avatar_outfit_image_magnific(
     outfit_references: list[str],
     prompt: str,
 ) -> dict:
-    """Use Magnific GPT Image 2 with one avatar plus multiple outfit references."""
+    """Use Magnific Google Nano Banana Pro at 2K with one avatar plus multiple outfit references."""
     if not api_key:
         return {"creation_id": None, "status": "error", "error": "The Anthropic API key is missing."}
     if not magnific_token:
@@ -4679,8 +4737,8 @@ def generate_avatar_outfit_image_magnific(
             messages=[{
                 "role": "user",
                 "content": (
-                    "Generate one Avatar Outfit mirror-selfie try-on image.\n"
-                    "Required Magnific settings: model slug = gpt_image_2, quality = high, resolution = 2k, aspect ratio = 9:16.\n"
+                    "Generate one Avatar Outfit mirror-selfie try-on image in Magnific.\n"
+                    "Required Magnific settings: use Google Nano Banana Pro, resolution = 2K, aspect ratio = 9:16. Do not use Auto or GPT Image.\n"
                     "Upload every reference below to Magnific. Reference 1 is the avatar. Every later reference is the same outfit/product from additional listing or customer-review views.\n\n"
                     f"{refs_text}\n\n"
                     f"Final image prompt:\n{prompt}"
@@ -4688,13 +4746,14 @@ def generate_avatar_outfit_image_magnific(
             }],
             mcp_servers=mcp_servers,
             tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
+            tool_choice={"type": "any"},
             betas=[MCP_BETA],
         )
         result = _parse_magnific_creation_response(response)
         result["provider"] = "Magnific"
-        result["image_model"] = "gpt_image_2"
-        result["image_quality"] = "high"
-        result["image_resolution"] = "2k"
+        result["image_model"] = "google_nano_banana_pro"
+        result["image_quality"] = "pro"
+        result["image_resolution"] = "2K"
         result["image_aspect_ratio"] = "9:16"
         result["reference_count"] = 1 + len(outfit_references)
         result["outfit_reference_count"] = len(outfit_references)
@@ -4758,6 +4817,7 @@ def generate_avatar_outfit_kling_magnific(
             }],
             mcp_servers=mcp_servers,
             tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
+            tool_choice={"type": "any"},
             betas=[MCP_BETA],
         )
         result = _parse_magnific_creation_response(response)
@@ -5379,6 +5439,8 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
                 )
             if result.get("error"):
                 st.error(result["error"])
+                if result.get("mcp_tools_called"):
+                    st.caption("Magnific MCP tools seen: " + ", ".join(result.get("mcp_tools_called") or []))
             elif queue_submit:
                 _queue_avatar_outfit_image_job(
                     image_result=result,
