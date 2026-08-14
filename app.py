@@ -2443,7 +2443,8 @@ STYLE_LABELS = {
 
 LIFESTYLE_IMAGE_MODEL_LABEL = "Nano Banana 2 · Pro · 2k · 9:16"
 LIFESTYLE_VIDEO_MODEL_LABEL = "Kling O1 · 720p · 5s · start frame"
-AVATAR_OUTFIT_IMAGE_MODEL_LABEL = "GPT Image 2 · High · 2K · 9:16 · Magnific · multi-reference"
+AVATAR_OUTFIT_IMAGE_MODEL_LABEL = "OpenAI GPT Image 1.5 · High · 2K · 9:16 · Magnific · multi-reference"
+AVATAR_OUTFIT_MAGNIFIC_MODEL_SLUG = "IHVGthzyDC-openai-gpt-image-1-5"
 AVATAR_OUTFIT_VIDEO_MODEL_LABEL = "Kling O1 · 720p · 10s · start frame"
 
 
@@ -3586,9 +3587,16 @@ def _parse_magnific_creation_response(response) -> dict:
         result["status"] = "queued"
 
     if tool_error_messages:
-        result["error"] = " | ".join(dict.fromkeys(tool_error_messages))[:2200]
-        if result.get("status") in {None, "", "unknown"}:
-            result["status"] = "error"
+        joined_errors = " | ".join(dict.fromkeys(tool_error_messages))[:2200]
+        # Some Magnific runs can return non-fatal upload/tool warnings while still creating a real image/video job.
+        if result.get("creation_id") or result.get("url") or result.get("preview_url"):
+            result["warning"] = joined_errors
+            if result.get("status") in {None, "", "unknown", "error"}:
+                result["status"] = "queued" if result.get("creation_id") and not result.get("url") else (result.get("status") or "completed")
+        else:
+            result["error"] = joined_errors
+            if result.get("status") in {None, "", "unknown"}:
+                result["status"] = "error"
 
     if not result.get("creation_id") and not result.get("url") and not result.get("preview_url") and not result.get("error"):
         if not result.get("mcp_tools_called"):
@@ -4826,7 +4834,7 @@ Use the same Magnific MCP account already configured in the app.
 3. Reference images 2+ are outfit/clothing references from official listing photos and/or customer review photos.
 4. Use ALL provided outfit references together for clothing accuracy: garment type, colors, pattern, fit, silhouette, fabric, details, and styling.
 5. Generate EXACTLY ONE final mirror-selfie try-on image.
-6. You MUST use model slug gpt_image_2.
+6. You MUST use model slug IHVGthzyDC-openai-gpt-image-1-5.
 7. You MUST use quality high.
 8. You MUST use resolution 2k.
 9. You MUST use aspect ratio 9:16.
@@ -4890,7 +4898,7 @@ def generate_avatar_outfit_image_magnific(
                 "role": "user",
                 "content": (
                     "Generate one Avatar Outfit mirror-selfie try-on image.\n"
-                    "Required Magnific settings: model slug = gpt_image_2, quality = high, resolution = 2k, aspect ratio = 9:16.\n"
+                    "Required Magnific settings: model slug = IHVGthzyDC-openai-gpt-image-1-5, quality = high, resolution = 2k, aspect ratio = 9:16.\n"
                     "Use all supplied reference images together. Reference image 1 is the avatar identity to preserve exactly. "
                     "Reference images 2+ are outfit / clothing / shoe references from official listing images and customer reviews.\n"
                     "Upload every provided reference to Magnific using creations_upload_image, then generate the final image.\n"
@@ -4905,7 +4913,7 @@ def generate_avatar_outfit_image_magnific(
         )
         result = _parse_magnific_creation_response(response)
         result["provider"] = "Magnific"
-        result["image_model"] = "gpt_image_2"
+        result["image_model"] = AVATAR_OUTFIT_MAGNIFIC_MODEL_SLUG
         result["image_quality"] = "high"
         result["image_resolution"] = "2K"
         result["image_aspect_ratio"] = "9:16"
@@ -5224,7 +5232,7 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
         "Choose a saved avatar, then paste a TikTok Shop clothing link or upload outfit photos. You can select multiple official listing photos and customer review photos before generating the try-on."
     )
     st.info(
-        "Selected outfit photos are analyzed together and sent to Magnific GPT Image 2 High at 2K as supporting references. The Avatar Outfit video remains a clean, silent Kling O1 mirror try-on with no hook text, captions, voiceover, music, or soundtrack."
+        "Selected outfit photos are analyzed together and sent to Magnific OpenAI GPT Image 1.5 High at 2K as supporting references. The Avatar Outfit video remains a clean, silent Kling O1 mirror try-on with no hook text, captions, voiceover, music, or soundtrack."
     )
     st.caption(
         "Large avatar/outfit files are optimized automatically. Claude analysis gets a resized copy, and local images get a separate compact reference copy for the Magnific MCP request so the request stays lightweight while still using the simpler one-pass GPT Image 2 flow."
@@ -5580,7 +5588,7 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
         )
 
         if queue_submit or single_submit:
-            with st.spinner(f"Submitting Magnific GPT Image 2 with {len(saved_outfit_refs)} outfit reference(s)..."):
+            with st.spinner(f"Submitting Magnific OpenAI GPT Image 1.5 with {len(saved_outfit_refs)} outfit reference(s)..."):
                 result = generate_avatar_outfit_image_magnific(
                     api_key=api_key,
                     magnific_token=magnific_token,
@@ -5593,6 +5601,10 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
                 if result.get("mcp_tools_called"):
                     st.caption("Magnific MCP tools seen: " + ", ".join(result.get("mcp_tools_called") or []))
             elif queue_submit:
+                if result.get("warning"):
+                    st.warning(result["warning"])
+                    if result.get("mcp_tools_called"):
+                        st.caption("Magnific MCP tools seen: " + ", ".join(result.get("mcp_tools_called") or []))
                 _queue_avatar_outfit_image_job(
                     image_result=result,
                     avatar_label=analysis.get("avatar_label") or avatar_source_label or "Avatar",
@@ -5618,6 +5630,10 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
                 st.rerun()
             else:
                 st.session_state["avatar_outfit_image_result"] = result
+                if result.get("warning"):
+                    st.warning(result["warning"])
+                    if result.get("mcp_tools_called"):
+                        st.caption("Magnific MCP tools seen: " + ", ".join(result.get("mcp_tools_called") or []))
                 if result.get("omitted_reference_count"):
                     st.warning(f"{result.get('omitted_reference_count')} oversized local outfit reference(s) were skipped to keep the MCP request within its prompt limit. All hosted TikTok references were retained.")
                 st.session_state["avatar_outfit_image_approved"] = False
@@ -5643,6 +5659,8 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
             st.caption("If the preview below looks broken but the creation finished in Magnific, click **Refresh image result** on the right to fetch the latest output URL.")
     with action_col:
         st.success("Review identity, outfit accuracy, shoes, full-body framing, and mirror realism before approving.")
+        if image_result.get("warning"):
+            st.warning(image_result.get("warning"))
         st.caption(f"Magnific used {image_result.get('outfit_reference_count', len(saved_outfit_refs))} outfit reference(s).")
         st.caption(f"Image status: {image_result.get('status', 'unknown')} · Creation ID: {image_result.get('creation_id', 'n/a')}")
         if generated_image_url:
@@ -5664,7 +5682,7 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
             key="avatar_outfit_regen_image",
             disabled=not bool(api_key and magnific_token and saved_avatar_ref and saved_outfit_refs),
         ):
-            with st.spinner("Generating another Magnific GPT Image 2 try-on image with the same selected references..."):
+            with st.spinner("Generating another Magnific OpenAI GPT Image 1.5 try-on image with the same selected references..."):
                 result = generate_avatar_outfit_image_magnific(
                     api_key=api_key,
                     magnific_token=magnific_token,
@@ -5676,6 +5694,10 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
                 st.error(result["error"])
             else:
                 st.session_state["avatar_outfit_image_result"] = result
+                if result.get("warning"):
+                    st.warning(result["warning"])
+                    if result.get("mcp_tools_called"):
+                        st.caption("Magnific MCP tools seen: " + ", ".join(result.get("mcp_tools_called") or []))
                 if result.get("omitted_reference_count"):
                     st.warning(f"{result.get('omitted_reference_count')} oversized local outfit reference(s) were skipped to keep the MCP request within its prompt limit. All hosted TikTok references were retained.")
                 st.session_state["avatar_outfit_image_approved"] = False
