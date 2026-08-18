@@ -711,6 +711,55 @@ def fetch_video_bytes(video_url: str, cache_key: str = "") -> bytes | None:
         return None
 
 
+def muted_avatar_outfit_video_bytes(video_url: str, creation_id: str = "", refresh_key: str = "") -> tuple[bytes | None, str | None]:
+    """Download an Avatar Outfit video and remove every audio stream with FFmpeg.
+
+    Seedance is requested with sound disabled, but this is a final safety net so
+    previews/downloads from this workflow never contain generated audio.
+    """
+    if not video_url:
+        return None, "No finished video URL is available."
+    source = fetch_video_bytes(video_url, cache_key=refresh_key or creation_id)
+    if not source:
+        return None, "The finished Seedance video could not be downloaded yet."
+
+    ffmpeg_path = get_ffmpeg_executable()
+    if not ffmpeg_path:
+        return None, "FFmpeg is required to guarantee a silent Avatar Outfit video."
+
+    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", creation_id or "avatar_outfit")[:60]
+    digest = hashlib.sha1(f"{video_url}|{refresh_key}".encode("utf-8")).hexdigest()[:12]
+    output_path = PROCESSED_DIR / f"{safe_id}_{digest}_silent.mp4"
+    if output_path.exists() and output_path.stat().st_size > 0:
+        try:
+            return output_path.read_bytes(), None
+        except Exception:
+            pass
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="avatar_outfit_silent_") as temp_dir:
+            input_path = Path(temp_dir) / "input.mp4"
+            input_path.write_bytes(source)
+            command = [
+                ffmpeg_path, "-hide_banner", "-loglevel", "error", "-y",
+                "-i", str(input_path),
+                "-map", "0:v:0",
+                "-c:v", "copy",
+                "-an",
+                "-movflags", "+faststart",
+                str(output_path),
+            ]
+            completed = subprocess.run(command, capture_output=True, text=True, timeout=180, check=False)
+            if completed.returncode != 0 or not output_path.exists() or output_path.stat().st_size == 0:
+                output_path.unlink(missing_ok=True)
+                details = (completed.stderr or "Could not remove the audio stream.").strip().splitlines()
+                return None, details[-1] if details else "Could not remove the audio stream."
+            return output_path.read_bytes(), None
+    except Exception as exc:
+        output_path.unlink(missing_ok=True)
+        return None, f"Could not make the Avatar Outfit video silent: {exc}"
+
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_image_bytes(image_url: str) -> tuple[bytes | None, str | None]:
     """Download image bytes and return the detected content type for Streamlit reruns."""
@@ -2444,7 +2493,7 @@ STYLE_LABELS = {
 LIFESTYLE_IMAGE_MODEL_LABEL = "Nano Banana 2 · Pro · 2k · 9:16"
 LIFESTYLE_VIDEO_MODEL_LABEL = "Kling O1 · 720p · 5s · start frame"
 AVATAR_OUTFIT_IMAGE_MODEL_LABEL = "No intermediate image model"
-AVATAR_OUTFIT_VIDEO_MODEL_LABEL = "Seedance 2.0 Fast · 720p · 10s · multi-reference"
+AVATAR_OUTFIT_VIDEO_MODEL_LABEL = "Seedance 2.0 Fast · 720p · 8s · multi-reference"
 
 
 def resolved_style_duration(style: str, selected_duration: int = 15) -> int:
@@ -4746,6 +4795,12 @@ For the outfit, combine evidence from ALL outfit references. Describe ONLY the c
 
 Determine whether shoes are visibly included in any selected outfit reference. If shoes are visible, describe them. If not, return clean white sneakers as the default. If only a top is visible across all selected references with no matching bottom, set bottom_fallback to black fitted jogger pants; otherwise leave bottom_fallback empty.
 
+Also determine the styling focus for motion prompting:
+- outfit_focus = "full_outfit" when both a top and bottom are part of the intended outfit.
+- outfit_focus = "top_only" when the clothing focus is mainly the top.
+- outfit_focus = "bottom_only" when the clothing focus is mainly the pants/shorts/skirt/bottom.
+- show_back_design = true only when the selected outfit references clearly show an important back graphic, print, embroidery, or back design detail that should be briefly shown in the video.
+
 Return ONLY valid JSON:
 {
   "avatar_description":"concise visible physical description",
@@ -4753,7 +4808,9 @@ Return ONLY valid JSON:
   "shoes_description":"visible shoes or clean white sneakers",
   "bottom_fallback":"black fitted jogger pants or empty string",
   "outfit_has_shoes":true,
-  "outfit_has_bottom":true
+  "outfit_has_bottom":true,
+  "outfit_focus":"full_outfit or top_only or bottom_only",
+  "show_back_design":false
 }"""
 
     try:
@@ -4813,6 +4870,10 @@ Return ONLY valid JSON:
             return {"error": "Could not extract both avatar and outfit descriptions."}
         parsed["shoes_description"] = (parsed.get("shoes_description") or "clean white sneakers").strip()
         parsed["bottom_fallback"] = (parsed.get("bottom_fallback") or "").strip()
+        parsed["outfit_focus"] = str(parsed.get("outfit_focus") or "").strip().lower()
+        if parsed["outfit_focus"] not in {"full_outfit", "top_only", "bottom_only"}:
+            parsed["outfit_focus"] = "full_outfit" if parsed.get("outfit_has_bottom") else "top_only"
+        parsed["show_back_design"] = bool(parsed.get("show_back_design"))
         parsed["outfit_reference_count"] = usable_count
         return parsed
     except Exception as exc:
@@ -4890,22 +4951,50 @@ def build_avatar_outfit_seedance_prompt(
     outfit_description: str,
     shoes_description: str,
     bottom_fallback: str = "",
+    outfit_focus: str = "full_outfit",
+    show_back_design: bool = False,
 ) -> str:
-    """Direct 10-second Seedance 2.0 Fast prompt using avatar + clothing references."""
+    """Direct 8-second Seedance 2.0 Fast prompt using avatar + clothing references."""
     avatar = re.sub(r"\s+", " ", (avatar_description or "").strip())[:220]
     outfit = re.sub(r"\s+", " ", (outfit_description or "").strip())[:420]
     shoes = re.sub(r"\s+", " ", (shoes_description or "clean white sneakers").strip())[:120]
     if bottom_fallback:
         outfit += f" Pair the visible top with {bottom_fallback}."
 
-    prompt = f"""10-second 9:16 vertical TikTok UGC mirror-selfie video, one continuous take, no cuts. REFERENCE RULES: reference image 1 is the AVATAR identity only; preserve this exact person's face, skin, hair, facial hair, body build and visible identity details: {avatar}. Reference images 2+ are OUTFIT references only; ignore the people/models in those images and dress the avatar in the exact clothing shown: {outfit}. Shoes: {shoes}. Begin with the avatar already wearing the finished outfit; do not show dressing or transformation.
+    outfit_focus = str(outfit_focus or "full_outfit").strip().lower()
+    if outfit_focus not in {"full_outfit", "top_only", "bottom_only"}:
+        outfit_focus = "full_outfit"
+    show_back_design = bool(show_back_design)
+
+    if outfit_focus == "top_only":
+        motion_timeline = """[00:00-00:02] Centered full-body front pose, gentle handheld sway, clearly present the shirt/top from the front.
+[00:02-00:04] Use the free hand to touch, smooth, or lightly pull the shirt/top near the chest, hem, or sleeve so the video clearly focuses on the top.
+[00:04-00:06] Make a slight quarter-turn while still highlighting the top fit and silhouette. If the top has an important back design, briefly turn enough to show part of the back graphic or back detail naturally.
+[00:06-00:08] Return to a confident final pose facing mostly forward, lightly adjust the top/hem once more, and keep the shirt/top clearly visible."""
+    elif outfit_focus == "bottom_only":
+        motion_timeline = """[00:00-00:02] Centered full-body front pose, gentle handheld sway, clearly present the pants/bottom from the front.
+[00:02-00:04] Use the free hand to touch or motion toward the waistband, upper thigh, pocket, or leg so the video clearly focuses on the pants/bottom.
+[00:04-00:06] Shift weight and make a small side-angle pose to show the leg shape, fit, and silhouette while still keeping the bottoms as the focus.
+[00:06-00:08] Return to a confident final pose with one last natural gesture toward the pants/bottom and keep the lower-half details easy to see."""
+    else:
+        if show_back_design:
+            motion_timeline = """[00:00-00:02] Centered full-body front pose, gentle handheld sway, clearly present the full outfit from the front.
+[00:02-00:04] Use the free hand to touch or gesture toward the shirt/top first, then motion toward the pants/bottom so both pieces are clearly featured.
+[00:04-00:06] Make a natural half-turn or strong quarter-turn to briefly show the back of the shirt/top enough for the important back design to be visible, while keeping the outfit realistic and wearable.
+[00:06-00:08] Turn back toward the mirror into a confident final full-body pose and lightly adjust the shirt or pants so the whole outfit is still clearly visible."""
+        else:
+            motion_timeline = """[00:00-00:02] Centered full-body front pose, gentle handheld sway, clearly present the full outfit from the front.
+[00:02-00:04] Use the free hand to touch or gesture toward the shirt/top first, then motion toward the pants/bottom so both pieces are clearly featured.
+[00:04-00:06] Shift weight into a slight side-angle pose to show overall fit and silhouette while keeping the full outfit visible head-to-toe.
+[00:06-00:08] Return to a confident final full-body pose with a small natural outfit adjustment, keeping both the shirt/top and pants/bottom clearly visible."""
+
+    prompt = f"""8-second 9:16 vertical TikTok UGC mirror-selfie video, one continuous take, no cuts. REFERENCE RULES: reference image 1 is the AVATAR identity only; preserve this exact person's face, skin, hair, facial hair, body build and visible identity details: {avatar}. Reference images 2+ are OUTFIT references only; ignore the people/models in those images and dress the avatar in the exact clothing shown: {outfit}. Shoes: {shoes}. Begin with the avatar already wearing the finished outfit; do not show dressing or transformation.
 
 Scene: full-body head-to-toe mirror selfie inside a luxury modern penthouse at night. The avatar holds a black smartphone at face level in the right hand so it partially covers the face. Floor-to-ceiling glass, blue-lit infinity pool, city skyline, palm trees, warm recessed lights, polished tile. Authentic iPhone low-light UGC: slight sensor grain, natural skin texture, subtle mirror smudge, realistic fabric texture, mixed warm indoor and cool pool light, natural shadows, no studio look.
 
-[00:00-00:03] Centered full-body front pose, gentle handheld sway, outfit clearly visible.
-[00:03-00:06] Shift weight and make a slight quarter-turn; free hand lightly touches the garment or pocket.
-[00:06-00:08] Small side-angle pose showing fit and silhouette while keeping the full outfit in frame.
-[00:08-00:10] Return to a confident final pose with a tiny natural garment/watch adjustment and subtle sway.
+Motion intent: The posing must match the clothing focus. If this is a full outfit, clearly feature both the top and bottom with natural gestures. If this is mainly a shirt/top, make the posing clearly about the shirt/top. If this is mainly pants/bottoms, make the posing clearly about the pants/bottoms. If there is an important back design on the top, include a brief natural turn so that back design is shown.
+
+{motion_timeline}
 
 Preserve identity and clothing accurately throughout. One person only. No morphing, wardrobe changes, extra limbs, duplicate people, animals, text, captions, prices, watermarks, logos added by the generator, voiceover, music, or sound. Use the reference images as visual references only; do NOT display them literally as a start frame, slideshow, collage, split screen, or inserted still image."""
     prompt = re.sub(r"\s+", " ", prompt).strip()
@@ -4918,7 +5007,7 @@ Create ONE direct Avatar Outfit video. There is NO intermediate image-generation
 2. Reference image 1 is the AVATAR identity reference. Preserve that exact person's identity and visible appearance.
 3. Reference images 2+ are OUTFIT references. Use them only for the clothing, footwear, fit, color, material and construction. Never copy the people/models from outfit references.
 4. Call video_generate with model slug bytedance-seedance-fast-2.0.
-5. Use 9:16, 720p, exactly 10 seconds, sound off.
+5. Use 9:16, 720p, exactly 8 seconds. AUDIO MUST BE OFF. Disable Sound Effects and all native/generated audio. If video_generate exposes generate_audio, audio, sound, sound_effects, or an equivalent boolean/toggle, explicitly set it to FALSE/OFF. Do not attach an audio reference and do not generate voice, SFX, ambience, or BGM.
 6. Attach all uploaded images as GENERAL visual references only. NEVER use start_image, start frame, first frame, end frame, keyframe, or slideshow behavior.
 7. The generated video must begin with the avatar already wearing the requested outfit in the scene described by the prompt.
 8. Submit exactly ONE video generation and return immediately after the real Magnific creation identifier is returned. Do not poll.
@@ -4974,7 +5063,7 @@ def generate_avatar_outfit_seedance_video(
                 "role": "user",
                 "content": (
                     "Generate the direct Avatar Outfit video now. Do NOT generate a still image first.\n"
-                    "Required video settings: bytedance-seedance-fast-2.0, 720p, 9:16, exactly 10 seconds, sound off.\n"
+                    "Required video settings: bytedance-seedance-fast-2.0, 720p, 9:16, exactly 8 seconds, sound off.\n"
                     "Reference 1 is the avatar identity. References 2+ are clothing/outfit references only.\n"
                     "Use every reference only as a general visual reference; never as a literal start frame.\n\n"
                     f"{refs_text}\n\n"
@@ -4989,8 +5078,10 @@ def generate_avatar_outfit_seedance_video(
         result["provider"] = "Magnific"
         result["video_model"] = "bytedance-seedance-fast-2.0"
         result["video_resolution"] = "720p"
-        result["video_duration"] = 10
+        result["video_duration"] = 8
         result["video_aspect_ratio"] = "9:16"
+        result["sound_enabled"] = False
+        result["generate_audio"] = False
         result["reference_count"] = len(refs)
         result["outfit_reference_count"] = len(outfit_references)
         result["omitted_reference_count"] = omitted_count
@@ -5312,17 +5403,45 @@ def _render_avatar_outfit_bulk_queue(api_key: str, magnific_token: str) -> None:
                 continue
             video_url = video.get("url") or video.get("preview_url")
             if video_url:
-                st.video(video_url)
-                video_bytes = fetch_video_bytes(video_url)
-                if video_bytes:
-                    st.download_button(
-                        "⬇️ Download Avatar Outfit video",
-                        data=video_bytes,
-                        file_name=f"avatar_outfit_{video.get('creation_id', job['job_id'])}.mp4",
-                        mime="video/mp4",
-                        key=f"ao_bulk_download_{job['job_id']}",
+                preview_col, info_col = st.columns(2, gap="large")
+                refresh_key = str(video.get("video_refresh_key") or video.get("creation_id") or job.get("job_id"))
+                silent_bytes, silent_error = muted_avatar_outfit_video_bytes(
+                    video_url,
+                    creation_id=str(video.get("creation_id") or job.get("job_id")),
+                    refresh_key=refresh_key,
+                )
+                with preview_col:
+                    st.markdown("#### Finished video")
+                    if silent_bytes:
+                        st.video(silent_bytes, muted=True)
+                    else:
+                        st.video(video_url, muted=True)
+                        if silent_error:
+                            st.warning(silent_error)
+                with info_col:
+                    st.success("Seedance video is ready.")
+                    st.caption("Audio generation was requested OFF. The app also removes any returned audio stream before download.")
+                    if st.button(
+                        "🔄 Refresh / Pull finished video",
+                        key=f"ao_bulk_pull_{job['job_id']}",
                         use_container_width=True,
-                    )
+                        disabled=not bool(api_key and magnific_token and video.get("creation_id")),
+                    ):
+                        with st.spinner("Pulling the latest Seedance result from Magnific..."):
+                            merged = _refresh_avatar_outfit_step(video, api_key, magnific_token)
+                            merged["video_refresh_key"] = str(time.time_ns())
+                            job["video"] = merged
+                        st.session_state["avatar_outfit_bulk_jobs"] = jobs
+                        st.rerun()
+                    if silent_bytes:
+                        st.download_button(
+                            "⬇️ Download silent Avatar Outfit video",
+                            data=silent_bytes,
+                            file_name=f"avatar_outfit_{video.get('creation_id', job['job_id'])}_silent.mp4",
+                            mime="video/mp4",
+                            key=f"ao_bulk_download_{job['job_id']}",
+                            use_container_width=True,
+                        )
             elif video.get("creation_id"):
                 st.info(f"Seedance submitted: `{video.get('creation_id')}` · {status or 'processing'}")
             else:
@@ -5641,6 +5760,9 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
     bottom_fallback = analysis.get("bottom_fallback", "")
     if bottom_fallback:
         st.caption(f"Only a top was detected, so Seedance will pair it with: **{bottom_fallback}**")
+    st.caption(f"Detected outfit focus: **{analysis.get('outfit_focus', 'full_outfit').replace('_', ' ')}**")
+    if analysis.get("show_back_design"):
+        st.caption("Back design detected: **yes** — the prompt will include a brief turn to show it.")
 
     seedance_prompt = build_avatar_outfit_seedance_prompt(
         avatar_description=avatar_desc,
@@ -5654,7 +5776,7 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
         st.caption(f"{len(seedance_prompt)}/1900 characters · {AVATAR_OUTFIT_VIDEO_MODEL_LABEL} · refs: 1 avatar + {len(saved_outfit_refs)} outfit")
 
     st.info(
-        "Avatar Outfit now skips still-image generation entirely. Reference 1 is the avatar; the selected listing/review photos are clothing references; Seedance 2.0 Fast generates the finished 10-second video directly."
+        "Avatar Outfit now skips still-image generation entirely. Reference 1 is the avatar; the selected listing/review photos are clothing references; Seedance 2.0 Fast generates the finished 8-second video directly."
     )
 
     video_result = st.session_state.get("avatar_outfit_video_result") or {}
@@ -5678,7 +5800,7 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
             disabled=not bool(api_key and magnific_token and saved_avatar_ref and saved_outfit_refs),
         )
         if queue_submit or single_submit:
-            with st.spinner(f"Submitting direct Seedance 2.0 Fast video with 1 avatar + {len(saved_outfit_refs)} outfit reference(s)..."):
+            with st.spinner(f"Submitting direct Seedance 2.0 Fast 8-second video with 1 avatar + {len(saved_outfit_refs)} outfit reference(s)..."):
                 result = generate_avatar_outfit_seedance_video(
                     api_key=api_key,
                     magnific_token=magnific_token,
@@ -5735,45 +5857,75 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
         if video_result.get("warning"):
             st.warning(video_result.get("warning"))
         if st.button(
-            "🔄 Refresh Seedance video status",
+            "🔄 Refresh / Pull Seedance video",
             key="avatar_outfit_refresh_seedance_status",
             type="primary",
             use_container_width=True,
             disabled=not bool(api_key and magnific_token),
         ):
-            with st.spinner("Checking Magnific for the finished Seedance video..."):
+            with st.spinner("Checking Magnific and pulling the finished Seedance video if it is ready..."):
                 merged = _refresh_avatar_outfit_step(video_result, api_key, magnific_token)
+                merged["video_refresh_key"] = str(time.time_ns())
             st.session_state["avatar_outfit_video_result"] = merged
             st.rerun()
         return
 
     if video_url:
         st.markdown("### Seedance 2.0 Fast Avatar Outfit video")
-        st.video(video_url)
-        video_bytes = fetch_video_bytes(video_url)
-        if video_bytes:
-            st.download_button(
-                "⬇️ Download Avatar Outfit video",
-                data=video_bytes,
-                file_name=f"avatar_outfit_{creation_id or 'video'}.mp4",
-                mime="video/mp4",
-                key="avatar_outfit_download_direct_video",
+        preview_col, action_col = st.columns(2, gap="large")
+        refresh_key = str(video_result.get("video_refresh_key") or creation_id or "avatar_outfit")
+        silent_bytes, silent_error = muted_avatar_outfit_video_bytes(
+            video_url,
+            creation_id=str(creation_id or "avatar_outfit"),
+            refresh_key=refresh_key,
+        )
+        with preview_col:
+            st.markdown("#### Finished video")
+            if silent_bytes:
+                st.video(silent_bytes, muted=True)
+            else:
+                st.video(video_url, muted=True)
+                if silent_error:
+                    st.warning(silent_error)
+        with action_col:
+            st.success("Seedance video is ready.")
+            st.caption(f"Creation ID: `{creation_id or 'n/a'}`")
+            st.caption("Sound Effects / generated audio are requested OFF. The app also strips any returned audio stream before preview/download.")
+            if st.button(
+                "🔄 Refresh / Pull finished video",
+                key="avatar_outfit_pull_finished_seedance",
+                type="primary",
                 use_container_width=True,
-            )
-        done_cols = st.columns(2)
-        if done_cols[0].button(
-            "🎬 Regenerate direct Seedance video",
-            use_container_width=True,
-            key="avatar_outfit_regenerate_seedance",
-            disabled=not bool(api_key and magnific_token and saved_avatar_ref and saved_outfit_refs),
-        ):
-            st.session_state.pop("avatar_outfit_video_result", None)
-            st.rerun()
-        if done_cols[1].button("🧹 Start over", use_container_width=True, key="avatar_outfit_start_over_direct"):
-            _reset_avatar_outfit_generated_state()
-            for key in ("avatar_outfit_scraped_product", "avatar_outfit_scraped_source_url", "avatar_outfit_magnific_references", "avatar_outfit_avatar_reference"):
-                st.session_state.pop(key, None)
-            st.rerun()
+                disabled=not bool(api_key and magnific_token and creation_id),
+            ):
+                with st.spinner("Pulling the latest Seedance result from Magnific..."):
+                    merged = _refresh_avatar_outfit_step(video_result, api_key, magnific_token)
+                    merged["video_refresh_key"] = str(time.time_ns())
+                st.session_state["avatar_outfit_video_result"] = merged
+                st.rerun()
+            if silent_bytes:
+                st.download_button(
+                    "⬇️ Download silent Avatar Outfit video",
+                    data=silent_bytes,
+                    file_name=f"avatar_outfit_{creation_id or 'video'}_silent.mp4",
+                    mime="video/mp4",
+                    key="avatar_outfit_download_direct_video",
+                    use_container_width=True,
+                )
+            done_cols = st.columns(2)
+            if done_cols[0].button(
+                "🎬 Regenerate",
+                use_container_width=True,
+                key="avatar_outfit_regenerate_seedance",
+                disabled=not bool(api_key and magnific_token and saved_avatar_ref and saved_outfit_refs),
+            ):
+                st.session_state.pop("avatar_outfit_video_result", None)
+                st.rerun()
+            if done_cols[1].button("🧹 Start over", use_container_width=True, key="avatar_outfit_start_over_direct"):
+                _reset_avatar_outfit_generated_state()
+                for key in ("avatar_outfit_scraped_product", "avatar_outfit_scraped_source_url", "avatar_outfit_magnific_references", "avatar_outfit_avatar_reference"):
+                    st.session_state.pop(key, None)
+                st.rerun()
 
 
 def get_secret(key: str) -> str:
