@@ -711,55 +711,6 @@ def fetch_video_bytes(video_url: str, cache_key: str = "") -> bytes | None:
         return None
 
 
-def muted_avatar_outfit_video_bytes(video_url: str, creation_id: str = "", refresh_key: str = "") -> tuple[bytes | None, str | None]:
-    """Download an Avatar Outfit video and remove every audio stream with FFmpeg.
-
-    Seedance is requested with sound disabled, but this is a final safety net so
-    previews/downloads from this workflow never contain generated audio.
-    """
-    if not video_url:
-        return None, "No finished video URL is available."
-    source = fetch_video_bytes(video_url, cache_key=refresh_key or creation_id)
-    if not source:
-        return None, "The finished Seedance video could not be downloaded yet."
-
-    ffmpeg_path = get_ffmpeg_executable()
-    if not ffmpeg_path:
-        return None, "FFmpeg is required to guarantee a silent Avatar Outfit video."
-
-    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", creation_id or "avatar_outfit")[:60]
-    digest = hashlib.sha1(f"{video_url}|{refresh_key}".encode("utf-8")).hexdigest()[:12]
-    output_path = PROCESSED_DIR / f"{safe_id}_{digest}_silent.mp4"
-    if output_path.exists() and output_path.stat().st_size > 0:
-        try:
-            return output_path.read_bytes(), None
-        except Exception:
-            pass
-
-    try:
-        with tempfile.TemporaryDirectory(prefix="avatar_outfit_silent_") as temp_dir:
-            input_path = Path(temp_dir) / "input.mp4"
-            input_path.write_bytes(source)
-            command = [
-                ffmpeg_path, "-hide_banner", "-loglevel", "error", "-y",
-                "-i", str(input_path),
-                "-map", "0:v:0",
-                "-c:v", "copy",
-                "-an",
-                "-movflags", "+faststart",
-                str(output_path),
-            ]
-            completed = subprocess.run(command, capture_output=True, text=True, timeout=180, check=False)
-            if completed.returncode != 0 or not output_path.exists() or output_path.stat().st_size == 0:
-                output_path.unlink(missing_ok=True)
-                details = (completed.stderr or "Could not remove the audio stream.").strip().splitlines()
-                return None, details[-1] if details else "Could not remove the audio stream."
-            return output_path.read_bytes(), None
-    except Exception as exc:
-        output_path.unlink(missing_ok=True)
-        return None, f"Could not make the Avatar Outfit video silent: {exc}"
-
-
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_image_bytes(image_url: str) -> tuple[bytes | None, str | None]:
     """Download image bytes and return the detected content type for Streamlit reruns."""
@@ -1814,9 +1765,9 @@ VOICEOVER_WITH_SCRIPT = '## Voiceover:\nInclude this voiceover (warm excited wom
 LIFESTYLE_PRODUCT_TYPES = {
     "small_handheld": {
         "label": "Small / handheld — supplements, beauty, personal care",
-        "description": "a small handheld product such as a bottle, jar, box, spray, cosmetic, supplement, accessory, or personal-care item",
+        "description": "the exact small/handheld product in the exact physical package, container, vessel, housing, or form factor shown in reference image 1",
         "framing": "Use a close phone-camera composition where the product fills roughly 45-75% of the frame without looking oversized.",
-        "appearance_help": "Include packaging color, label, cap, logo placement, count, material, and proportions.",
+        "appearance_help": "Lock the exact sold package/form from reference image 1: pouch, bag, sachet, stick pack, bottle, jar/tub, box/carton, can/canister, tube, device housing, etc. Include packaging color, label, closure, logo placement, count, material, and proportions. Never substitute a different container.",
     },
     "clothing_shoe": {
         "label": "Clothing / shoes — apparel, footwear, fashion accessories",
@@ -2413,12 +2364,13 @@ def build_lifestyle_image_prompt(
     scene_key: str,
     product_type: str = "other",
     custom_scene: str = "",
+    appearance_details: str = "",
 ) -> str:
     scene = resolve_lifestyle_scene(scene_key, custom_scene)
     profile = LIFESTYLE_PRODUCT_TYPES.get(product_type, LIFESTYLE_PRODUCT_TYPES["other"])
     normalized_name = (product_name or "").lower()
     supplement_like = any(word in normalized_name for word in (
-        "gummies", "capsules", "supplement", "vitamin", "powder", "drink mix", "prebiotic", "probiotic", "sea moss", "enzyme", "collagen"
+        "gummies", "capsules", "supplement", "vitamin", "powder", "drink mix", "prebiotic", "probiotic", "sea moss", "enzyme", "collagen", "protein coffee", "protein powder", "electrolyte"
     ))
     hand_rule = (
         "Show one natural hand only, with correct fingers and a believable grip; the hand must not hide the product. "
@@ -2433,23 +2385,43 @@ def build_lifestyle_image_prompt(
         )
     if supplement_like and scene_key in ("hand_kitchen", "counter_kitchen", "counter_bathroom"):
         brightness_rule += (
-            "For supplement or wellness products, make the counter scene especially clean and simple, with only one or two subtle "
-            "background objects and no moody shadows. "
+            "For supplement, drink-mix, protein, or wellness products, make the counter especially clean and simple, with only one or two subtle "
+            "background objects and no moody shadows. Do not transfer the product contents into a different storage container. "
         )
+
+    form_lock = (
+        "PRODUCT FORM LOCK — NON-NEGOTIABLE: Reference image 1 is the authoritative source for the exact product as sold. "
+        "Keep the identical package/container/form factor, silhouette, dimensions, closure, seams, edges, materials, label placement, and included parts shown in reference 1. "
+        "Do not infer a container from the product category or product name. Do not redesign, repackage, decant, transfer, reshape, open into a replacement vessel, or substitute the packaging. "
+        "If reference 1 is a flexible pouch or bag, it MUST remain that same flexible pouch/bag — never a jar, tub, bottle, canister, cup, shaker, or rigid container. "
+        "If it is a sachet or stick pack, keep that exact sachet/stick-pack form. If it is a bottle, jar/tub, box/carton, can/canister, tube, appliance, device, garment, or other object, keep that exact physical form. "
+        "Secondary listing/review references are SUPPORTING references only. If a customer review shows contents transferred into another jar, bottle, cup, shaker, organizer, or storage container, IGNORE that secondary container and preserve the sold package from reference 1. "
+        "Preserve the product's real function and sold configuration; do not turn the product into a different object or usage vessel. "
+    )
+
+    extra_lock = ""
+    if appearance_details:
+        extra_lock = (
+            "Additional product-lock details supplied by the user: "
+            + re.sub(r"\s+", " ", appearance_details.strip())[:700]
+            + ". These details are constraints, not suggestions. "
+        )
+
     safety_rule = (
         "Do not include moving water, fire, steam, dirt, sand, powder clouds, pulsing light, animated electronic screens, pets, animals, or any living beings. "
         "Do not show cluttered environments, other brand titles, prices, retail messaging, cartoon or abstract environments, spaceships, levitating products, physics-breaking product orientation, or the same environment as the original listing image. "
         "Keep all visible text clear and readable rather than warped, hieroglyphic, or illegible. The product must be fully visible in frame during image generation, correctly scaled, correctly colored, and realistically lit so it matches the environment. "
     )
+
     return (
-        f"{LIFESTYLE_IPHONE_STYLE}Photograph the exact {product_name} as {profile['description']}, {scene['setting']}. "
-        f"{profile['framing']} {hand_rule}{brightness_rule}{safety_rule}Use all uploaded images as strict visual references for the real product: preserve its "
-        "true dimensions, silhouette, colors, materials, texture, seams, controls, attachments, accessories, logo placement, "
-        "physical label text where applicable, and exact proportions. Do not turn a large item into a miniature and do not enlarge "
-        "a small item unnaturally. Show only the correct number of products and included parts. The environment should feel lived-in, "
-        "casual, slightly imperfect, and believable, like a quick TikTok Shop customer photo. Do not make it look like AI, a 3D render, "
-        "a catalog cutout, a floating mockup, a showroom, or a polished brand shoot. No rendered captions, promotional text, prices, "
-        "stickers, graphics, or watermarks. Physical writing printed on the real product is allowed."
+        f"{LIFESTYLE_IPHONE_STYLE}{form_lock}{extra_lock}Photograph the exact {product_name}. "
+        f"Treat it as {profile['description']} without changing its physical form, {scene['setting']}. "
+        f"{profile['framing']} {hand_rule}{brightness_rule}{safety_rule}"
+        "Use reference image 1 as the primary visual source of truth for the real product. Preserve its true dimensions, silhouette, package type, colors, materials, texture, seams, closure, controls, attachments, accessories, logo placement, physical label text where applicable, and exact proportions. "
+        "Never create a new package design or replacement container. Never use a review-photo storage vessel as the product packaging. "
+        "Do not turn a large item into a miniature and do not enlarge a small item unnaturally. Show only the correct number of products and included parts. "
+        "The environment should feel lived-in, casual, slightly imperfect, and believable, like a quick TikTok Shop customer photo. Do not make it look like AI, a 3D render, a catalog cutout, a floating mockup, a showroom, or a polished brand shoot. "
+        "No rendered captions, promotional text, prices, stickers, graphics, or watermarks. Physical writing printed on the real product is allowed."
     )
 
 
@@ -2470,7 +2442,7 @@ def build_lifestyle_kling_prompt(
         f"{product_name} {scene['placement']}. Treat it as {profile['description']} at the exact real-world scale shown in the approved image. "
         f"{subject.capitalize()} remain completely stationary and fixed for the entire clip; {pronoun} must not lift, rotate, slide, bend, "
         "float, duplicate, shrink, grow, melt, warp, open, close, or change shape. Strictly preserve these details: "
-        f"{product_details}. Keep the same environment and lighting: {scene['background']}. Only the handheld phone camera moves: "
+        f"{product_details}. HARD FORM LOCK: preserve the exact package/container/form factor from the approved image for every frame; never turn a pouch into a jar/bottle/tub, never transfer contents into another vessel, and never redesign or repackage the product. Keep the same environment and lighting: {scene['background']}. Only the handheld phone camera moves: "
         f"{scene.get('camera_motion', 'a natural side-to-side arc and slight push-in')}, with realistic parallax, contact shadows, reflections, "
         "depth of field, and small phone micro-shake. For furniture, appliances, vacuums, electronics, fitness equipment, and outdoor products, "
         "keep the full footprint and major parts visible and correctly attached. The product must stay entirely in frame and occupy most of the video, ideally 80% or more of the clip. Repeat: the product stays fixed while only the camera moves. "
@@ -2492,8 +2464,8 @@ STYLE_LABELS = {
 
 LIFESTYLE_IMAGE_MODEL_LABEL = "Nano Banana 2 · Pro · 2k · 9:16"
 LIFESTYLE_VIDEO_MODEL_LABEL = "Kling O1 · 720p · 5s · start frame"
-AVATAR_OUTFIT_IMAGE_MODEL_LABEL = "No intermediate image model"
-AVATAR_OUTFIT_VIDEO_MODEL_LABEL = "Seedance 2.0 Fast · 720p · 8s · multi-reference"
+AVATAR_OUTFIT_IMAGE_MODEL_LABEL = "GPT Image 2 · High · 2K · 9:16 · Magnific · multi-reference"
+AVATAR_OUTFIT_VIDEO_MODEL_LABEL = "Kling O1 · 720p · 10s · start frame"
 
 
 def resolved_style_duration(style: str, selected_duration: int = 15) -> int:
@@ -2504,7 +2476,7 @@ def resolved_style_duration(style: str, selected_duration: int = 15) -> int:
     if style == "lifestyle_animation":
         return 5
     if style == "avatar_outfit":
-        return 10
+        return 8
     return int(selected_duration)
 
 
@@ -3375,15 +3347,17 @@ def generate_video(
 LIFESTYLE_IMAGE_GENERATE_SYSTEM = """You are an image production assistant with access to Magnific tools.
 Use the same Magnific MCP account already configured in the app.
 1. Upload EVERY provided reference image to Magnific using creations_upload_image.
-2. The supplied reference images all show the same product from official listing photos and/or customer review photos.
-3. Use ALL provided references together to preserve the exact product identity: packaging, branding, text, shape, scale, materials, colors, controls, accessories, proportions, and real-world appearance.
-4. Generate EXACTLY ONE final lifestyle approval image.
-5. You MUST use the image model Nano Banana 2.
-6. You MUST use quality Pro.
-7. You MUST use resolution 2k.
-8. You MUST use aspect ratio 9:16.
-9. Submit the generation ONCE and return immediately after you receive the creation identifier. DO NOT call creations_get, DO NOT poll, and DO NOT wait for the image to finish.
-10. Return ONLY valid JSON (no markdown): {"creation_id":"the magnific creation identifier","status":"queued","url":null,"preview_url":null,"error":null}
+2. REFERENCE IMAGE 1 IS AUTHORITATIVE for the product as sold: exact package/container/form factor, silhouette, dimensions, closure, branding, label layout, colors, materials, and included parts. Never override reference 1 with a secondary image.
+3. References 2+ may be official alternate views or customer review photos. Use them only to improve secondary detail, real-world scale, texture, and appearance. If a review photo shows the product decanted, transferred, opened, poured, placed in another jar/bottle/container, or otherwise used differently from reference 1, IGNORE that alternate container/state for the final product form.
+4. HARD PRODUCT-FORM LOCK: never repackage, decant, transfer, reshape, or substitute the product. A pouch/bag must remain that exact pouch/bag; a sachet/stick pack must remain that exact sachet/stick pack; a bottle remains that bottle; a jar/tub remains that jar/tub; a box/carton remains that box/carton; a can/canister remains that can/canister; a tube remains that tube; an appliance/device remains its exact housing. Never convert one package type into another.
+5. Preserve the product's real function and sold configuration. Do not turn a powder/drink mix/supplement sold in a pouch into a jar, bottle, prepared drink, shaker, or other storage vessel. Do not invent replacement packaging.
+6. Generate EXACTLY ONE final lifestyle approval image.
+7. You MUST use the image model Nano Banana 2.
+8. You MUST use quality Pro.
+9. You MUST use resolution 2k.
+10. You MUST use aspect ratio 9:16.
+11. Submit the generation ONCE and return immediately after you receive the creation identifier. DO NOT call creations_get, DO NOT poll, and DO NOT wait for the image to finish.
+12. Return ONLY valid JSON (no markdown): {"creation_id":"the magnific creation identifier","status":"queued","url":null,"preview_url":null,"error":null}
 """
 
 
@@ -3434,7 +3408,7 @@ def generate_lifestyle_image_magnific(
                 "content": (
                     f"Generate exactly one lifestyle approval image for {product_name}.\n"
                     "Required Magnific settings: use Nano Banana 2, quality Pro, resolution 2k, and aspect ratio 9:16.\n"
-                    "Use the supplied reference images only as product references for the same item. Preserve the product exactly while placing it into the requested clean, realistic lifestyle scene.\n\n"
+                    "Reference image 1 is the PRIMARY source of truth for the exact sold package/container/form. Secondary images may show alternate views or customer usage but MUST NOT override the package type or physical form from reference 1. Preserve the product exactly while placing it into the requested clean, realistic lifestyle scene.\n\n"
                     f"{refs_text}\n\n"
                     f"Final image prompt:\n{prompt}"
                 ),
@@ -4408,7 +4382,8 @@ def normalize_sniper_batch_products(
 
 # ═══════════════════════════════════════════════════════════════════
 #  AVATAR OUTFIT — two-skill workflow
-#  Direct Avatar Outfit: avatar + outfit references -> Seedance 2.0 Fast video
+#  Skill 1: avatar + outfit -> mirror-selfie try-on image
+#  Skill 2: approved image -> Kling O1 mirror-selfie video
 # ═══════════════════════════════════════════════════════════════════
 
 
@@ -4480,13 +4455,7 @@ def load_avatar_library() -> tuple[list[dict], str]:
                 continue
             label = str(item.get("label") or item.get("name") or img_path.stem.replace("_", " ").replace("-", " ").title()).strip()
             avatar_id = str(item.get("id") or img_path.stem).strip() or img_path.stem
-            records.append({
-                "id": avatar_id,
-                "label": label,
-                "path": str(img_path),
-                "file_name": img_path.name,
-                "url": str(item.get("url") or item.get("image_url") or item.get("imageUrl") or "").strip(),
-            })
+            records.append({"id": avatar_id, "label": label, "path": str(img_path), "file_name": img_path.name})
             used.add(img_path.resolve())
 
     for img_path in sorted(folder.iterdir()):
@@ -4499,68 +4468,8 @@ def load_avatar_library() -> tuple[list[dict], str]:
             "label": img_path.stem.replace("_", " ").replace("-", " ").title(),
             "path": str(img_path.resolve()),
             "file_name": img_path.name,
-            "url": "",
         })
     return records, str(folder)
-
-
-def _detect_git_repo_and_branch() -> tuple[str, str]:
-    """Best-effort detection of the GitHub repo/branch backing the deployed app."""
-    repo = str(os.environ.get("GITHUB_REPOSITORY") or "").strip().strip("/")
-    branch = str(os.environ.get("GITHUB_REF_NAME") or os.environ.get("GITHUB_BRANCH") or "").strip()
-    try:
-        if not repo:
-            completed = subprocess.run(
-                ["git", "config", "--get", "remote.origin.url"],
-                capture_output=True, text=True, timeout=5, check=False,
-            )
-            remote = (completed.stdout or "").strip()
-            match = re.search(r"github\.com[/:]([^/]+/[^/]+?)(?:\.git)?$", remote)
-            if match:
-                repo = match.group(1).removesuffix(".git").strip("/")
-        if not branch:
-            completed = subprocess.run(
-                ["git", "branch", "--show-current"],
-                capture_output=True, text=True, timeout=5, check=False,
-            )
-            branch = (completed.stdout or "").strip()
-    except Exception:
-        pass
-    return repo, (branch or "main")
-
-
-def _hosted_avatar_reference(record: dict, library_dir: str) -> str:
-    """Prefer a hosted avatar URL so Magnific can use it as a normal reference image."""
-    explicit = str((record or {}).get("url") or "").strip()
-    if explicit.startswith(("http://", "https://")):
-        return explicit
-
-    path_value = str((record or {}).get("path") or "").strip()
-    if not path_value:
-        return ""
-    try:
-        image_path = Path(path_value).resolve()
-        cwd = Path.cwd().resolve()
-        try:
-            rel_path = image_path.relative_to(cwd).as_posix()
-        except Exception:
-            folder_name = Path(library_dir).name if library_dir else "avatar_library"
-            rel_path = f"{folder_name}/{image_path.name}"
-
-        repo, branch = _detect_git_repo_and_branch()
-        if not repo:
-            return ""
-        safe_path = "/".join(requests.utils.quote(part, safe="") for part in rel_path.split("/") if part)
-        raw_url = f"https://raw.githubusercontent.com/{repo}/{branch}/{safe_path}"
-        try:
-            probe = requests.get(raw_url, headers={"Range": "bytes=0-32"}, timeout=8)
-            if probe.status_code < 400 and probe.content:
-                return raw_url
-        except Exception:
-            return ""
-    except Exception:
-        return ""
-    return ""
 
 
 def _local_image_payload(image_path: str) -> tuple[bytes, str, str]:
@@ -4795,12 +4704,6 @@ For the outfit, combine evidence from ALL outfit references. Describe ONLY the c
 
 Determine whether shoes are visibly included in any selected outfit reference. If shoes are visible, describe them. If not, return clean white sneakers as the default. If only a top is visible across all selected references with no matching bottom, set bottom_fallback to black fitted jogger pants; otherwise leave bottom_fallback empty.
 
-Also determine the styling focus for motion prompting:
-- outfit_focus = "full_outfit" when both a top and bottom are part of the intended outfit.
-- outfit_focus = "top_only" when the clothing focus is mainly the top.
-- outfit_focus = "bottom_only" when the clothing focus is mainly the pants/shorts/skirt/bottom.
-- show_back_design = true only when the selected outfit references clearly show an important back graphic, print, embroidery, or back design detail that should be briefly shown in the video.
-
 Return ONLY valid JSON:
 {
   "avatar_description":"concise visible physical description",
@@ -4808,9 +4711,7 @@ Return ONLY valid JSON:
   "shoes_description":"visible shoes or clean white sneakers",
   "bottom_fallback":"black fitted jogger pants or empty string",
   "outfit_has_shoes":true,
-  "outfit_has_bottom":true,
-  "outfit_focus":"full_outfit or top_only or bottom_only",
-  "show_back_design":false
+  "outfit_has_bottom":true
 }"""
 
     try:
@@ -4870,10 +4771,6 @@ Return ONLY valid JSON:
             return {"error": "Could not extract both avatar and outfit descriptions."}
         parsed["shoes_description"] = (parsed.get("shoes_description") or "clean white sneakers").strip()
         parsed["bottom_fallback"] = (parsed.get("bottom_fallback") or "").strip()
-        parsed["outfit_focus"] = str(parsed.get("outfit_focus") or "").strip().lower()
-        if parsed["outfit_focus"] not in {"full_outfit", "top_only", "bottom_only"}:
-            parsed["outfit_focus"] = "full_outfit" if parsed.get("outfit_has_bottom") else "top_only"
-        parsed["show_back_design"] = bool(parsed.get("show_back_design"))
         parsed["outfit_reference_count"] = usable_count
         return parsed
     except Exception as exc:
@@ -4943,151 +4840,6 @@ Preserve the exact avatar identity, outfit colors/pattern/fit, shoes, penthouse 
 Preserve exact identity, outfit, shoes, setting and lighting from the approved start image. One person only. No animals. No voiceover, text, captions, subtitles, watermarks, music or sound. Photorealistic iPhone UGC."""
         prompt = re.sub(r"\s+", " ", prompt).strip()
     return prompt[:1899]
-
-
-
-def build_avatar_outfit_seedance_prompt(
-    avatar_description: str,
-    outfit_description: str,
-    shoes_description: str,
-    bottom_fallback: str = "",
-    outfit_focus: str = "full_outfit",
-    show_back_design: bool = False,
-) -> str:
-    """Direct 8-second Seedance 2.0 Fast prompt using avatar + clothing references."""
-    avatar = re.sub(r"\s+", " ", (avatar_description or "").strip())[:220]
-    outfit = re.sub(r"\s+", " ", (outfit_description or "").strip())[:420]
-    shoes = re.sub(r"\s+", " ", (shoes_description or "clean white sneakers").strip())[:120]
-    if bottom_fallback:
-        outfit += f" Pair the visible top with {bottom_fallback}."
-
-    outfit_focus = str(outfit_focus or "full_outfit").strip().lower()
-    if outfit_focus not in {"full_outfit", "top_only", "bottom_only"}:
-        outfit_focus = "full_outfit"
-    show_back_design = bool(show_back_design)
-
-    if outfit_focus == "top_only":
-        motion_timeline = """[00:00-00:02] Centered full-body front pose, gentle handheld sway, clearly present the shirt/top from the front.
-[00:02-00:04] Use the free hand to touch, smooth, or lightly pull the shirt/top near the chest, hem, or sleeve so the video clearly focuses on the top.
-[00:04-00:06] Make a slight quarter-turn while still highlighting the top fit and silhouette. If the top has an important back design, briefly turn enough to show part of the back graphic or back detail naturally.
-[00:06-00:08] Return to a confident final pose facing mostly forward, lightly adjust the top/hem once more, and keep the shirt/top clearly visible."""
-    elif outfit_focus == "bottom_only":
-        motion_timeline = """[00:00-00:02] Centered full-body front pose, gentle handheld sway, clearly present the pants/bottom from the front.
-[00:02-00:04] Use the free hand to touch or motion toward the waistband, upper thigh, pocket, or leg so the video clearly focuses on the pants/bottom.
-[00:04-00:06] Shift weight and make a small side-angle pose to show the leg shape, fit, and silhouette while still keeping the bottoms as the focus.
-[00:06-00:08] Return to a confident final pose with one last natural gesture toward the pants/bottom and keep the lower-half details easy to see."""
-    else:
-        if show_back_design:
-            motion_timeline = """[00:00-00:02] Centered full-body front pose, gentle handheld sway, clearly present the full outfit from the front.
-[00:02-00:04] Use the free hand to touch or gesture toward the shirt/top first, then motion toward the pants/bottom so both pieces are clearly featured.
-[00:04-00:06] Make a natural half-turn or strong quarter-turn to briefly show the back of the shirt/top enough for the important back design to be visible, while keeping the outfit realistic and wearable.
-[00:06-00:08] Turn back toward the mirror into a confident final full-body pose and lightly adjust the shirt or pants so the whole outfit is still clearly visible."""
-        else:
-            motion_timeline = """[00:00-00:02] Centered full-body front pose, gentle handheld sway, clearly present the full outfit from the front.
-[00:02-00:04] Use the free hand to touch or gesture toward the shirt/top first, then motion toward the pants/bottom so both pieces are clearly featured.
-[00:04-00:06] Shift weight into a slight side-angle pose to show overall fit and silhouette while keeping the full outfit visible head-to-toe.
-[00:06-00:08] Return to a confident final full-body pose with a small natural outfit adjustment, keeping both the shirt/top and pants/bottom clearly visible."""
-
-    prompt = f"""8-second 9:16 vertical TikTok UGC mirror-selfie video, one continuous take, no cuts. REFERENCE RULES: reference image 1 is the AVATAR identity only; preserve this exact person's face, skin, hair, facial hair, body build and visible identity details: {avatar}. Reference images 2+ are OUTFIT references only; ignore the people/models in those images and dress the avatar in the exact clothing shown: {outfit}. Shoes: {shoes}. Begin with the avatar already wearing the finished outfit; do not show dressing or transformation.
-
-Scene: full-body head-to-toe mirror selfie inside a luxury modern penthouse at night. The avatar holds a black smartphone at face level in the right hand so it partially covers the face. Floor-to-ceiling glass, blue-lit infinity pool, city skyline, palm trees, warm recessed lights, polished tile. Authentic iPhone low-light UGC: slight sensor grain, natural skin texture, subtle mirror smudge, realistic fabric texture, mixed warm indoor and cool pool light, natural shadows, no studio look.
-
-Motion intent: The posing must match the clothing focus. If this is a full outfit, clearly feature both the top and bottom with natural gestures. If this is mainly a shirt/top, make the posing clearly about the shirt/top. If this is mainly pants/bottoms, make the posing clearly about the pants/bottoms. If there is an important back design on the top, include a brief natural turn so that back design is shown.
-
-{motion_timeline}
-
-Preserve identity and clothing accurately throughout. One person only. No morphing, wardrobe changes, extra limbs, duplicate people, animals, text, captions, prices, watermarks, logos added by the generator, voiceover, music, or sound. Use the reference images as visual references only; do NOT display them literally as a start frame, slideshow, collage, split screen, or inserted still image."""
-    prompt = re.sub(r"\s+", " ", prompt).strip()
-    return prompt[:1899]
-
-
-AVATAR_OUTFIT_SEEDANCE_SYSTEM = """You are a video production assistant with access to Magnific MCP tools.
-Create ONE direct Avatar Outfit video. There is NO intermediate image-generation step.
-1. Upload every supplied reference with creations_upload_image when an upload is required.
-2. Reference image 1 is the AVATAR identity reference. Preserve that exact person's identity and visible appearance.
-3. Reference images 2+ are OUTFIT references. Use them only for the clothing, footwear, fit, color, material and construction. Never copy the people/models from outfit references.
-4. Call video_generate with model slug bytedance-seedance-fast-2.0.
-5. Use 9:16, 720p, exactly 8 seconds. AUDIO MUST BE OFF. Disable Sound Effects and all native/generated audio. If video_generate exposes generate_audio, audio, sound, sound_effects, or an equivalent boolean/toggle, explicitly set it to FALSE/OFF. Do not attach an audio reference and do not generate voice, SFX, ambience, or BGM.
-6. Attach all uploaded images as GENERAL visual references only. NEVER use start_image, start frame, first frame, end frame, keyframe, or slideshow behavior.
-7. The generated video must begin with the avatar already wearing the requested outfit in the scene described by the prompt.
-8. Submit exactly ONE video generation and return immediately after the real Magnific creation identifier is returned. Do not poll.
-9. Return ONLY valid JSON (no markdown): {"creation_id":"the magnific creation identifier","status":"queued","url":null,"preview_url":null,"error":null}
-"""
-
-
-def generate_avatar_outfit_seedance_video(
-    api_key: str,
-    magnific_token: str,
-    avatar_reference: str,
-    outfit_references: list[str],
-    prompt: str,
-) -> dict:
-    """Direct Avatar Outfit generation with Seedance 2.0 Fast and multiple references."""
-    if not api_key:
-        return {"creation_id": None, "status": "error", "error": "The Anthropic API key is missing."}
-    if not magnific_token:
-        return {"creation_id": None, "status": "error", "error": "The Magnific authorization token is missing."}
-
-    avatar_reference = str(avatar_reference or "").strip()
-    outfit_references = [str(ref or "").strip() for ref in (outfit_references or []) if str(ref or "").strip()]
-    if not avatar_reference or not outfit_references:
-        return {"creation_id": None, "status": "error", "error": "Choose an avatar and at least one outfit reference."}
-
-    original_count = len(outfit_references)
-    outfit_references = outfit_references[:5]
-    avatar_reference, outfit_references, payload_omitted = _trim_magnific_reference_payload(
-        avatar_reference, outfit_references, max_data_uri_chars=700_000
-    )
-    omitted_count = max(0, original_count - len(outfit_references)) + int(payload_omitted or 0)
-    if not outfit_references:
-        return {"creation_id": None, "status": "error", "error": "No outfit reference could be sent to Magnific."}
-
-    refs = [avatar_reference] + outfit_references
-    refs_text = "\n".join(
-        [f"Reference image 1 (AVATAR identity): {refs[0]}"]
-        + [f"Reference image {idx} (OUTFIT only): {ref}" for idx, ref in enumerate(refs[1:], start=2)]
-    )
-    mcp_servers = [{
-        "type": "url",
-        "url": MAGNIFIC_MCP_URL,
-        "name": MAGNIFIC_MCP_NAME,
-        "authorization_token": magnific_token,
-    }]
-    try:
-        client = anthropic.Anthropic(api_key=api_key)
-        response = client.beta.messages.create(
-            model=MODEL,
-            max_tokens=2048,
-            system=AVATAR_OUTFIT_SEEDANCE_SYSTEM,
-            messages=[{
-                "role": "user",
-                "content": (
-                    "Generate the direct Avatar Outfit video now. Do NOT generate a still image first.\n"
-                    "Required video settings: bytedance-seedance-fast-2.0, 720p, 9:16, exactly 8 seconds, sound off.\n"
-                    "Reference 1 is the avatar identity. References 2+ are clothing/outfit references only.\n"
-                    "Use every reference only as a general visual reference; never as a literal start frame.\n\n"
-                    f"{refs_text}\n\n"
-                    f"Seedance prompt:\n{prompt}"
-                ),
-            }],
-            mcp_servers=mcp_servers,
-            tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
-            betas=[MCP_BETA],
-        )
-        result = _parse_magnific_creation_response(response)
-        result["provider"] = "Magnific"
-        result["video_model"] = "bytedance-seedance-fast-2.0"
-        result["video_resolution"] = "720p"
-        result["video_duration"] = 8
-        result["video_aspect_ratio"] = "9:16"
-        result["sound_enabled"] = False
-        result["generate_audio"] = False
-        result["reference_count"] = len(refs)
-        result["outfit_reference_count"] = len(outfit_references)
-        result["omitted_reference_count"] = omitted_count
-        return result
-    except Exception as exc:
-        return {"creation_id": None, "status": "error", "error": f"Avatar Outfit Seedance generation failed: {exc}"}
 
 
 AVATAR_OUTFIT_IMAGE_GENERATE_SYSTEM = """You are an image production assistant with access to Magnific tools.
@@ -5287,47 +5039,58 @@ def _get_avatar_outfit_bulk_jobs() -> list[dict]:
     return jobs
 
 
-def _queue_avatar_outfit_video_job(
-    video_result: dict,
+def _queue_avatar_outfit_image_job(
+    image_result: dict,
     avatar_label: str,
     product_name: str,
-    seedance_prompt: str,
+    kling_prompt: str,
 ) -> dict:
-    creation_id = str(video_result.get("creation_id") or "").strip()
+    """Save a submitted image generation so the member can immediately start another outfit."""
+    creation_id = str(image_result.get("creation_id") or "").strip()
     seed = f"{creation_id}|{avatar_label}|{product_name}|{time.time_ns()}"
     job = {
         "job_id": hashlib.sha1(seed.encode("utf-8")).hexdigest()[:14],
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "avatar_label": avatar_label or "Avatar",
         "product_name": product_name or "Outfit",
-        "seedance_prompt": seedance_prompt,
-        "video": dict(video_result or {}),
+        "kling_prompt": kling_prompt,
+        "approved": False,
+        "image": dict(image_result or {}),
+        "video": {},
     }
     jobs = _get_avatar_outfit_bulk_jobs()
     jobs.insert(0, job)
+    # Keep the live session manageable while preserving plenty of recent work.
     del jobs[50:]
     st.session_state["avatar_outfit_bulk_jobs"] = jobs
     return job
 
 
 def _refresh_avatar_outfit_bulk_jobs(api_key: str, magnific_token: str) -> int:
-    """Refresh every pending direct Seedance Avatar Outfit video."""
+    """Refresh every pending image/video job with one button."""
     jobs = _get_avatar_outfit_bulk_jobs()
     checked = 0
     for job in jobs:
-        result = job.get("video") or {}
-        creation_id = str(result.get("creation_id") or "").strip()
-        status = str(result.get("status") or "").strip().lower()
-        if not creation_id or status not in AVATAR_OUTFIT_PENDING_STATUSES:
-            continue
-        refreshed = check_creation_status(api_key=api_key, magnific_token=magnific_token, creation_id=creation_id)
-        job["video"] = {**result, **{k: v for k, v in (refreshed or {}).items() if v is not None}}
-        checked += 1
+        for step in ("image", "video"):
+            result = job.get(step) or {}
+            creation_id = str(result.get("creation_id") or "").strip()
+            status = str(result.get("status") or "").strip().lower()
+            if not creation_id or status not in AVATAR_OUTFIT_PENDING_STATUSES:
+                continue
+            refreshed = check_creation_status(
+                api_key=api_key,
+                magnific_token=magnific_token,
+                creation_id=creation_id,
+            )
+            merged = {**result, **{k: v for k, v in (refreshed or {}).items() if v is not None}}
+            job[step] = merged
+            checked += 1
     st.session_state["avatar_outfit_bulk_jobs"] = jobs
     return checked
 
 
 def _refresh_avatar_outfit_step(result: dict, api_key: str, magnific_token: str) -> dict:
+    """Refresh one Avatar Outfit image/video result by creation_id."""
     creation_id = str((result or {}).get("creation_id") or "").strip()
     if not creation_id:
         return result or {}
@@ -5336,61 +5099,139 @@ def _refresh_avatar_outfit_step(result: dict, api_key: str, magnific_token: str)
 
 
 def _render_avatar_outfit_bulk_queue(api_key: str, magnific_token: str) -> None:
-    """Render direct Seedance Avatar Outfit queue with one-click refresh."""
+    """Render queued Avatar Outfit images/videos and allow one-click refresh."""
     jobs = _get_avatar_outfit_bulk_jobs()
     st.markdown("### 📦 Bulk Avatar Outfit Queue")
+
     message = st.session_state.pop("avatar_outfit_queue_message", None)
     if message:
         st.success(message)
+
     if not jobs:
-        st.caption("Queue direct Seedance Avatar Outfit videos below, start the next outfit immediately, then use **Refresh All** later.")
+        st.caption("Queue Avatar Outfit images below. You can immediately start the next outfit, then use **Refresh All** here later.")
         return
 
-    pending = 0
-    ready = 0
+    pending_count = 0
+    completed_images = 0
+    completed_videos = 0
     for job in jobs:
+        image = job.get("image") or {}
         video = job.get("video") or {}
-        status = str(video.get("status") or "").lower()
-        if video.get("creation_id") and status in AVATAR_OUTFIT_PENDING_STATUSES:
-            pending += 1
-        if status == "completed" and (video.get("url") or video.get("preview_url")):
-            ready += 1
+        image_status = str(image.get("status") or "").lower()
+        video_status = str(video.get("status") or "").lower()
+        if image.get("creation_id") and image_status in AVATAR_OUTFIT_PENDING_STATUSES:
+            pending_count += 1
+        if video.get("creation_id") and video_status in AVATAR_OUTFIT_PENDING_STATUSES:
+            pending_count += 1
+        if image_status == "completed" and (image.get("url") or image.get("preview_url")):
+            completed_images += 1
+        if video_status == "completed" and (video.get("url") or video.get("preview_url")):
+            completed_videos += 1
 
-    c1, c2, c3 = st.columns([1.5, 1, 1])
-    if c1.button(
-        f"🔄 Refresh All ({pending} pending)",
+    top1, top2, top3 = st.columns([1.4, 1, 1])
+    if top1.button(
+        f"🔄 Refresh All ({pending_count} pending)",
         key="avatar_outfit_bulk_refresh_all",
         use_container_width=True,
         type="primary",
-        disabled=not bool(api_key and magnific_token and pending),
+        disabled=not bool(api_key and magnific_token and pending_count),
     ):
-        with st.spinner("Refreshing queued Avatar Outfit videos..."):
+        with st.spinner("Refreshing queued Avatar Outfit jobs..."):
             checked = _refresh_avatar_outfit_bulk_jobs(api_key, magnific_token)
-        st.session_state["avatar_outfit_queue_message"] = f"Refreshed {checked} pending video{'s' if checked != 1 else ''}."
+        st.session_state["avatar_outfit_queue_message"] = f"Refreshed {checked} pending creation{'s' if checked != 1 else ''}."
         st.rerun()
-    c2.metric("Pending", pending)
-    c3.metric("Videos ready", ready)
+    top2.metric("Images ready", completed_images)
+    top3.metric("Videos ready", completed_videos)
 
     for index, job in enumerate(list(jobs)):
+        image = job.get("image") or {}
         video = job.get("video") or {}
-        status = str(video.get("status") or "unknown").lower()
+        image_status = str(image.get("status") or "unknown").lower()
+        video_status = str(video.get("status") or "").lower()
         title = f"{job.get('product_name', 'Outfit')} · {job.get('avatar_label', 'Avatar')}"
         with st.expander(title, expanded=(index == 0)):
-            st.caption(f"Queued: {job.get('created_at', '')} · Seedance: {status}")
-            if video.get("warning"):
-                st.warning(video.get("warning"))
-            action_cols = st.columns([1, 1])
+            st.caption(f"Queued: {job.get('created_at', '')} · Image: {image_status or 'unknown'}" + (f" · Video: {video_status}" if video else ""))
+
+            action_cols = st.columns([1, 1, 1])
             if action_cols[0].button(
+                "🔄 Refresh image",
+                key=f"ao_bulk_refresh_image_{job['job_id']}",
+                use_container_width=True,
+                disabled=not bool(api_key and magnific_token and (image.get('creation_id'))),
+            ):
+                with st.spinner("Refreshing image status..."):
+                    job["image"] = _refresh_avatar_outfit_step(image, api_key, magnific_token)
+                st.session_state["avatar_outfit_bulk_jobs"] = jobs
+                st.rerun()
+            if video.get("creation_id") and action_cols[1].button(
                 "🔄 Refresh video",
                 key=f"ao_bulk_refresh_video_{job['job_id']}",
                 use_container_width=True,
-                disabled=not bool(api_key and magnific_token and video.get("creation_id")),
+                disabled=not bool(api_key and magnific_token),
             ):
-                with st.spinner("Refreshing Seedance status..."):
+                with st.spinner("Refreshing video status..."):
                     job["video"] = _refresh_avatar_outfit_step(video, api_key, magnific_token)
                 st.session_state["avatar_outfit_bulk_jobs"] = jobs
                 st.rerun()
-            if action_cols[1].button(
+
+            image_url = image.get("url") or image.get("preview_url")
+            if image_status == "error":
+                st.error(image.get("error") or "Image generation failed.")
+            elif image_url:
+                st.image(image_url, caption="Generated try-on image", use_container_width=True)
+                if not job.get("approved"):
+                    if st.button(
+                        "✅ Approve image & queue Kling O1",
+                        key=f"ao_bulk_approve_{job['job_id']}",
+                        type="primary",
+                        use_container_width=True,
+                        disabled=not bool(api_key and magnific_token),
+                    ):
+                        with st.spinner("Submitting Kling O1 video job..."):
+                            video_result = generate_avatar_outfit_kling_magnific(
+                                api_key=api_key,
+                                magnific_token=magnific_token,
+                                approved_image_url=image_url,
+                                prompt=job.get("kling_prompt") or "",
+                            )
+                        if video_result.get("error") or not _is_real_magnific_creation_id(video_result.get("creation_id")):
+                            st.error(video_result.get("error") or "Magnific did not return a real Kling creation ID.")
+                        else:
+                            job["approved"] = True
+                            job["video"] = video_result
+                            st.session_state["avatar_outfit_bulk_jobs"] = jobs
+                            st.session_state["avatar_outfit_queue_message"] = f"Kling O1 job sent to Magnific: {video_result.get('creation_id')}. Continue working and refresh later."
+                            st.rerun()
+            else:
+                creation_id = image.get("creation_id")
+                if creation_id:
+                    st.info(f"Image job submitted: `{creation_id}` · {image_status or 'processing'}")
+                else:
+                    st.warning("This queued item has no image creation ID.")
+
+            if job.get("approved"):
+                if not video:
+                    st.info("Image approved. Kling O1 has not been queued yet.")
+                elif video_status == "error":
+                    st.error(video.get("error") or "Kling O1 generation failed.")
+                else:
+                    video_url = video.get("url") or video.get("preview_url")
+                    if video_url:
+                        st.video(video_url)
+                        video_bytes = fetch_video_bytes(video_url)
+                        if video_bytes:
+                            st.download_button(
+                                "⬇️ Download Avatar Outfit video",
+                                data=video_bytes,
+                                file_name=f"avatar_outfit_{video.get('creation_id', job['job_id'])}.mp4",
+                                mime="video/mp4",
+                                key=f"ao_bulk_download_{job['job_id']}",
+                                use_container_width=True,
+                            )
+                    elif video.get("creation_id"):
+                        st.info(f"Kling O1 submitted: `{video.get('creation_id')}` · {video_status or 'processing'}")
+
+            if st.button(
                 "🗑️ Remove from queue",
                 key=f"ao_bulk_remove_{job['job_id']}",
                 use_container_width=True,
@@ -5398,67 +5239,18 @@ def _render_avatar_outfit_bulk_queue(api_key: str, magnific_token: str) -> None:
                 st.session_state["avatar_outfit_bulk_jobs"] = [j for j in jobs if j.get("job_id") != job.get("job_id")]
                 st.rerun()
 
-            if status == "error":
-                st.error(video.get("error") or "Seedance Avatar Outfit generation failed.")
-                continue
-            video_url = video.get("url") or video.get("preview_url")
-            if video_url:
-                preview_col, info_col = st.columns(2, gap="large")
-                refresh_key = str(video.get("video_refresh_key") or video.get("creation_id") or job.get("job_id"))
-                silent_bytes, silent_error = muted_avatar_outfit_video_bytes(
-                    video_url,
-                    creation_id=str(video.get("creation_id") or job.get("job_id")),
-                    refresh_key=refresh_key,
-                )
-                with preview_col:
-                    st.markdown("#### Finished video")
-                    if silent_bytes:
-                        st.video(silent_bytes, muted=True)
-                    else:
-                        st.video(video_url, muted=True)
-                        if silent_error:
-                            st.warning(silent_error)
-                with info_col:
-                    st.success("Seedance video is ready.")
-                    st.caption("Audio generation was requested OFF. The app also removes any returned audio stream before download.")
-                    if st.button(
-                        "🔄 Refresh / Pull finished video",
-                        key=f"ao_bulk_pull_{job['job_id']}",
-                        use_container_width=True,
-                        disabled=not bool(api_key and magnific_token and video.get("creation_id")),
-                    ):
-                        with st.spinner("Pulling the latest Seedance result from Magnific..."):
-                            merged = _refresh_avatar_outfit_step(video, api_key, magnific_token)
-                            merged["video_refresh_key"] = str(time.time_ns())
-                            job["video"] = merged
-                        st.session_state["avatar_outfit_bulk_jobs"] = jobs
-                        st.rerun()
-                    if silent_bytes:
-                        st.download_button(
-                            "⬇️ Download silent Avatar Outfit video",
-                            data=silent_bytes,
-                            file_name=f"avatar_outfit_{video.get('creation_id', job['job_id'])}_silent.mp4",
-                            mime="video/mp4",
-                            key=f"ao_bulk_download_{job['job_id']}",
-                            use_container_width=True,
-                        )
-            elif video.get("creation_id"):
-                st.info(f"Seedance submitted: `{video.get('creation_id')}` · {status or 'processing'}")
-            else:
-                st.warning("This queued item has no confirmed Magnific creation ID.")
-
 
 def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: str) -> None:
     """Avatar Outfit: saved avatar + multi-photo TikTok outfit/review references."""
     st.markdown("## 🪞 Avatar Outfit")
     st.caption(
-        "Choose a saved avatar, then paste a TikTok Shop clothing link or upload outfit photos. Select official listing photos and customer review photos, analyze them, then send the avatar + clothing references directly to Seedance 2.0 Fast."
+        "Choose a saved avatar, then paste a TikTok Shop clothing link or upload outfit photos. You can select multiple official listing photos and customer review photos before generating the try-on."
     )
     st.info(
-        "Direct workflow: Avatar reference + clothing/review references + Seedance prompt → Seedance 2.0 Fast video. No intermediate AI image generation and no Kling approval step."
+        "Selected outfit photos are analyzed together and sent to Magnific GPT Image 2 High at 2K as supporting references. The Avatar Outfit video remains a clean, silent Kling O1 mirror try-on with no hook text, captions, voiceover, music, or soundtrack."
     )
     st.caption(
-        "Claude still analyzes the avatar and outfit first so the direct Seedance prompt is specific. Saved avatars use a hosted GitHub image URL automatically when the repo is publicly reachable; otherwise the app falls back to a compact local reference."
+        "Large avatar/outfit files are optimized automatically. Claude analysis gets a resized copy, and local images get a separate compact reference copy for the Magnific MCP request so the request stays lightweight while still using the simpler one-pass GPT Image 2 flow."
     )
 
     _render_avatar_outfit_bulk_queue(api_key, magnific_token)
@@ -5487,12 +5279,6 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
             st.image(selected_avatar["path"], caption=f"Selected avatar — {selected_avatar['label']}", use_container_width=True)
             avatar_bytes, avatar_mime, avatar_data_uri = _local_image_payload(selected_avatar["path"])
             _avatar_mcp_bytes, _avatar_mcp_mime, avatar_reference = _prepare_image_for_magnific_mcp_reference(avatar_bytes, avatar_mime)
-            hosted_avatar_ref = _hosted_avatar_reference(selected_avatar, avatar_library_dir)
-            if hosted_avatar_ref:
-                avatar_reference = hosted_avatar_ref
-                st.success("Avatar reference: hosted GitHub image ✅")
-            else:
-                st.warning("Avatar reference: compact local fallback ⚠️. A public `url` in avatars/manifest.json is the most reliable option for Magnific.")
             st.caption(f"Library folder: {avatar_library_dir}")
             avatar_source_label = selected_avatar["label"]
         else:
@@ -5721,7 +5507,7 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
     if not api_key:
         st.warning("Connect the Anthropic API key above to analyze the avatar and outfit references.")
     if not magnific_token:
-        st.warning("Connect Magnific above to generate the direct Seedance 2.0 Fast Avatar Outfit video.")
+        st.warning("Connect Magnific above to generate the Avatar Outfit try-on image and run the Kling O1 video step.")
 
     analysis = st.session_state.get("avatar_outfit_analysis") or {}
     if not analysis:
@@ -5738,7 +5524,6 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
         st.caption(f"Avatar: **{analysis.get('avatar_label')}**")
     if analysis.get("outfit_reference_count"):
         st.caption(f"Outfit references analyzed: **{analysis.get('outfit_reference_count')}**")
-
     avatar_desc = st.text_area(
         "Avatar description",
         value=analysis.get("avatar_description", ""),
@@ -5750,7 +5535,7 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
         value=analysis.get("outfit_description", ""),
         height=130,
         key="avatar_outfit_outfit_description",
-        help="This combines the selected listing and customer-review images.",
+        help="This description combines all selected listing and customer-review images.",
     ).strip()
     shoes_desc = st.text_input(
         "Shoes",
@@ -5759,173 +5544,315 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
     ).strip() or "clean white sneakers"
     bottom_fallback = analysis.get("bottom_fallback", "")
     if bottom_fallback:
-        st.caption(f"Only a top was detected, so Seedance will pair it with: **{bottom_fallback}**")
-    st.caption(f"Detected outfit focus: **{analysis.get('outfit_focus', 'full_outfit').replace('_', ' ')}**")
-    if analysis.get("show_back_design"):
-        st.caption("Back design detected: **yes** — the prompt will include a brief turn to show it.")
+        st.caption(f"Only a top was detected, so the image skill will pair it with: **{bottom_fallback}**")
 
-    seedance_prompt = build_avatar_outfit_seedance_prompt(
+    image_prompt = build_avatar_outfit_image_prompt(
         avatar_description=avatar_desc,
         outfit_description=outfit_desc,
         shoes_description=shoes_desc,
         bottom_fallback=bottom_fallback,
     )
-
-    with st.expander("📋 Seedance 2.0 Fast prompt", expanded=False):
-        st.code(seedance_prompt, language=None)
-        st.caption(f"{len(seedance_prompt)}/1900 characters · {AVATAR_OUTFIT_VIDEO_MODEL_LABEL} · refs: 1 avatar + {len(saved_outfit_refs)} outfit")
-
-    st.info(
-        "Avatar Outfit now skips still-image generation entirely. Reference 1 is the avatar; the selected listing/review photos are clothing references; Seedance 2.0 Fast generates the finished 8-second video directly."
+    kling_prompt = build_avatar_outfit_kling_prompt(
+        avatar_description=avatar_desc,
+        outfit_description=outfit_desc,
+        shoes_description=shoes_desc,
     )
 
-    video_result = st.session_state.get("avatar_outfit_video_result") or {}
-    creation_id = str(video_result.get("creation_id") or "").strip()
-    video_status = str(video_result.get("status") or "").lower().strip()
-    video_url = video_result.get("url") or video_result.get("preview_url")
+    with st.expander("📋 Skill prompts", expanded=False):
+        st.markdown("**Try-on image prompt**")
+        st.code(image_prompt, language=None)
+        st.caption(f"Image model: {AVATAR_OUTFIT_IMAGE_MODEL_LABEL} · Outfit refs: {len(saved_outfit_refs)}")
+        st.markdown("**Kling O1 mirror prompt**")
+        st.code(kling_prompt, language=None)
+        st.caption(f"Kling prompt characters: {len(kling_prompt)}/1900 · {AVATAR_OUTFIT_VIDEO_MODEL_LABEL}")
 
-    if not creation_id and not video_url:
+    image_result = st.session_state.get("avatar_outfit_image_result") or {}
+    generated_image_url = image_result.get("url") or image_result.get("preview_url")
+
+    if not generated_image_url:
+        status = (image_result.get("status") or "").lower().strip()
+        creation_id = image_result.get("creation_id")
+        if creation_id and status in {"queued", "processing", "running", "unknown"}:
+            st.info(f"Avatar Outfit image status: **{status or 'processing'}**")
+            if st.button(
+                "🔄 Check image status",
+                use_container_width=True,
+                key="avatar_outfit_check_image_status",
+                disabled=not bool(api_key and magnific_token and creation_id),
+            ):
+                with st.spinner("Checking Magnific image status..."):
+                    refreshed = check_creation_status(api_key=api_key, magnific_token=magnific_token, creation_id=creation_id)
+                merged = {**image_result, **{k: v for k, v in refreshed.items() if v is not None}}
+                st.session_state["avatar_outfit_image_result"] = merged
+                if merged.get("status") == "error" and merged.get("error"):
+                    st.error(merged["error"])
+                st.rerun()
         submit_col, single_col = st.columns(2)
         queue_submit = submit_col.button(
-            "➕ Queue Seedance video & start next",
+            "➕ Queue image & start next",
             type="primary",
             use_container_width=True,
-            key="avatar_outfit_queue_video",
+            key="avatar_outfit_queue_image",
             disabled=not bool(api_key and magnific_token and saved_avatar_ref and saved_outfit_refs),
         )
         single_submit = single_col.button(
-            "🎬 Generate here",
+            "🖼️ Generate here",
             use_container_width=True,
-            key="avatar_outfit_generate_direct_video",
+            key="avatar_outfit_generate_image",
             disabled=not bool(api_key and magnific_token and saved_avatar_ref and saved_outfit_refs),
         )
+
         if queue_submit or single_submit:
-            with st.spinner(f"Submitting direct Seedance 2.0 Fast 8-second video with 1 avatar + {len(saved_outfit_refs)} outfit reference(s)..."):
-                result = generate_avatar_outfit_seedance_video(
+            with st.spinner(f"Submitting Magnific GPT Image 2 with {len(saved_outfit_refs)} outfit reference(s)..."):
+                result = generate_avatar_outfit_image_magnific(
                     api_key=api_key,
                     magnific_token=magnific_token,
                     avatar_reference=saved_avatar_ref,
                     outfit_references=saved_outfit_refs,
-                    prompt=seedance_prompt,
+                    prompt=image_prompt,
                 )
-            if result.get("error") or not _is_real_magnific_creation_id(result.get("creation_id")):
-                st.error(result.get("error") or "Magnific did not return a real Seedance creation ID, so the video was not confirmed as submitted.")
+            if result.get("error"):
+                st.error(result["error"])
                 if result.get("mcp_tools_called"):
                     st.caption("Magnific MCP tools seen: " + ", ".join(result.get("mcp_tools_called") or []))
-                return
-            if result.get("warning"):
-                st.warning(result.get("warning"))
-            if result.get("omitted_reference_count"):
-                st.warning(f"{result.get('omitted_reference_count')} extra/oversized outfit reference(s) were omitted from the final Seedance request.")
-            if queue_submit:
-                _queue_avatar_outfit_video_job(
-                    video_result=result,
+            elif queue_submit:
+                _queue_avatar_outfit_image_job(
+                    image_result=result,
                     avatar_label=analysis.get("avatar_label") or avatar_source_label or "Avatar",
                     product_name=analysis.get("product_name") or outfit_name_prefill or "Outfit",
-                    seedance_prompt=seedance_prompt,
+                    kling_prompt=kling_prompt,
                 )
+                # Clear only the active work item; queued jobs remain available above.
                 for key in (
-                    "avatar_outfit_analysis", "avatar_outfit_image_result", "avatar_outfit_image_approved",
-                    "avatar_outfit_video_result", "avatar_outfit_input_signature", "avatar_outfit_scraped_product",
-                    "avatar_outfit_scraped_source_url", "avatar_outfit_magnific_references", "avatar_outfit_avatar_reference",
+                    "avatar_outfit_analysis",
+                    "avatar_outfit_image_result",
+                    "avatar_outfit_image_approved",
+                    "avatar_outfit_video_result",
+                    "avatar_outfit_input_signature",
+                    "avatar_outfit_scraped_product",
+                    "avatar_outfit_scraped_source_url",
+                    "avatar_outfit_magnific_references",
+                    "avatar_outfit_avatar_reference",
                 ):
                     st.session_state.pop(key, None)
                 st.session_state["avatar_outfit_queue_message"] = (
-                    f"Direct Seedance video queued for {analysis.get('product_name') or outfit_name_prefill or 'outfit'}. Start the next outfit and use Refresh All later."
+                    f"Queued {analysis.get('product_name') or outfit_name_prefill or 'outfit'} for {analysis.get('avatar_label') or avatar_source_label or 'avatar'}. Start the next outfit below, then use Refresh All later."
                 )
                 st.rerun()
             else:
-                result["avatar_label"] = analysis.get("avatar_label")
-                result["product_name"] = analysis.get("product_name") or outfit_name_prefill
-                st.session_state["avatar_outfit_video_result"] = result
+                st.session_state["avatar_outfit_image_result"] = result
+                if result.get("omitted_reference_count"):
+                    st.warning(f"{result.get('omitted_reference_count')} oversized local outfit reference(s) were skipped to keep the MCP request within its prompt limit. All hosted TikTok references were retained.")
+                st.session_state["avatar_outfit_image_approved"] = False
+                st.session_state.pop("avatar_outfit_video_result", None)
                 st.rerun()
         return
 
-    if video_status == "error":
-        st.error(video_result.get("error") or "Seedance Avatar Outfit generation failed.")
-        retry_cols = st.columns(2)
-        if retry_cols[0].button("🎬 Retry direct Seedance", type="primary", use_container_width=True, key="avatar_outfit_retry_seedance"):
-            st.session_state.pop("avatar_outfit_video_result", None)
-            st.rerun()
-        if retry_cols[1].button("🧹 Start over", use_container_width=True, key="avatar_outfit_clear_seedance"):
-            _reset_avatar_outfit_generated_state()
-            st.rerun()
-        return
-
-    if creation_id and not video_url:
-        st.info(f"Direct Seedance submitted · Status: **{video_status or 'queued'}** · Creation ID: `{creation_id}`")
-        if video_result.get("warning"):
-            st.warning(video_result.get("warning"))
+    st.markdown("### Generated try-on image")
+    image_col, action_col = st.columns([1.15, 1], gap="large")
+    with image_col:
+        st.image(generated_image_url, use_container_width=True)
+        image_bytes, image_content_type = fetch_image_bytes(generated_image_url)
+        if image_bytes:
+            st.download_button(
+                "⬇️ Download try-on image",
+                data=image_bytes,
+                file_name=f"avatar_outfit_{image_result.get('creation_id', 'image')}.jpg",
+                mime=image_content_type or "image/jpeg",
+                key="avatar_outfit_download_image",
+                use_container_width=True,
+            )
+        else:
+            st.caption("If the preview below looks broken but the creation finished in Magnific, click **Refresh image result** on the right to fetch the latest output URL.")
+    with action_col:
+        st.success("Review identity, outfit accuracy, shoes, full-body framing, and mirror realism before approving.")
+        st.caption(f"Magnific used {image_result.get('outfit_reference_count', len(saved_outfit_refs))} outfit reference(s).")
+        st.caption(f"Image status: {image_result.get('status', 'unknown')} · Creation ID: {image_result.get('creation_id', 'n/a')}")
+        if generated_image_url:
+            st.link_button("🔗 Open image in browser", generated_image_url, use_container_width=True)
         if st.button(
-            "🔄 Refresh / Pull Seedance video",
-            key="avatar_outfit_refresh_seedance_status",
+            "🔄 Refresh image result",
+            use_container_width=True,
+            key="avatar_outfit_refresh_completed_image",
+            disabled=not bool(api_key and magnific_token and image_result.get('creation_id')),
+        ):
+            with st.spinner("Refreshing Magnific image status..."):
+                merged = _refresh_avatar_outfit_step(image_result, api_key, magnific_token)
+            st.session_state["avatar_outfit_image_result"] = merged
+            st.rerun()
+        regen_col, approve_col = st.columns(2)
+        if regen_col.button(
+            "🔁 Regenerate image",
+            use_container_width=True,
+            key="avatar_outfit_regen_image",
+            disabled=not bool(api_key and magnific_token and saved_avatar_ref and saved_outfit_refs),
+        ):
+            with st.spinner("Generating another Magnific GPT Image 2 try-on image with the same selected references..."):
+                result = generate_avatar_outfit_image_magnific(
+                    api_key=api_key,
+                    magnific_token=magnific_token,
+                    avatar_reference=saved_avatar_ref,
+                    outfit_references=saved_outfit_refs,
+                    prompt=image_prompt,
+                )
+            if result.get("error"):
+                st.error(result["error"])
+            else:
+                st.session_state["avatar_outfit_image_result"] = result
+                if result.get("omitted_reference_count"):
+                    st.warning(f"{result.get('omitted_reference_count')} oversized local outfit reference(s) were skipped to keep the MCP request within its prompt limit. All hosted TikTok references were retained.")
+                st.session_state["avatar_outfit_image_approved"] = False
+                st.session_state.pop("avatar_outfit_video_result", None)
+                st.rerun()
+        if approve_col.button(
+            "✅ Approve image",
             type="primary",
             use_container_width=True,
-            disabled=not bool(api_key and magnific_token),
+            key="avatar_outfit_approve_image",
         ):
-            with st.spinner("Checking Magnific and pulling the finished Seedance video if it is ready..."):
-                merged = _refresh_avatar_outfit_step(video_result, api_key, magnific_token)
-                merged["video_refresh_key"] = str(time.time_ns())
+            st.session_state["avatar_outfit_image_approved"] = True
+            st.rerun()
+
+    if not st.session_state.get("avatar_outfit_image_approved"):
+        st.info("Approve the generated image before sending it to Kling O1.")
+        return
+
+    st.success("Image approved. This exact image will be used as the Kling O1 start frame.")
+    video_result = st.session_state.get("avatar_outfit_video_result") or {}
+    creation_id = video_result.get("creation_id")
+    video_status = video_result.get("status", "")
+
+    if not creation_id:
+        if st.button(
+            "🎬 Send 10s Kling O1 Video to Magnific",
+            type="primary",
+            use_container_width=True,
+            key="avatar_outfit_generate_video",
+            disabled=not bool(api_key and magnific_token and generated_image_url),
+        ):
+            with st.spinner("Sending the approved mirror image to Kling O1 as the start frame..."):
+                result = generate_avatar_outfit_kling_magnific(
+                    api_key=api_key,
+                    magnific_token=magnific_token,
+                    approved_image_url=generated_image_url,
+                    prompt=kling_prompt,
+                )
+            if result.get("error") or not _is_real_magnific_creation_id(result.get("creation_id")):
+                st.error(result.get("error") or "Magnific did not return a real creation ID, so the video was not submitted.")
+                st.session_state.pop("avatar_outfit_video_result", None)
+            else:
+                result["avatar_label"] = analysis.get("avatar_label")
+                result["product_name"] = analysis.get("product_name")
+                result["status"] = result.get("status") or "queued"
+                st.session_state["avatar_outfit_video_result"] = result
+                st.success(f"Sent to Magnific. Creation ID: {result['creation_id']}")
+                st.rerun()
+        return
+
+    st.markdown("### Kling O1 mirror video")
+    video_url = video_result.get("url") or video_result.get("preview_url")
+
+    # Any real creation ID without a finished URL is an asynchronous job that must
+    # remain refreshable, regardless of whatever status label the MCP returned.
+    if creation_id and not video_url and video_status != "error":
+        st.info(f"Sent to Magnific · Status: **{video_status or 'queued'}** · Creation ID: `{creation_id}`")
+        if st.button(
+            "🔄 Refresh Kling video status",
+            key="avatar_outfit_check_video_status",
+            type="primary",
+            use_container_width=True,
+            disabled=not bool(api_key and magnific_token and creation_id),
+        ):
+            with st.spinner("Checking Magnific for the finished Kling O1 video..."):
+                refreshed = check_creation_status(api_key=api_key, magnific_token=magnific_token, creation_id=creation_id)
+            merged = {**video_result, **{k: v for k, v in refreshed.items() if v is not None}}
+            if merged.get("status") == "completed" and not (merged.get("url") or merged.get("preview_url")):
+                merged["status"] = "processing"
             st.session_state["avatar_outfit_video_result"] = merged
             st.rerun()
         return
 
-    if video_url:
-        st.markdown("### Seedance 2.0 Fast Avatar Outfit video")
-        preview_col, action_col = st.columns(2, gap="large")
-        refresh_key = str(video_result.get("video_refresh_key") or creation_id or "avatar_outfit")
-        silent_bytes, silent_error = muted_avatar_outfit_video_bytes(
-            video_url,
-            creation_id=str(creation_id or "avatar_outfit"),
-            refresh_key=refresh_key,
-        )
-        with preview_col:
-            st.markdown("#### Finished video")
-            if silent_bytes:
-                st.video(silent_bytes, muted=True)
-            else:
-                st.video(video_url, muted=True)
-                if silent_error:
-                    st.warning(silent_error)
-        with action_col:
-            st.success("Seedance video is ready.")
-            st.caption(f"Creation ID: `{creation_id or 'n/a'}`")
-            st.caption("Sound Effects / generated audio are requested OFF. The app also strips any returned audio stream before preview/download.")
-            if st.button(
-                "🔄 Refresh / Pull finished video",
-                key="avatar_outfit_pull_finished_seedance",
-                type="primary",
+    if video_status == "completed" and video_url:
+        refreshed_key = f"{creation_id}_{hashlib.sha1(video_url.encode('utf-8')).hexdigest()[:12]}"
+        st.video(video_url)
+        video_bytes = fetch_video_bytes(f"{video_url}#avatar_outfit={refreshed_key}")
+        if video_bytes:
+            st.download_button(
+                "⬇️ Download Avatar Outfit video",
+                data=video_bytes,
+                file_name=f"avatar_outfit_{creation_id}.mp4",
+                mime="video/mp4",
+                key="avatar_outfit_download_video",
                 use_container_width=True,
-                disabled=not bool(api_key and magnific_token and creation_id),
-            ):
-                with st.spinner("Pulling the latest Seedance result from Magnific..."):
-                    merged = _refresh_avatar_outfit_step(video_result, api_key, magnific_token)
-                    merged["video_refresh_key"] = str(time.time_ns())
-                st.session_state["avatar_outfit_video_result"] = merged
-                st.rerun()
-            if silent_bytes:
-                st.download_button(
-                    "⬇️ Download silent Avatar Outfit video",
-                    data=silent_bytes,
-                    file_name=f"avatar_outfit_{creation_id or 'video'}_silent.mp4",
-                    mime="video/mp4",
-                    key="avatar_outfit_download_direct_video",
-                    use_container_width=True,
+            )
+        regen_cols = st.columns(2)
+        if regen_cols[0].button(
+            "🎬 Regenerate Kling O1 video",
+            key="avatar_outfit_regen_video",
+            use_container_width=True,
+            disabled=not bool(api_key and magnific_token and generated_image_url),
+        ):
+            with st.spinner("Generating a fresh Kling O1 mirror video from the approved image..."):
+                result = generate_avatar_outfit_kling_magnific(
+                    api_key=api_key,
+                    magnific_token=magnific_token,
+                    approved_image_url=generated_image_url,
+                    prompt=kling_prompt,
                 )
-            done_cols = st.columns(2)
-            if done_cols[0].button(
-                "🎬 Regenerate",
-                use_container_width=True,
-                key="avatar_outfit_regenerate_seedance",
-                disabled=not bool(api_key and magnific_token and saved_avatar_ref and saved_outfit_refs),
+            if result.get("error"):
+                st.error(result["error"])
+            else:
+                result["avatar_label"] = analysis.get("avatar_label")
+                result["product_name"] = analysis.get("product_name")
+                st.session_state["avatar_outfit_video_result"] = result
+                st.rerun()
+        if regen_cols[1].button(
+            "🧹 Start over",
+            key="avatar_outfit_start_over",
+            use_container_width=True,
+        ):
+            _reset_avatar_outfit_generated_state()
+            for key in (
+                "avatar_outfit_scraped_product",
+                "avatar_outfit_scraped_source_url",
+                "avatar_outfit_magnific_references",
+                "avatar_outfit_avatar_reference",
             ):
-                st.session_state.pop("avatar_outfit_video_result", None)
-                st.rerun()
-            if done_cols[1].button("🧹 Start over", use_container_width=True, key="avatar_outfit_start_over_direct"):
-                _reset_avatar_outfit_generated_state()
-                for key in ("avatar_outfit_scraped_product", "avatar_outfit_scraped_source_url", "avatar_outfit_magnific_references", "avatar_outfit_avatar_reference"):
-                    st.session_state.pop(key, None)
-                st.rerun()
+                st.session_state.pop(key, None)
+            st.rerun()
+        return
+
+    if video_status == "error":
+        st.error(video_result.get("error") or "Kling O1 failed.")
+        retry_cols = st.columns(2)
+        if retry_cols[0].button(
+            "🎬 Retry Send to Magnific",
+            key="avatar_outfit_retry_failed_video",
+            type="primary",
+            use_container_width=True,
+            disabled=not bool(api_key and magnific_token and generated_image_url),
+        ):
+            st.session_state.pop("avatar_outfit_video_result", None)
+            st.rerun()
+        if retry_cols[1].button(
+            "🧹 Clear video state",
+            key="avatar_outfit_clear_failed_video",
+            use_container_width=True,
+        ):
+            st.session_state.pop("avatar_outfit_video_result", None)
+            st.rerun()
+    else:
+        st.warning("Magnific has not returned a finished video URL yet.")
+        if st.button(
+            "🔄 Refresh Kling video status",
+            key="avatar_outfit_refresh_missing_url",
+            type="primary",
+            use_container_width=True,
+            disabled=not bool(api_key and magnific_token and creation_id),
+        ):
+            refreshed = check_creation_status(api_key=api_key, magnific_token=magnific_token, creation_id=creation_id)
+            st.session_state["avatar_outfit_video_result"] = {**video_result, **{k: v for k, v in refreshed.items() if v is not None}}
+            st.rerun()
 
 
 def get_secret(key: str) -> str:
@@ -5944,7 +5871,7 @@ def main():
         <section class="apple-hero">
             <div class="apple-kicker">✦ AI VIDEO WORKSPACE</div>
             <h1>Seedance Studio</h1>
-            <p>Turn TikTok Shop products into multiple video formats, or create Avatar Outfit mirror try-ons directly from avatar + clothing references with Seedance 2.0 Fast, then refine supported workflows with the existing editor.</p>
+            <p>Turn TikTok Shop products into multiple video formats, or create Avatar Outfit mirror try-ons from an avatar + clothing reference using Magnific GPT Image 2 + Kling O1, then refine supported workflows with the existing editor.</p>
         </section>
         """,
         unsafe_allow_html=True,
@@ -6040,12 +5967,12 @@ def main():
                 st.caption(f"Image model: {LIFESTYLE_IMAGE_MODEL_LABEL}  |  Video model: {LIFESTYLE_VIDEO_MODEL_LABEL}")
             voice_script = None
         elif style == "avatar_outfit":
-            duration = 10
+            duration = 8
             voice_script = None
             st.info(
-                "Avatar Outfit is now a direct reference-to-video workflow: choose the saved avatar, select the clothing/review photos, analyze them, then send the avatar + outfit references + prompt straight to Seedance 2.0 Fast. No intermediate image generation or Kling step."
+                "Avatar Outfit uses the two uploaded try-on skills as one workflow: upload the avatar and outfit separately, analyze both, generate a 9:16 iPhone-style penthouse mirror selfie with Magnific GPT Image 2, approve it, then use that exact image as the Kling O1 start frame for the silent mirror try-on video."
             )
-            st.caption(f"Video model: {AVATAR_OUTFIT_VIDEO_MODEL_LABEL}")
+            st.caption(f"Image model: {AVATAR_OUTFIT_IMAGE_MODEL_LABEL}  |  Video model: {AVATAR_OUTFIT_VIDEO_MODEL_LABEL}")
         else:
             duration = 8
             voice_script = None
@@ -6718,11 +6645,11 @@ def main():
                         st.info("Describe the custom scene before generating so Nano Banana knows the correct environment and scale.")
 
                 appearance_details = st.text_area(
-                    "Product appearance and scale details",
+                    "Product form / packaging / appearance lock",
                     placeholder=LIFESTYLE_PRODUCT_TYPES[resolved_product_type]["appearance_help"],
                     height=92,
                     key=f"lifestyle_appearance_{product_fingerprint}",
-                    help="Kling uses this after image approval. Include every feature that must stay unchanged, especially overall size, materials, controls, accessories, and proportions.",
+                    help="Used by BOTH the lifestyle image and the animation. Add any exact package/form detail that must never change, e.g. ‘flexible stand-up pouch, NOT a jar or bottle’. The primary reference image is still the source of truth.",
                 ).strip()
                 default_appearance = (
                     "the exact real-world size, silhouette, construction, colors, materials, controls, accessories, branding, "
@@ -6782,7 +6709,7 @@ def main():
                     "custom_scene": custom_scene,
                     "appearance_details": appearance_details,
                     "lifestyle_prompt": build_lifestyle_image_prompt(
-                        product["name"], scene_key, product_type, custom_scene
+                        product["name"], scene_key, product_type, custom_scene, appearance_details
                     ),
                     "kling_prompt": build_lifestyle_kling_prompt(
                         product["name"], appearance_details, scene_key, product_type, custom_scene
