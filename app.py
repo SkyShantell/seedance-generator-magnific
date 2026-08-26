@@ -2252,7 +2252,7 @@ def _run_magnific_mcp_sequence(
     for turn_index in range(max(1, int(max_turns))):
         try:
             response = client.beta.messages.create(
-                model=MODEL,
+                model=MAGNIFIC_MCP_MODEL,
                 max_tokens=2048,
                 system=system,
                 messages=messages,
