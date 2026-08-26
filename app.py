@@ -1505,6 +1505,7 @@ def lifestyle_images_zip_bytes(generations: list[dict]) -> tuple[bytes | None, i
 
 # ── Constants ───────────────────────────────────────────────────────
 MAGNIFIC_MCP_URL = "https://mcp.magnific.com"
+MAGNIFIC_LEGACY_OAUTH_MCP_URL = "https://mcp.magnific.com"
 XAI_IMAGE_API_URL = "https://api.x.ai/v1/images/edits"
 LIFESTYLE_MAGNIFIC_IMAGE_MODEL = "grok-imagine-image-quality"
 LIFESTYLE_MAGNIFIC_IMAGE_MODEL = "nano_banana_2"
@@ -1754,9 +1755,12 @@ def _mcp_http_json(response) -> dict:
 
 
 class _MagnificDirectMCP:
-    """Minimal Streamable-HTTP MCP client so OpenAI never proxies the Magnific connection."""
-    def __init__(self, token: str):
-        self.token = str(token or "").strip()
+    """Minimal Streamable-HTTP client for Magnific's OAuth MCP endpoint."""
+    def __init__(self, auth_token: str):
+        token = str(auth_token or "").strip()
+        if token.lower().startswith("bearer "):
+            token = token[7:].strip()
+        self.auth_token = token
         self.session_id = None
         self.protocol_version = "2025-03-26"
         self.next_id = 1
@@ -1764,9 +1768,10 @@ class _MagnificDirectMCP:
 
     def _headers(self, include_protocol: bool = True) -> dict:
         headers = {
-            "Authorization": f"Bearer {self.token}",
+            "Authorization": f"Bearer {self.auth_token}",
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
+            "User-Agent": "SeedanceStudio/3.0 MCP-Client",
         }
         if self.session_id:
             headers["Mcp-Session-Id"] = self.session_id
@@ -1775,15 +1780,38 @@ class _MagnificDirectMCP:
         return headers
 
     def _post(self, payload: dict, *, include_protocol: bool = True, allow_empty: bool = False) -> dict:
-        try:
-            response = requests.post(
-                MAGNIFIC_MCP_URL,
-                headers=self._headers(include_protocol=include_protocol),
-                json=payload,
-                timeout=120,
-            )
-        except Exception as exc:
-            return {"error": {"message": f"Could not reach Magnific MCP directly: {exc}"}}
+        last_exc = None
+        response = None
+        # Magnific's remote OAuth MCP can occasionally drop a TLS handshake. Retry a
+        # few times with a fresh connection before surfacing the error to the user.
+        for attempt in range(3):
+            try:
+                headers = self._headers(include_protocol=include_protocol)
+                if attempt > 0:
+                    headers["Connection"] = "close"
+                response = requests.post(
+                    MAGNIFIC_MCP_URL,
+                    headers=headers,
+                    json=payload,
+                    timeout=(20, 120),
+                )
+                break
+            except requests.exceptions.SSLError as exc:
+                last_exc = exc
+                if attempt < 2:
+                    time.sleep(0.7 * (attempt + 1))
+                    continue
+            except requests.exceptions.RequestException as exc:
+                last_exc = exc
+                if attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+            except Exception as exc:
+                last_exc = exc
+                break
+
+        if response is None:
+            return {"error": {"message": f"Could not reach Magnific OAuth MCP after retries: {last_exc}"}}
 
         sid = response.headers.get("Mcp-Session-Id") or response.headers.get("mcp-session-id")
         if sid:
@@ -1793,8 +1821,8 @@ class _MagnificDirectMCP:
             return {
                 "error": {
                     "message": (
-                        "Magnific OAuth authorization was rejected or has expired. Your OpenAI key is OK. "
-                        "Renew the Magnific OAuth token and replace MAGNIFIC_AUTH_TOKEN."
+                        "Magnific OAuth authorization was rejected or expired. Your OpenAI key is OK. "
+                        "Refresh the Magnific OAuth token and update MAGNIFIC_AUTH_TOKEN in Streamlit secrets."
                     ),
                     "http_status": response.status_code,
                 }
@@ -1857,13 +1885,29 @@ class _MagnificDirectMCP:
         return self._post(payload)
 
     def list_tools(self) -> tuple[list[dict], str | None]:
-        response = self.request("tools/list", {})
-        if response.get("error"):
-            err = response.get("error") or {}
-            return [], str(err.get("message") if isinstance(err, dict) else err)
-        result = response.get("result") or {}
-        tools = result.get("tools") if isinstance(result, dict) else None
-        return list(tools or []), None
+        """Return the COMPLETE live Magnific tool catalog, following MCP pagination cursors."""
+        all_tools = []
+        seen_names = set()
+        cursor = None
+        for _page in range(20):
+            params = {"cursor": cursor} if cursor else {}
+            response = self.request("tools/list", params)
+            if response.get("error"):
+                err = response.get("error") or {}
+                return [], str(err.get("message") if isinstance(err, dict) else err)
+            result = response.get("result") or {}
+            if not isinstance(result, dict):
+                break
+            for tool in list(result.get("tools") or []):
+                name = str(tool.get("name") or "").strip()
+                if name and name not in seen_names:
+                    seen_names.add(name)
+                    all_tools.append(tool)
+            next_cursor = result.get("nextCursor") or result.get("next_cursor")
+            if not next_cursor or next_cursor == cursor:
+                break
+            cursor = next_cursor
+        return all_tools, None
 
     def call_tool(self, name: str, arguments: dict | None = None) -> dict:
         return self.request("tools/call", {"name": name, "arguments": arguments or {}})
@@ -1948,15 +1992,15 @@ def _direct_status_call(mcp: _MagnificDirectMCP, tools: list[dict], forced_name:
 
 
 def _openai_magnific(api_key: str, magnific_token: str, *, instructions: str, user_text: str, max_output_tokens: int = 900, tool_choice=None) -> dict:
-    """Use OpenAI for cheap planning, but call Magnific MCP directly from Streamlit.
+    """Use OpenAI for cheap planning, while Streamlit calls Magnific's OAuth MCP directly.
 
-    This intentionally avoids OpenAI's hosted remote-MCP connector. Magnific OAuth sessions are
-    client-managed; proxying a manually supplied token through OpenAI can fail at tools/list with HTTP 424.
+    This preserves the user's existing Magnific-account OAuth/authorization-token workflow
+    and avoids requiring Magnific developer API access.
     """
     if not api_key:
         return {"creation_id": None, "status": "error", "error": "OpenAI API key is missing."}
     if not magnific_token:
-        return {"creation_id": None, "status": "error", "error": "Magnific token is missing."}
+        return {"creation_id": None, "status": "error", "error": "Magnific OAuth token is missing. Add MAGNIFIC_AUTH_TOKEN to Streamlit secrets."}
 
     mcp = _MagnificDirectMCP(magnific_token)
     tools, tools_error = mcp.list_tools()
@@ -1965,12 +2009,27 @@ def _openai_magnific(api_key: str, magnific_token: str, *, instructions: str, us
             "creation_id": None,
             "status": "error",
             "error": tools_error,
-            "mcp_connection": "direct",
+            "mcp_connection": "direct_oauth",
         }
 
     forced_name = None
     if isinstance(tool_choice, dict) and tool_choice.get("type") == "mcp":
         forced_name = str(tool_choice.get("name") or "").strip() or None
+
+    live_names = {str(tool.get("name") or "").strip() for tool in tools if str(tool.get("name") or "").strip()}
+    task_lower = (instructions + "\n" + user_text).lower()
+    needs_generation = forced_name is None and any(token in task_lower for token in ("generate", "video", "image"))
+    if needs_generation and not ({"video_generate", "images_generate"} & live_names):
+        return {
+            "creation_id": None,
+            "status": "error",
+            "error": (
+                "Magnific OAuth MCP connected, but its complete generation tool catalog was not returned. "
+                f"Tools received after pagination: {', '.join(sorted(live_names)) or 'none'}. "
+                "Refresh MAGNIFIC_AUTH_TOKEN with MCP Inspector and try again."
+            ),
+            "mcp_connection": "direct_oauth",
+        }
 
     result = {
         "creation_id": None,
@@ -1979,7 +2038,7 @@ def _openai_magnific(api_key: str, magnific_token: str, *, instructions: str, us
         "preview_url": None,
         "error": None,
         "mcp_tools_called": [],
-        "mcp_connection": "direct",
+        "mcp_connection": "direct_oauth",
     }
     errors = []
     relevant_tools = _magnific_relevant_tools(tools, instructions + "\n" + user_text, forced_name=forced_name)
@@ -3885,7 +3944,7 @@ def generate_lifestyle_image_magnific(
     if not api_key:
         return {"creation_id": None, "status": "error", "error": "OpenAI API key is missing."}
     if not magnific_token:
-        return {"creation_id": None, "status": "error", "error": "Magnific authorization token is missing."}
+        return {"creation_id": None, "status": "error", "error": "Magnific OAuth token is missing. Add MAGNIFIC_AUTH_TOKEN to Streamlit secrets."}
     refs = []
     for url in reference_urls or []:
         cleaned = str(url or "").strip()
@@ -4916,7 +4975,7 @@ def generate_avatar_outfit_image_magnific(
     if not api_key:
         return {"creation_id": None, "status": "error", "error": "OpenAI API key is missing."}
     if not magnific_token:
-        return {"creation_id": None, "status": "error", "error": "Magnific authorization token is missing."}
+        return {"creation_id": None, "status": "error", "error": "Magnific OAuth token is missing. Add MAGNIFIC_AUTH_TOKEN to Streamlit secrets."}
     avatar_reference = str(avatar_reference or "").strip()
     outfit_references = [str(ref or "").strip() for ref in (outfit_references or []) if str(ref or "").strip()]
     if not avatar_reference or not outfit_references:
@@ -4980,7 +5039,7 @@ def generate_avatar_outfit_kling_magnific(
     if not api_key:
         return {"creation_id": None, "status": "error", "error": "OpenAI API key is missing."}
     if not magnific_token:
-        return {"creation_id": None, "status": "error", "error": "Magnific token is missing."}
+        return {"creation_id": None, "status": "error", "error": "Magnific OAuth token is missing. Add MAGNIFIC_AUTH_TOKEN to Streamlit secrets."}
     if not approved_image_url:
         return {"creation_id": None, "status": "error", "error": "Approve a generated try-on image first."}
     result = _openai_magnific(
@@ -5979,9 +6038,9 @@ def main():
         else:
             status_col_1.warning("OpenAI key needed")
         if magnific_token:
-            status_col_2.success("Magnific connected")
+            status_col_2.success("Magnific OAuth connected")
         else:
-            status_col_2.info("Magnific needed for video")
+            status_col_2.info("Magnific OAuth token needed")
         status_col_3.info("Nano Banana + Kling via Magnific")
         if director_ingest_key:
             status_col_4.success("Director connected")
@@ -6008,13 +6067,16 @@ def main():
             if xai_key_from_secrets or st.session_state.get("runtime_xai_api_key", ""):
                 st.caption("xAI API key is stored, but Lifestyle Animation now uses Magnific Nano Banana 2 instead of Grok.")
 
-            st.session_state["runtime_magnific_token"] = st.text_input(
-                "Magnific token",
-                type="password",
-                value=st.session_state.get("runtime_magnific_token", ""),
-                key="runtime_magnific_token_input",
-                help="Paste a refreshed token here whenever Magnific authentication expires.",
-            )
+            if token_from_secrets:
+                st.success("Magnific OAuth token loaded from Streamlit secrets.")
+            else:
+                st.session_state["runtime_magnific_token"] = st.text_input(
+                    "Magnific OAuth token",
+                    type="password",
+                    value=st.session_state.get("runtime_magnific_token", ""),
+                    key="runtime_magnific_token_input",
+                    help="OAuth access token for the Magnific MCP server at https://mcp.magnific.com.",
+                )
 
             if director_key_from_secrets:
                 st.success("Momentum Director ingest key loaded from Streamlit secrets.")
@@ -6092,13 +6154,16 @@ def main():
             st.markdown("**xAI key for image workflows**")
             st.markdown('Lifestyle approval images now use your existing **Magnific** connection with **Nano Banana 2 · Pro · 2k**. No xAI key is required for this workflow.')
 
-            st.markdown("**How to refresh the Magnific token**")
+            st.markdown("**Magnific OAuth token**")
             st.markdown("""
-1. Run `npx @modelcontextprotocol/inspector` on a computer with Node.js.
-2. Set **Transport Type** to `Streamable HTTP`.
-3. Set the URL to `https://mcp.magnific.com`.
-4. Connect, open Auth Settings, and complete the Quick OAuth Flow.
-5. Copy the `access_token` and paste it above.
+Use the same OAuth-token workflow you were already using:
+
+1. In **MCP Inspector**, connect to `https://mcp.magnific.com` using **Streamable HTTP**.
+2. Choose **OAuth** and complete the Magnific browser sign-in.
+3. Copy the resulting authorization/access token.
+4. Add it to Streamlit secrets as `MAGNIFIC_AUTH_TOKEN = "..."`.
+
+No Magnific developer API key is required. If the token expires, repeat the OAuth sign-in and replace only `MAGNIFIC_AUTH_TOKEN`.
             """)
 
 
@@ -7114,7 +7179,7 @@ def main():
                     error_msg = gen_result.get("error", "")
                     st.error(f"❌ **{product['name']}** — {error_msg}")
                     if any(keyword in error_msg.lower() for keyword in ['401', 'unauthorized', 'auth', 'api key', 'token', 'forbidden', '403']):
-                        st.warning("🔄 Magnific authentication failed. Refresh the Magnific token in the API connection section.")
+                        st.warning("🔄 Magnific authentication failed. Refresh/check the Magnific OAuth token in the API connection section.")
                         token_expired = True
                 else:
                     st.warning(f"⚠️ **{product['name']}** — Status: {gen_result.get('status')}")
