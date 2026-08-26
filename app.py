@@ -2003,32 +2003,76 @@ def _openai_magnific(api_key: str, magnific_token: str, *, instructions: str, us
     schema_text = _magnific_tool_schema_text(relevant_tools)
     history = []
     max_steps = 7
+    allowed_names = {str(tool.get("name") or "").strip() for tool in relevant_tools if str(tool.get("name") or "").strip()}
+    allowed_names_list = sorted(allowed_names)
+
+    # Never let stale prose override the live server schemas. Older app versions named
+    # upload tools explicitly, but Magnific can rename those tools over time.
+    sanitized_instructions = re.sub(
+        r"\bcreations_(?:upload_image|upload_file|request_upload|finalize_upload|upload)\b",
+        "the appropriate LIVE Magnific upload tool",
+        instructions or "",
+        flags=re.IGNORECASE,
+    )
+    sanitized_user_text = re.sub(
+        r"\bcreations_(?:upload_image|upload_file|request_upload|finalize_upload|upload)\b",
+        "the appropriate LIVE Magnific upload tool",
+        user_text or "",
+        flags=re.IGNORECASE,
+    )
 
     for step in range(max_steps):
         previous = json.dumps(history[-4:], ensure_ascii=False, default=str)[:12000]
         planner_instructions = (
-            "You are a strict tool-call planner for Magnific MCP. Choose exactly ONE next tool call from the supplied live tool schemas. "
-            "Do not invent tool names or argument keys. Fill arguments using the user's task and prior MCP results. "
+            "You are a strict tool-call planner for Magnific MCP. Choose exactly ONE next tool call from the supplied LIVE tool schemas. "
+            "The allowed tool names are an absolute whitelist. NEVER output a tool name that is not in the whitelist, even if an older instruction or your prior knowledge suggests another Magnific tool name. "
+            "Do not invent argument keys. Fill arguments only from the selected live tool's input schema, the user's task, and prior MCP results. "
             "Do not repeat a successful upload. If a prior result gives an upload URL/handle/identifier needed by a later generation tool, use it. "
             "For generation, obey the requested model, duration, resolution, aspect ratio, reference/start-frame behavior, and sound/audio setting exactly. "
             "Return ONLY JSON in one of these forms: "
-            "{\"done\":false,\"tool\":\"exact_tool_name\",\"arguments\":{...}} OR "
+            "{\"done\":false,\"tool\":\"exact_whitelisted_tool_name\",\"arguments\":{...}} OR "
             "{\"done\":true,\"result\":{\"creation_id\":\"...\",\"status\":\"queued|processing|completed\",\"url\":null,\"preview_url\":null}}. "
             "Only say done when a real creation/task identifier or final output URL has already been returned by Magnific."
         )
-        planner_text = (
-            f"TASK INSTRUCTIONS:\n{instructions}\n\nUSER TASK:\n{user_text}\n\n"
+        base_planner_text = (
+            f"ABSOLUTE TOOL-NAME WHITELIST (use one of these exact strings only):\n{json.dumps(allowed_names_list, ensure_ascii=False)}\n\n"
+            f"TASK INSTRUCTIONS:\n{sanitized_instructions}\n\nUSER TASK:\n{sanitized_user_text}\n\n"
             f"LIVE MAGNIFIC TOOL SCHEMAS:\n{schema_text}\n\n"
             f"PREVIOUS MCP RESULTS:\n{previous or 'none'}"
         )
-        plan = _openai_json_text(
-            api_key,
-            instructions=planner_instructions,
-            user_text=planner_text,
-            max_output_tokens=min(max_output_tokens, 900),
-        )
-        if plan.get("error"):
-            result["error"] = str(plan.get("error"))
+
+        plan = None
+        invalid_plan_note = ""
+        for planner_attempt in range(2):
+            planner_text = base_planner_text + invalid_plan_note
+            plan = _openai_json_text(
+                api_key,
+                instructions=planner_instructions,
+                user_text=planner_text,
+                max_output_tokens=min(max_output_tokens, 900),
+            )
+            if plan.get("error"):
+                result["error"] = str(plan.get("error"))
+                result["status"] = "error"
+                return result
+
+            if plan.get("done"):
+                break
+
+            proposed_name = str(plan.get("tool") or "").strip()
+            proposed_args = plan.get("arguments")
+            if proposed_name in allowed_names and isinstance(proposed_args, dict):
+                break
+
+            # One cheap corrective replan instead of failing the whole product.
+            invalid_plan_note = (
+                f"\n\nCORRECTION: Your previous proposal was INVALID: tool={proposed_name!r}. "
+                f"You MUST choose one exact name from this whitelist: {json.dumps(allowed_names_list, ensure_ascii=False)}. "
+                "Re-read that tool's LIVE input schema and rebuild its arguments from scratch. Do not reuse an obsolete Magnific tool name."
+            )
+
+        if not isinstance(plan, dict):
+            result["error"] = "OpenAI planner did not return a usable Magnific plan."
             result["status"] = "error"
             return result
 
@@ -2044,9 +2088,11 @@ def _openai_magnific(api_key: str, magnific_token: str, *, instructions: str, us
 
         tool_name = str(plan.get("tool") or "").strip()
         arguments = plan.get("arguments") or {}
-        allowed_names = {str(tool.get("name") or "") for tool in relevant_tools}
         if tool_name not in allowed_names or not isinstance(arguments, dict):
-            result["error"] = f"OpenAI planner selected an invalid Magnific tool call: {tool_name or 'none'}."
+            result["error"] = (
+                f"Magnific planner could not select a valid live tool after correction. "
+                f"Proposed: {tool_name or 'none'}. Live tools: {', '.join(allowed_names_list)}"
+            )
             result["status"] = "error"
             return result
 
@@ -2057,7 +2103,7 @@ def _openai_magnific(api_key: str, magnific_token: str, *, instructions: str, us
             err = tool_response.get("error") or {}
             message = str(err.get("message") if isinstance(err, dict) else err)
             errors.append(f"{tool_name}: {message}")
-            result["error"] = " | ".join(errors)[-2200:]
+            result["error"] = " | ".join(errors)[-1900:] + f" | Live Magnific tools: {', '.join(allowed_names_list)}"
             result["status"] = "error"
             return result
 
@@ -3769,7 +3815,7 @@ def write_prompt(
 GENERATE_SYSTEM = """You are a video production assistant. You have access to Magnific tools.
 
 Your job:
-1. Upload every provided product image to Magnific using creations_upload_image.
+1. Upload every provided product image using the appropriate upload tool from the LIVE Magnific tool list. Do not assume or invent an upload tool name.
 2. Generate a video using video_generate with:
    - The prompt provided
    - EVERY uploaded image attached only as a general image/reference input for visual accuracy
@@ -3813,7 +3859,7 @@ def generate_video(
 
 LIFESTYLE_IMAGE_GENERATE_SYSTEM = """You are an image production assistant with access to Magnific tools.
 Use the same Magnific MCP account already configured in the app.
-1. Upload EVERY provided reference image to Magnific using creations_upload_image.
+1. Upload EVERY provided reference image using the appropriate upload tool from the LIVE Magnific tool list. Do not assume or invent an upload tool name.
 2. REFERENCE IMAGE 1 IS AUTHORITATIVE for the product as sold: exact package/container/form factor, silhouette, dimensions, closure, branding, label layout, colors, materials, and included parts. Never override reference 1 with a secondary image.
 3. References 2+ may be official alternate views or customer review photos. Use them only to improve secondary detail, real-world scale, texture, and appearance. If a review photo shows the product decanted, transferred, opened, poured, placed in another jar/bottle/container, or otherwise used differently from reference 1, IGNORE that alternate container/state for the final product form.
 4. HARD PRODUCT-FORM LOCK: never repackage, decant, transfer, reshape, or substitute the product. A pouch/bag must remain that exact pouch/bag; a sachet/stick pack must remain that exact sachet/stick pack; a bottle remains that bottle; a jar/tub remains that jar/tub; a box/carton remains that box/carton; a can/canister remains that can/canister; a tube remains that tube; an appliance/device remains its exact housing. Never convert one package type into another.
@@ -4844,7 +4890,7 @@ Preserve exact identity, outfit, shoes, setting and lighting from the approved s
 
 AVATAR_OUTFIT_IMAGE_GENERATE_SYSTEM = """You are an image production assistant with access to Magnific tools.
 Use the same Magnific MCP account already configured in the app.
-1. Upload EVERY provided reference image to Magnific using creations_upload_image.
+1. Upload EVERY provided reference image using the appropriate upload tool from the LIVE Magnific tool list. Do not assume or invent an upload tool name.
 2. Reference image 1 is the avatar/identity reference. Preserve this exact person's appearance and identity.
 3. Reference images 2+ are outfit/clothing references from official listing photos and/or customer review photos.
 4. Use ALL provided outfit references together for clothing accuracy: garment type, colors, pattern, fit, silhouette, fabric, details, and styling.
