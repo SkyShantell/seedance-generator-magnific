@@ -2428,6 +2428,18 @@ def _openai_magnific(api_key: str, magnific_token: str, *, instructions: str, us
         continuation_instruction=continuation,
         max_turns=10,
     )
+
+    # A real Magnific creation ID means the generation was actually submitted.
+    # Do not let an incidental upload/connector status mark that asynchronous job as
+    # terminal Error before we have polled the creation itself. Preserve the message
+    # as a warning, then let creations_get determine the real final state.
+    if _is_real_magnific_creation_id(result.get("creation_id")) and not (result.get("url") or result.get("preview_url")):
+        if str(result.get("status") or "").lower() in {"", "unknown", "error", "failed", "failure"}:
+            if result.get("error"):
+                result["submission_warning"] = result.get("error")
+            result["status"] = "queued"
+            result["error"] = None
+
     result["mcp_bridge_model"] = MAGNIFIC_MCP_MODEL
     result["mcp_connection"] = "anthropic_native_oauth"
     return result
@@ -4276,10 +4288,11 @@ CHECK_STATUS_SYSTEM = """You have access to Magnific tools. Check the status of 
 and return its details.
 
 Use creations_get with the identifier provided. Return ONLY valid JSON (no markdown):
-{"status": "completed|queued|processing|error", "url": "full-res video URL or null", "preview_url": "preview URL or null"}
+{"status": "completed|queued|processing|error", "url": "full-resolution IMAGE OR VIDEO output URL or null", "preview_url": "preview URL or null"}
 
-If the creation is a video and it's completed, the url field should contain the video URL.
-Extract URLs from the creation data — look for fields like url, videoUrl, previewUrl, etc.
+The creation may be an image or a video. If it is completed, return the actual generated media URL.
+Do not return an input/reference/upload URL as the output. Extract the finished output from fields such
+as imageUrl, videoUrl, outputUrl, resultUrl, mediaUrl, downloadUrl, url, or previewUrl.
 """
 
 def _extract_status_payload(payload, result: dict):
@@ -4354,7 +4367,13 @@ def check_creation_status(api_key: str, magnific_token: str, creation_id: str) -
         max_output_tokens=350,
         tool_choice={"type": "mcp", "server_label": MAGNIFIC_MCP_NAME, "name": "creations_get"},
     )
-    if result.get("status") == "completed" and not (result.get("url") or result.get("preview_url")):
+    # A real finished output URL is stronger evidence than a stray nested status from
+    # an upload/reference sub-object. This is especially important for lifestyle images.
+    if result.get("url") or result.get("preview_url"):
+        result["status"] = "completed"
+        result["error"] = None
+    elif result.get("status") == "completed":
+        # Never mark the job finished until an actual output URL is available.
         result["status"] = "processing"
     return result
 
@@ -7760,7 +7779,9 @@ No Magnific developer API key is required. The app uses Claude Haiku only as the
                     refresh_result.get("style") == "lifestyle_animation"
                     and refresh_result.get("pipeline_stage") == "image"
                 )
-                terminal_statuses = {"completed", "error", "prompt_only", "image_approved"}
+                terminal_statuses = {"completed", "prompt_only", "image_approved"}
+                if refresh_status == "error" and not _is_real_magnific_creation_id(refresh_creation_id):
+                    terminal_statuses.add("error")
                 if refresh_status == "image_completed" and refresh_result.get("lifestyle_image_url"):
                     terminal_statuses.add("image_completed")
                 if refresh_creation_id and refresh_status not in terminal_statuses:
@@ -7778,6 +7799,8 @@ No Magnific developer API key is required. The app uses Claude Haiku only as the
                         approved_image_url = status_result.get("url") or status_result.get("preview_url")
                         if approved_image_url:
                             saved_gens[refresh_index]["lifestyle_image_url"] = approved_image_url
+                            saved_gens[refresh_index]["status"] = "image_completed"
+                            saved_gens[refresh_index].pop("error", None)
                     else:
                         refreshed_status = status_result.get("status", refresh_status)
                         saved_gens[refresh_index]["status"] = refreshed_status
@@ -7927,7 +7950,9 @@ No Magnific developer API key is required. The app uses Claude Haiku only as the
                     is_lifestyle = stored_style == "lifestyle_animation"
                     is_lifestyle_image_stage = is_lifestyle and result.get("pipeline_stage") == "image"
 
-                    terminal_statuses = {"completed", "error", "prompt_only", "image_approved"}
+                    terminal_statuses = {"completed", "prompt_only", "image_approved"}
+                    if status == "error" and not _is_real_magnific_creation_id(creation_id):
+                        terminal_statuses.add("error")
                     if status == "image_completed" and result.get("lifestyle_image_url"):
                         terminal_statuses.add("image_completed")
                     if creation_id and status not in terminal_statuses and magnific_token and api_key:
@@ -7945,6 +7970,8 @@ No Magnific developer API key is required. The app uses Claude Haiku only as the
                                 lifestyle_url = status_result.get("url") or status_result.get("preview_url")
                                 if lifestyle_url:
                                     saved_gens[i]["lifestyle_image_url"] = lifestyle_url
+                                    saved_gens[i]["status"] = "image_completed"
+                                    saved_gens[i].pop("error", None)
                             else:
                                 refreshed_status = status_result.get("status", status)
                                 saved_gens[i]["status"] = refreshed_status
