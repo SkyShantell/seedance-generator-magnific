@@ -1513,7 +1513,7 @@ DIRECTOR_INGEST_URL_DEFAULT = "https://app.momentumacademy.co/api/director/inges
 SEEDANCE_QUEUE_SCHEMA = "momentum.seedance.batch.v1"
 SEEDANCE_QUEUE_PATH_DEFAULT = "seedance_inbox"
 MAGNIFIC_MCP_NAME = "magnific"
-MODEL = "gpt-5-mini"
+MODEL = "gpt-4o-mini"
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 
 HEADERS = {
@@ -1551,42 +1551,58 @@ def _openai_output_text(payload: dict) -> str:
 
 
 def _openai_request(api_key: str, *, instructions: str, input_content, max_output_tokens: int = 800, tools=None, tool_choice=None, json_mode: bool = False) -> dict:
-    """Call OpenAI Responses API without adding another SDK dependency."""
+    """Call the low-cost OpenAI Responses API with one automatic max-token retry."""
     if not api_key:
         return {"error": {"message": "OpenAI API key is missing."}}
-    payload = {
-        "model": MODEL,
-        "instructions": instructions,
-        "input": input_content,
-        "max_output_tokens": max(128, int(max_output_tokens)),
-        "text": {
-            "verbosity": "low",
-            **({"format": {"type": "json_object"}} if json_mode else {}),
-        },
-    }
-    if tools:
-        payload["tools"] = tools
-    if tool_choice is not None:
-        payload["tool_choice"] = tool_choice
+
+    requested_tokens = max(256, int(max_output_tokens))
+
+    def make_payload(token_limit: int) -> dict:
+        payload = {
+            "model": MODEL,
+            "instructions": instructions,
+            "input": input_content,
+            "max_output_tokens": token_limit,
+            "store": False,
+            "text": ({"format": {"type": "json_object"}} if json_mode else {"format": {"type": "text"}}),
+        }
+        if tools:
+            payload["tools"] = tools
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
+        return payload
+
     try:
-        response = requests.post(
-            OPENAI_RESPONSES_URL,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json=payload,
-            timeout=180,
-        )
-        if not response.ok:
-            try:
-                detail = response.json()
-            except Exception:
-                detail = {"message": response.text[:1500]}
-            return {"error": {"message": f"OpenAI API {response.status_code}: {detail}"}}
-        return response.json()
+        for attempt, token_limit in enumerate((requested_tokens, max(1600, requested_tokens * 2))):
+            response = requests.post(
+                OPENAI_RESPONSES_URL,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json=make_payload(token_limit),
+                timeout=180,
+            )
+            if not response.ok:
+                try:
+                    detail = response.json()
+                except Exception:
+                    detail = {"message": response.text[:1500]}
+                return {"error": {"message": f"OpenAI API {response.status_code}: {detail}"}}
+
+            data = response.json()
+            status = str(data.get("status") or "").lower()
+            incomplete = data.get("incomplete_details") or {}
+            reason = str(incomplete.get("reason") or "").lower()
+
+            # A truncated structured response is safe to retry once with more output room.
+            if status == "incomplete" and reason in {"max_output_tokens", "max_tokens"} and attempt == 0:
+                continue
+            return data
+
+        return data
     except Exception as exc:
         return {"error": {"message": f"OpenAI API request failed: {exc}"}}
 
 
-def _openai_json_text(api_key: str, *, instructions: str, user_text: str, max_output_tokens: int = 600) -> dict:
+def _openai_json_text(api_key: str, *, instructions: str, user_text: str, max_output_tokens: int = 1000) -> dict:
     payload = _openai_request(
         api_key,
         instructions=instructions,
@@ -1603,10 +1619,10 @@ def _openai_json_text(api_key: str, *, instructions: str, user_text: str, max_ou
     # This should be extremely rare with JSON mode, but surface useful diagnostics.
     status = str(payload.get("status") or "unknown")
     incomplete = payload.get("incomplete_details") or {}
-    return {"error": f"OpenAI returned no parseable JSON (status: {status}).", "raw": raw, "incomplete_details": incomplete}
+    return {"error": f"OpenAI returned no parseable JSON (status: {status}, reason: {incomplete.get('reason') or 'n/a'}).", "raw": raw, "incomplete_details": incomplete}
 
 
-def _openai_vision_json(api_key: str, *, instructions: str, content: list[dict], max_output_tokens: int = 700) -> dict:
+def _openai_vision_json(api_key: str, *, instructions: str, content: list[dict], max_output_tokens: int = 1200) -> dict:
     normalized = []
     for item in content:
         if not isinstance(item, dict):
@@ -1640,7 +1656,7 @@ def _openai_vision_json(api_key: str, *, instructions: str, content: list[dict],
         return parsed
     status = str(payload.get("status") or "unknown")
     incomplete = payload.get("incomplete_details") or {}
-    return {"error": f"OpenAI returned no parseable JSON (status: {status}).", "raw": raw, "incomplete_details": incomplete}
+    return {"error": f"OpenAI returned no parseable JSON (status: {status}, reason: {incomplete.get('reason') or 'n/a'}).", "raw": raw, "incomplete_details": incomplete}
 
 
 def _absorb_openai_magnific_payload(value, result: dict) -> None:
@@ -3186,7 +3202,7 @@ def _extract_visible_text_excerpt(html: str, limit: int = 2400) -> str:
 
 
 def recover_product_name_with_page_context(api_key: str, html: str, image_urls: list[str], page_url: str = "", product_id: str = "") -> str:
-    """Fallback product-name recovery using OpenAI GPT-5 mini vision/text."""
+    """Fallback product-name recovery using OpenAI GPT-4o mini vision/text."""
     if not api_key:
         return ""
     visible_text = _extract_visible_text_excerpt(html)
@@ -3212,7 +3228,7 @@ def recover_product_name_with_page_context(api_key: str, html: str, image_urls: 
         api_key,
         instructions="You identify retail product names from weak ecommerce page signals. Read only what is actually visible.",
         input_content=[{"role": "user", "content": content}],
-        max_output_tokens=220,
+        max_output_tokens=500,
         json_mode=True,
     )
     if payload.get("error"):
@@ -3364,7 +3380,7 @@ def _clean_product_name_candidate(value: str) -> str:
 
 
 def recover_product_name_from_images(api_key: str, image_urls: list[str], product_id: str = "") -> str:
-    """Use OpenAI GPT-5 mini vision only when scraping exposes no usable product title."""
+    """Use OpenAI GPT-4o mini vision only when scraping exposes no usable product title."""
     if not api_key:
         return ""
     content = []
@@ -3386,7 +3402,7 @@ def recover_product_name_from_images(api_key: str, image_urls: list[str], produc
         api_key,
         instructions="Identify retail products from listing images accurately and conservatively.",
         input_content=[{"role": "user", "content": content}],
-        max_output_tokens=220,
+        max_output_tokens=500,
         json_mode=True,
     )
     if payload.get("error"):
@@ -3577,7 +3593,7 @@ def scrape_product(url: str, api_key: str = "") -> dict | None:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  PROMPT WRITER (OpenAI GPT-5 mini)
+#  PROMPT WRITER (OpenAI GPT-4o mini)
 # ═══════════════════════════════════════════════════════════════════
 
 def _extract_json_object(raw_text: str) -> dict | None:
@@ -3652,6 +3668,29 @@ def write_hooks(api_key: str, product_name: str, style: str = "texthook_broll") 
     }
 
 
+def _local_seedance_prompt_fallback(
+    product_name: str,
+    style: str,
+    duration: int,
+    broll_scene: str | None = None,
+    voice_script: str | None = None,
+) -> str:
+    """Deterministic emergency prompt so an OpenAI formatting/API hiccup never blocks generation."""
+    name = re.sub(r"\s+", " ", (product_name or "product").strip())
+    if style == "shoe_video":
+        audio = (
+            f'Include this voiceover in a warm casual female voice: "{re.sub(r"\\s+", " ", voice_script.strip())[:500]}".'
+            if voice_script else "Ambient sound only; no voiceover."
+        )
+        return re.sub(r"\s+", " ", f"""9:16 vertical TikTok UGC video, {int(duration)} seconds. Match every supplied reference image exactly for the {name}: exact shoe silhouette, color, material, sole, straps/laces, logo placement and proportions. Uploaded images are visual references only, never a literal start frame. Show feet-and-shoes only; never show a person above the ankle. Warm natural phone-camera lighting, casual handheld movement, no polished commercial look, no digital zoom, no rendered text/captions/subtitles/overlays/prices/watermarks. [00:00-00:05] Looking-down POV of both feet wearing the exact shoes on a realistic surface, one small natural stance shift. [00:05-00:10] Low side angle focused on the shoe profile and sole; one foot lifts slightly then sets down. [00:10-00:{int(duration):02d}] Return to overhead/three-quarter POV with a small natural step or weight shift, keeping the shoes dominant and accurate. {audio}""").strip()[:1899]
+    if style == "warehouse":
+        return re.sub(r"\s+", " ", f"""9:16 vertical TikTok UGC, exactly 5 seconds, completely silent. Match the exact {name} packaging, colors, labels, shape and proportions from all supplied references; reference 1 has highest product-accuracy priority. Images are general references only, never a start frame. One continuous first-person shopper POV already standing directly beside a real warehouse display at arm's length. No people, hands, faces, bodies or animals. [00:00-00:02] Product display already fills about 75-85% of frame, slightly off-center, natural phone micro-shake. [00:02-00:05] One tiny 6-12 inch lean-in/half-step and gentle reframe so repeated units fill about 90-95% of frame. Real metal racking, fluorescent light, concrete floor and pallet edges around the display. No walking sequence, cuts, audio, digital zoom, rendered text, captions, prices, sale graphics or watermarks.""").strip()[:1899]
+    if style == "pool":
+        return re.sub(r"\s+", " ", f"""9:16 vertical realistic TikTok Shop UGC, exactly 8 seconds, silent. Match the exact {name} package, colors, branding, shape and proportions from supplied references; keep one unchanged accurate product throughout. References are visual references only, never a start frame. Bright natural summer daylight beside a residential backyard pool. [00:00-00:03] One natural hand holds the product upright beside the turquoise pool, package facing camera and filling 65-75% of frame, slight wrist movement and phone micro-shake. [00:03-00:05.5] Clean cut: product stands upright on a small patio table; short casual half-orbit and tiny push-in. [00:05.5-00:08] Clean cut: product held upright again while camera makes one or two small natural steps along pool edge. No packaging changes, duplicates, warped hands, invented words, rendered text/captions/prices/watermarks, voiceover, music or digital zoom.""").strip()[:1899]
+    scene = re.sub(r"\s+", " ", (broll_scene or choose_broll_scene()).strip())
+    return re.sub(r"\s+", " ", f"""9:16 vertical TikTok UGC, exactly 8 seconds, completely silent, no rendered text/captions/subtitles/overlays/signs/watermarks. Uploaded product images are general references only and must be matched exactly; never use them as a start frame. [00:00-00:03] Show this exact unrelated opening scene and do not substitute another scene: {scene}. Casual handheld iPhone footage, natural micro-shake, ordinary daylight. [00:03-00:08] Hard cut to an outdoor or casual real-life surface. One natural hand holds up the exact {name}, matching reference packaging/colors/shape/logo/proportions, slowly rotating and tilting it in warm natural light with a softly blurred background. No face or person above wrist, no product changes, no digital zoom, no audio.""").strip()[:1899]
+
+
 def write_prompt(
     api_key: str,
     product_name: str,
@@ -3661,7 +3700,7 @@ def write_prompt(
     selected_hook: str | None = None,
     broll_scene: str | None = None,
 ) -> dict:
-    """Use low-cost OpenAI GPT-5 mini to write the Seedance prompt."""
+    """Use low-cost OpenAI GPT-4o mini to write the Seedance prompt."""
     if style == "shoe_video":
         vo = VOICEOVER_WITH_SCRIPT.format(script=voice_script) if voice_script else VOICEOVER_SILENT
         system = SHOE_VIDEO_SYSTEM.format(voiceover_instruction=vo)
@@ -3691,15 +3730,24 @@ def write_prompt(
         api_key,
         instructions=system,
         user_text=user_task,
-        max_output_tokens=900,
+        max_output_tokens=1400,
     )
     if parsed.get("error"):
-        # Do not abort the whole generation for a formatting-only model failure.
+        # Never block the actual video run because the inexpensive prompt-writer call was truncated or unavailable.
         raw_fallback = re.sub(r"\s+", " ", str(parsed.get("raw") or "")).strip()
-        if raw_fallback and len(raw_fallback) >= 80:
-            parsed = {"product_name": product_name, "prompt": raw_fallback[:1899]}
-        else:
-            return {"error": parsed.get("error"), "product_name": product_name}
+        fallback_prompt = raw_fallback[:1899] if len(raw_fallback) >= 80 else _local_seedance_prompt_fallback(
+            product_name=product_name,
+            style=style,
+            duration=dur,
+            broll_scene=chosen_broll_scene,
+            voice_script=voice_script,
+        )
+        parsed = {
+            "product_name": product_name,
+            "prompt": fallback_prompt,
+            "openai_prompt_warning": parsed.get("error"),
+            "used_local_prompt_fallback": not bool(raw_fallback and len(raw_fallback) >= 80),
+        }
     prompt_text = str(parsed.get("prompt") or "").strip()
     if style == "warehouse" and len(prompt_text) >= 1900:
         # Avoid a second paid model call: trim at the nearest sentence boundary.
@@ -3744,7 +3792,7 @@ def generate_video(
     duration: int,
     image_urls: list[str] | None = None,
 ) -> dict:
-    """Generate a Seedance video through Magnific MCP using OpenAI GPT-5 mini as the low-cost orchestrator."""
+    """Generate a Seedance video through Magnific MCP using OpenAI GPT-4o mini as the low-cost orchestrator."""
     refs = [u for u in (image_urls or [image_url]) if u] or [image_url]
     refs_text = "\n".join(f"Reference image {i+1}: {url}" for i, url in enumerate(refs) if url)
     return _openai_magnific(
@@ -3787,7 +3835,7 @@ def generate_lifestyle_image_magnific(
     reference_urls: list[str],
     prompt: str,
 ) -> dict:
-    """Generate one 2K, 9:16 lifestyle approval image in Magnific using OpenAI GPT-5 mini for low-cost planning and direct Magnific MCP."""
+    """Generate one 2K, 9:16 lifestyle approval image in Magnific using OpenAI GPT-4o mini for low-cost planning and direct Magnific MCP."""
     if not api_key:
         return {"creation_id": None, "status": "error", "error": "OpenAI API key is missing."}
     if not magnific_token:
@@ -4671,7 +4719,7 @@ def analyze_avatar_outfit_images(
     avatar_mime: str,
     outfit_images: list[dict],
 ) -> dict:
-    """Analyze avatar + outfit refs using low-cost OpenAI GPT-5 mini vision."""
+    """Analyze avatar + outfit refs using low-cost OpenAI GPT-4o mini vision."""
     if not api_key:
         return {"error": "OpenAI API key is missing."}
     if not avatar_bytes or not outfit_images:
@@ -5763,7 +5811,7 @@ def main():
         <section class="apple-hero">
             <div class="apple-kicker">✦ AI VIDEO WORKSPACE</div>
             <h1>Seedance Studio</h1>
-            <p>Turn TikTok Shop products into multiple video formats, or create Avatar Outfit mirror try-ons from an avatar + clothing reference using the existing Magnific workflows, with low-cost OpenAI GPT-5 mini for AI analysis/orchestration, then refine supported workflows with the existing editor.</p>
+            <p>Turn TikTok Shop products into multiple video formats, or create Avatar Outfit mirror try-ons from an avatar + clothing reference using the existing Magnific workflows, with low-cost OpenAI GPT-4o mini for AI analysis/orchestration, then refine supported workflows with the existing editor.</p>
         </section>
         """,
         unsafe_allow_html=True,
