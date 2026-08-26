@@ -1997,6 +1997,64 @@ def _direct_status_call(mcp: _MagnificDirectMCP, tools: list[dict], forced_name:
     return mcp.call_tool(forced_name, {key: creation_id})
 
 
+
+def _absorb_magnific_toon_text(raw_text, result: dict, include_creation_id: bool = True):
+    """Parse Magnific MCP TOON/human-readable creation payloads into our normalized result."""
+    raw = str(raw_text or "").strip()
+    if not raw or not isinstance(result, dict):
+        return result
+
+    # A tool result may itself be JSON whose only useful field is a TOON text blob.
+    try:
+        wrapped = json.loads(raw)
+        if isinstance(wrapped, dict):
+            nested_text = wrapped.get("text")
+            if isinstance(nested_text, str) and nested_text.strip() and nested_text.strip() != raw:
+                _absorb_magnific_toon_text(nested_text, result, include_creation_id=include_creation_id)
+            if include_creation_id and not result.get("creation_id"):
+                for key in ("identifier", "creation_id", "creationId", "task_id", "taskId", "id"):
+                    if wrapped.get(key):
+                        result["creation_id"] = str(wrapped[key])
+                        break
+            if isinstance(wrapped.get("status"), str):
+                raw_status = wrapped["status"].strip().lower()
+                aliases = {
+                    "succeeded": "completed", "success": "completed", "done": "completed", "finished": "completed",
+                    "pending": "queued", "running": "processing", "failed": "error", "failure": "error",
+                }
+                result["status"] = aliases.get(raw_status, raw_status)
+            for source_key, target_key in (("url", "url"), ("previewUrl", "preview_url"), ("preview_url", "preview_url")):
+                value = wrapped.get(source_key)
+                if isinstance(value, str) and value.startswith(("http://", "https://")):
+                    result[target_key] = value
+    except Exception:
+        pass
+
+    if include_creation_id and not result.get("creation_id"):
+        match = re.search(r"(?im)^\s*(?:identifier|creation[_ -]?id|task[_ -]?id|job[_ -]?id)\s*:\s*[\"']?([A-Za-z0-9_-]{6,})", raw)
+        if match:
+            result["creation_id"] = match.group(1)
+
+    status_match = re.search(r"(?im)^\s*(?:status|state|creation_status)\s*:\s*[\"']?([A-Za-z_-]+)", raw)
+    if status_match:
+        raw_status = status_match.group(1).strip().lower()
+        aliases = {
+            "succeeded": "completed", "success": "completed", "done": "completed", "finished": "completed",
+            "pending": "queued", "running": "processing", "failed": "error", "failure": "error",
+        }
+        result["status"] = aliases.get(raw_status, raw_status)
+
+    url_match = re.search(r"(?im)^\s*url\s*:\s*[\"']?(https?://[^\s\"']+)", raw)
+    preview_match = re.search(r"(?im)^\s*(?:previewUrl|preview_url)\s*:\s*[\"']?(https?://[^\s\"']+)", raw)
+    thumb_match = re.search(r"(?im)^\s*(?:thumbnailUrl|thumbnail_url)\s*:\s*[\"']?(https?://[^\s\"']+)", raw)
+    if url_match:
+        result["url"] = url_match.group(1)
+    if preview_match:
+        result["preview_url"] = preview_match.group(1)
+    elif thumb_match and not result.get("preview_url"):
+        result["preview_url"] = thumb_match.group(1)
+    return result
+
 def _parse_magnific_creation_response(response) -> dict:
     """Normalize Magnific MCP responses and preserve the actual MCP failure when one occurs."""
     result = {
@@ -2032,8 +2090,17 @@ def _parse_magnific_creation_response(response) -> dict:
         return status_aliases.get(normalized, normalized)
 
     def absorb(payload):
+        if isinstance(payload, str):
+            _absorb_magnific_toon_text(payload, result)
+            return
         if not isinstance(payload, (dict, list)):
             return
+        if isinstance(payload, dict):
+            # Magnific creations_get commonly returns {"text": "identifier: ...\nstatus: ...\nurl: ..."}.
+            for toon_key in ("text", "content", "message"):
+                toon_value = payload.get(toon_key)
+                if isinstance(toon_value, str):
+                    _absorb_magnific_toon_text(toon_value, result)
         url_candidates = []
 
         def walk(value, path=()):
@@ -2150,9 +2217,11 @@ def _parse_magnific_creation_response(response) -> dict:
             for sub in subcontents:
                 raw = sub if isinstance(sub, str) else getattr(sub, "text", None)
                 if raw:
-                    raw_parts.append(str(raw))
+                    raw_text = str(raw)
+                    raw_parts.append(raw_text)
+                    _absorb_magnific_toon_text(raw_text, result)
                     try:
-                        absorb(json.loads(str(raw)))
+                        absorb(json.loads(raw_text))
                     except (json.JSONDecodeError, TypeError, ValueError):
                         pass
             raw_joined = "\n".join(raw_parts).strip()
@@ -4296,7 +4365,15 @@ as imageUrl, videoUrl, outputUrl, resultUrl, mediaUrl, downloadUrl, url, or prev
 """
 
 def _extract_status_payload(payload, result: dict):
-    """Extract status and output URLs from nested Magnific creation responses."""
+    """Extract status and output URLs from JSON or Magnific TOON/text creation responses."""
+    if isinstance(payload, str):
+        _absorb_magnific_toon_text(payload, result, include_creation_id=False)
+        return result
+    if isinstance(payload, dict):
+        for toon_key in ("text", "content", "message"):
+            toon_value = payload.get(toon_key)
+            if isinstance(toon_value, str):
+                _absorb_magnific_toon_text(toon_value, result, include_creation_id=False)
     url_candidates = []
 
     def walk(value, path=()):
@@ -4323,8 +4400,8 @@ def _extract_status_payload(payload, result: dict):
                 if isinstance(child, str) and child.startswith(("http://", "https://")):
                     path_text = " ".join(child_path)
                     score = 0
-                    if key_lower in {"videourl", "video_url", "video", "downloadurl", "download_url"}:
-                        score += 120
+                    if key_lower in {"imageurl", "image_url", "image", "videourl", "video_url", "video", "downloadurl", "download_url"}:
+                        score += 135
                     elif key_lower in {"outputurl", "output_url", "resulturl", "result_url", "mediaurl", "media_url"}:
                         score += 105
                     elif key_lower in {"url", "fileurl", "file_url"}:
@@ -4358,24 +4435,112 @@ def _extract_status_payload(payload, result: dict):
 
 
 def check_creation_status(api_key: str, magnific_token: str, creation_id: str) -> dict:
-    """Check a Magnific creation through direct Magnific MCP."""
-    result = _openai_magnific(
-        api_key,
-        magnific_token,
-        instructions=CHECK_STATUS_SYSTEM,
-        user_text=f"Check the status of creation: {creation_id}. Use creations_get and return the current output URL when available.",
-        max_output_tokens=350,
-        tool_choice={"type": "mcp", "server_label": MAGNIFIC_MCP_NAME, "name": "creations_get"},
-    )
-    # A real finished output URL is stronger evidence than a stray nested status from
-    # an upload/reference sub-object. This is especially important for lifestyle images.
-    if result.get("url") or result.get("preview_url"):
-        result["status"] = "completed"
-        result["error"] = None
-    elif result.get("status") == "completed":
-        # Never mark the job finished until an actual output URL is available.
-        result["status"] = "processing"
-    return result
+    """Check one Magnific creation using the proven Anthropic native OAuth MCP path.
+
+    Keep this separate from the generation planner. Status checks are deterministic:
+    call creations_get for the saved identifier and extract the finished media URL.
+    """
+    if not creation_id:
+        return {"status": "error", "url": None, "preview_url": None, "error": "Missing Magnific creation ID."}
+    if not magnific_token:
+        return {"status": "error", "url": None, "preview_url": None, "error": "Magnific OAuth token is missing."}
+    if anthropic is None:
+        return {"status": "error", "url": None, "preview_url": None, "error": "The anthropic package is missing for the Magnific MCP bridge."}
+
+    anthropic_key = ""
+    try:
+        anthropic_key = str(st.secrets.get("ANTHROPIC_API_KEY", "") or "").strip()
+    except Exception:
+        anthropic_key = str(os.environ.get("ANTHROPIC_API_KEY", "") or "").strip()
+    if not anthropic_key:
+        anthropic_key = str(st.session_state.get("runtime_anthropic_api_key", "") or "").strip()
+    if not anthropic_key:
+        return {"status": "error", "url": None, "preview_url": None, "error": "Anthropic API key is missing for Magnific status refresh."}
+
+    mcp_servers = [{
+        "type": "url",
+        "url": MAGNIFIC_MCP_URL,
+        "name": MAGNIFIC_MCP_NAME,
+        "authorization_token": magnific_token,
+    }]
+
+    try:
+        client = anthropic.Anthropic(api_key=anthropic_key)
+        response = client.beta.messages.create(
+            model=MAGNIFIC_MCP_MODEL,
+            max_tokens=1200,
+            system=CHECK_STATUS_SYSTEM,
+            messages=[{
+                "role": "user",
+                "content": f"Check the status of creation: {creation_id}. Call creations_get with this exact identifier and return the finished image/video URL when available."
+            }],
+            mcp_servers=mcp_servers,
+            tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
+            betas=[MCP_BETA],
+        )
+
+        result = {"status": "unknown", "url": None, "preview_url": None, "error": None}
+        saw_tool_result = False
+        raw_debug = []
+
+        for block in getattr(response, "content", []) or []:
+            block_type = getattr(block, "type", "")
+            if block_type == "text":
+                raw = str(getattr(block, "text", "") or "")
+                if raw.strip():
+                    raw_debug.append(raw.strip()[:1200])
+                try:
+                    cleaned = re.sub(r'```json\s*|```\s*', '', raw)
+                    j = cleaned.find("{")
+                    k = cleaned.rfind("}") + 1
+                    if j >= 0 and k > j:
+                        parsed = json.loads(cleaned[j:k])
+                        if isinstance(parsed, dict):
+                            _extract_status_payload(parsed, result)
+                            for field in ("status", "url", "preview_url"):
+                                if parsed.get(field):
+                                    result[field] = parsed[field]
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    pass
+
+            elif block_type == "mcp_tool_result" and getattr(block, "content", None):
+                saw_tool_result = True
+                for sub in block.content:
+                    raw = sub if isinstance(sub, str) else getattr(sub, "text", None)
+                    if not raw:
+                        continue
+                    raw_debug.append(str(raw)[:1800])
+                    raw_text = str(raw)
+                    _absorb_magnific_toon_text(raw_text, result, include_creation_id=False)
+                    try:
+                        payload = json.loads(raw_text)
+                        _extract_status_payload(payload, result)
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        # Some MCP results are text-wrapped JSON; try to isolate the object.
+                        j = raw_text.find("{")
+                        k = raw_text.rfind("}") + 1
+                        if j >= 0 and k > j:
+                            try:
+                                payload = json.loads(raw_text[j:k])
+                                _extract_status_payload(payload, result)
+                            except Exception:
+                                pass
+
+        # Finished media beats any nested status from references/uploads.
+        if result.get("url") or result.get("preview_url"):
+            result["status"] = "completed"
+            result["error"] = None
+        elif result.get("status") == "completed":
+            result["status"] = "processing"
+        elif result.get("status") in {None, "", "unknown"} and not saw_tool_result:
+            result["error"] = "Magnific status refresh did not return a creations_get result."
+
+        if result.get("error") and raw_debug:
+            result["debug"] = raw_debug[-1][:1800]
+        return result
+
+    except Exception as exc:
+        return {"status": "error", "url": None, "preview_url": None, "error": f"Magnific status refresh failed: {exc}"}
 
 def push_generated_image_to_director(
     ingest_key: str,
@@ -7777,7 +7942,14 @@ No Magnific developer API key is required. The app uses Claude Haiku only as the
                 refresh_status = refresh_result.get("status", "unknown")
                 is_lifestyle_image = (
                     refresh_result.get("style") == "lifestyle_animation"
-                    and refresh_result.get("pipeline_stage") == "image"
+                    and (
+                        refresh_result.get("pipeline_stage") == "image"
+                        or str(refresh_result.get("status") or "").startswith("image_")
+                        or (
+                            refresh_result.get("lifestyle_creation_id")
+                            and str(refresh_result.get("lifestyle_creation_id")) == str(refresh_creation_id)
+                        )
+                    )
                 )
                 terminal_statuses = {"completed", "prompt_only", "image_approved"}
                 if refresh_status == "error" and not _is_real_magnific_creation_id(refresh_creation_id):
@@ -7787,6 +7959,13 @@ No Magnific developer API key is required. The app uses Claude Haiku only as the
                 if refresh_creation_id and refresh_status not in terminal_statuses:
                     with st.spinner(f"Checking {refresh_result.get('product_name', 'video')}..."):
                         status_result = check_creation_status(api_key, magnific_token, refresh_creation_id)
+                    if status_result.get("error"):
+                        saved_gens[refresh_index]["last_refresh_error"] = status_result.get("error")
+                        if status_result.get("debug"):
+                            saved_gens[refresh_index]["last_refresh_debug"] = status_result.get("debug")
+                    else:
+                        saved_gens[refresh_index].pop("last_refresh_error", None)
+                        saved_gens[refresh_index].pop("last_refresh_debug", None)
                     if is_lifestyle_image:
                         raw_status = status_result.get("status", refresh_status)
                         mapped = {
@@ -7944,6 +8123,11 @@ No Magnific developer API key is required. The app uses Claude Haiku only as the
                         st.caption(f"Image model: {LIFESTYLE_IMAGE_MODEL_LABEL}  |  Video model: {LIFESTYLE_VIDEO_MODEL_LABEL}")
                     if creation_id:
                         st.caption(f"Creation ID: `{creation_id}`")
+                    if result.get("last_refresh_error"):
+                        st.error(f"Refresh error: {result.get('last_refresh_error')}")
+                        if result.get("last_refresh_debug"):
+                            with st.expander("Magnific refresh details"):
+                                st.code(str(result.get("last_refresh_debug"))[:1800])
 
                 with header_actions:
                     stored_style = result.get("style") or "texthook_broll"
@@ -7959,6 +8143,13 @@ No Magnific developer API key is required. The app uses Claude Haiku only as the
                         if st.button("🔄 Check status", key=f"chk_{i}", use_container_width=True):
                             with st.spinner("Checking..."):
                                 status_result = check_creation_status(api_key, magnific_token, creation_id)
+                            if status_result.get("error"):
+                                saved_gens[i]["last_refresh_error"] = status_result.get("error")
+                                if status_result.get("debug"):
+                                    saved_gens[i]["last_refresh_debug"] = status_result.get("debug")
+                            else:
+                                saved_gens[i].pop("last_refresh_error", None)
+                                saved_gens[i].pop("last_refresh_debug", None)
                             if is_lifestyle_image_stage:
                                 raw_status = status_result.get("status", status)
                                 saved_gens[i]["status"] = {
