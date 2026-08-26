@@ -1674,78 +1674,366 @@ def _absorb_openai_magnific_payload(value, result: dict) -> None:
             result["url"] = url_candidates[0][2]
 
 
+
+def _mcp_http_json(response) -> dict:
+    """Parse a Streamable-HTTP MCP response (JSON or SSE) into one JSON-RPC object."""
+    raw = response.text or ""
+    ctype = (response.headers.get("content-type") or "").lower()
+    if "application/json" in ctype:
+        try:
+            data = response.json()
+            return data if isinstance(data, dict) else {"result": data}
+        except Exception:
+            pass
+
+    events = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            obj = json.loads(payload)
+            if isinstance(obj, dict):
+                events.append(obj)
+        except Exception:
+            continue
+    if events:
+        # Prefer an actual JSON-RPC result/error event over progress notifications.
+        for obj in reversed(events):
+            if "result" in obj or "error" in obj:
+                return obj
+        return events[-1]
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {"result": data}
+    except Exception:
+        return {"error": {"message": raw[:1800] or f"Magnific MCP HTTP {response.status_code}"}}
+
+
+class _MagnificDirectMCP:
+    """Minimal Streamable-HTTP MCP client so OpenAI never proxies the Magnific connection."""
+    def __init__(self, token: str):
+        self.token = str(token or "").strip()
+        self.session_id = None
+        self.protocol_version = "2025-03-26"
+        self.next_id = 1
+        self.initialized = False
+
+    def _headers(self, include_protocol: bool = True) -> dict:
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        if self.session_id:
+            headers["Mcp-Session-Id"] = self.session_id
+        if include_protocol and self.initialized:
+            headers["MCP-Protocol-Version"] = self.protocol_version
+        return headers
+
+    def _post(self, payload: dict, *, include_protocol: bool = True, allow_empty: bool = False) -> dict:
+        try:
+            response = requests.post(
+                MAGNIFIC_MCP_URL,
+                headers=self._headers(include_protocol=include_protocol),
+                json=payload,
+                timeout=120,
+            )
+        except Exception as exc:
+            return {"error": {"message": f"Could not reach Magnific MCP directly: {exc}"}}
+
+        sid = response.headers.get("Mcp-Session-Id") or response.headers.get("mcp-session-id")
+        if sid:
+            self.session_id = sid
+
+        if response.status_code in (401, 403):
+            return {
+                "error": {
+                    "message": (
+                        "Magnific OAuth authorization was rejected or has expired. Your OpenAI key is OK. "
+                        "Renew the Magnific OAuth token and replace MAGNIFIC_AUTH_TOKEN."
+                    ),
+                    "http_status": response.status_code,
+                }
+            }
+        if not response.ok:
+            parsed = _mcp_http_json(response)
+            message = parsed.get("error") if isinstance(parsed, dict) else None
+            if isinstance(message, dict):
+                message = message.get("message") or message.get("detail") or str(message)
+            return {
+                "error": {
+                    "message": f"Magnific MCP HTTP {response.status_code}: {message or (response.text or '')[:1500]}",
+                    "http_status": response.status_code,
+                }
+            }
+        if allow_empty and not (response.text or "").strip():
+            return {"result": {}}
+        return _mcp_http_json(response)
+
+    def initialize(self) -> dict:
+        if self.initialized:
+            return {"result": {"protocolVersion": self.protocol_version}}
+        request_id = self.next_id
+        self.next_id += 1
+        payload = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": self.protocol_version,
+                "capabilities": {},
+                "clientInfo": {"name": "Seedance Studio", "version": "3.0"},
+            },
+        }
+        result = self._post(payload, include_protocol=False)
+        if result.get("error"):
+            return result
+        negotiated = ((result.get("result") or {}).get("protocolVersion") if isinstance(result.get("result"), dict) else None)
+        if negotiated:
+            self.protocol_version = str(negotiated)
+        self.initialized = True
+        # Streamable HTTP servers accept the initialized notification without a JSON-RPC id.
+        notify = {
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {},
+        }
+        self._post(notify, allow_empty=True)
+        return result
+
+    def request(self, method: str, params: dict | None = None) -> dict:
+        init = self.initialize()
+        if init.get("error"):
+            return init
+        request_id = self.next_id
+        self.next_id += 1
+        payload = {"jsonrpc": "2.0", "id": request_id, "method": method}
+        if params is not None:
+            payload["params"] = params
+        return self._post(payload)
+
+    def list_tools(self) -> tuple[list[dict], str | None]:
+        response = self.request("tools/list", {})
+        if response.get("error"):
+            err = response.get("error") or {}
+            return [], str(err.get("message") if isinstance(err, dict) else err)
+        result = response.get("result") or {}
+        tools = result.get("tools") if isinstance(result, dict) else None
+        return list(tools or []), None
+
+    def call_tool(self, name: str, arguments: dict | None = None) -> dict:
+        return self.request("tools/call", {"name": name, "arguments": arguments or {}})
+
+
+def _magnific_relevant_tools(tools: list[dict], task_text: str, forced_name: str | None = None) -> list[dict]:
+    """Keep the planner prompt small while retaining upload/generation/status dependencies."""
+    if forced_name:
+        exact = [tool for tool in tools if str(tool.get("name") or "") == forced_name]
+        if exact:
+            return exact
+    lower = (task_text or "").lower()
+    wanted = []
+    for tool in tools:
+        name = str(tool.get("name") or "")
+        n = name.lower()
+        keep = False
+        if any(token in lower for token in ("check the status", "creation status", "creations_get")):
+            keep = n in {"creations_get", "creation_status", "creations_wait"}
+        elif "image" in lower and "video" not in lower:
+            keep = (
+                n.startswith("images_")
+                or n in {"creations_request_upload", "creations_upload", "creations_finalize_upload", "creations_get"}
+                or "upload" in n
+            )
+        else:
+            keep = (
+                n.startswith("video_")
+                or n in {"creations_request_upload", "creations_upload", "creations_finalize_upload", "creations_get"}
+                or "upload" in n
+            )
+        if keep:
+            wanted.append(tool)
+    return wanted or tools[:20]
+
+
+def _magnific_tool_schema_text(tools: list[dict], max_chars: int = 26000) -> str:
+    compact = []
+    for tool in tools:
+        compact.append({
+            "name": tool.get("name"),
+            "description": str(tool.get("description") or "")[:900],
+            "inputSchema": tool.get("inputSchema") or tool.get("input_schema") or {},
+        })
+    raw = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+    return raw[:max_chars]
+
+
+def _extract_creation_id_from_text(value: str) -> str:
+    text = str(value or "")
+    # UUID-like IDs first, then the generic Magnific IDs already handled elsewhere.
+    patterns = [
+        r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b",
+        r"(?i)(?:creation|task|job|generation)[ _-]?(?:id|identifier)\s*[:=]?\s*[\"']?([A-Za-z0-9_-]{8,})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1) if match.lastindex else match.group(0)
+    return ""
+
+
+def _direct_status_call(mcp: _MagnificDirectMCP, tools: list[dict], forced_name: str, user_text: str) -> dict | None:
+    """Avoid an OpenAI planning call for a simple creations_get/status request."""
+    tool = next((item for item in tools if str(item.get("name") or "") == forced_name), None)
+    if not tool:
+        return None
+    creation_id = _extract_creation_id_from_text(user_text)
+    if not creation_id:
+        return None
+    schema = tool.get("inputSchema") or tool.get("input_schema") or {}
+    props = schema.get("properties") if isinstance(schema, dict) else {}
+    props = props if isinstance(props, dict) else {}
+    key = next((candidate for candidate in ("identifier", "creation_id", "creationId", "id", "task_id", "taskId") if candidate in props), None)
+    if not key:
+        required = schema.get("required") if isinstance(schema, dict) else []
+        if isinstance(required, list) and len(required) == 1:
+            key = required[0]
+    if not key:
+        return None
+    return mcp.call_tool(forced_name, {key: creation_id})
+
+
 def _openai_magnific(api_key: str, magnific_token: str, *, instructions: str, user_text: str, max_output_tokens: int = 900, tool_choice=None) -> dict:
-    """Use OpenAI's remote MCP tool to orchestrate the existing Magnific connection."""
+    """Use OpenAI for cheap planning, but call Magnific MCP directly from Streamlit.
+
+    This intentionally avoids OpenAI's hosted remote-MCP connector. Magnific OAuth sessions are
+    client-managed; proxying a manually supplied token through OpenAI can fail at tools/list with HTTP 424.
+    """
     if not api_key:
         return {"creation_id": None, "status": "error", "error": "OpenAI API key is missing."}
     if not magnific_token:
         return {"creation_id": None, "status": "error", "error": "Magnific token is missing."}
-    mcp_tool = {
-        "type": "mcp",
-        "server_label": MAGNIFIC_MCP_NAME,
-        "server_url": MAGNIFIC_MCP_URL,
-        "authorization": magnific_token,
-        "require_approval": "never",
-        "server_description": "Magnific image and video generation MCP server.",
-    }
-    payload = _openai_request(
-        api_key,
-        instructions=instructions,
-        input_content=[{"role": "user", "content": [{"type": "input_text", "text": user_text}]}],
-        max_output_tokens=max_output_tokens,
-        tools=[mcp_tool],
-        tool_choice=tool_choice,
-    )
-    if payload.get("error"):
-        return {"creation_id": None, "status": "error", "error": payload["error"].get("message", str(payload["error"]))}
 
-    result = {"creation_id": None, "status": "unknown", "url": None, "preview_url": None, "error": None, "mcp_tools_called": []}
+    mcp = _MagnificDirectMCP(magnific_token)
+    tools, tools_error = mcp.list_tools()
+    if tools_error:
+        return {
+            "creation_id": None,
+            "status": "error",
+            "error": tools_error,
+            "mcp_connection": "direct",
+        }
+
+    forced_name = None
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == "mcp":
+        forced_name = str(tool_choice.get("name") or "").strip() or None
+
+    result = {
+        "creation_id": None,
+        "status": "unknown",
+        "url": None,
+        "preview_url": None,
+        "error": None,
+        "mcp_tools_called": [],
+        "mcp_connection": "direct",
+    }
     errors = []
-    for item in payload.get("output", []) or []:
-        if not isinstance(item, dict):
-            continue
-        if item.get("type") == "mcp_call":
-            name = str(item.get("name") or "Magnific MCP tool")
-            if name not in result["mcp_tools_called"]:
-                result["mcp_tools_called"].append(name)
-            if item.get("error"):
-                errors.append(f"{name}: {item.get('error')}")
-            raw_output = item.get("output")
-            if raw_output:
-                try:
-                    parsed = json.loads(raw_output) if isinstance(raw_output, str) else raw_output
-                    _absorb_openai_magnific_payload(parsed, result)
-                except Exception:
-                    raw = str(raw_output)
-                    for pattern in (
-                        r'(?i)(?:creation|task|job|generation)[ _-]?(?:id|identifier)\s*[:=]\s*["\']?([A-Za-z0-9_-]{8,})',
-                        r'(?i)identifier\s*[:=]\s*["\']?([A-Za-z0-9_-]{8,})',
-                    ):
-                        match = re.search(pattern, raw)
-                        if match and not result.get("creation_id"):
-                            result["creation_id"] = match.group(1)
-                            break
-        elif item.get("type") == "message":
-            for content in item.get("content", []) or []:
-                if isinstance(content, dict) and content.get("type") == "output_text":
-                    raw = str(content.get("text") or "")
-                    parsed = _extract_json_object(raw)
-                    if isinstance(parsed, dict):
-                        _absorb_openai_magnific_payload(parsed, result)
-                        if parsed.get("error"):
-                            errors.append(str(parsed.get("error")))
+    relevant_tools = _magnific_relevant_tools(tools, instructions + "\n" + user_text, forced_name=forced_name)
+
+    # Fast path for status refreshes: call creations_get directly with no extra model turn.
+    if forced_name:
+        direct_response = _direct_status_call(mcp, relevant_tools, forced_name, user_text)
+        if direct_response is not None:
+            if direct_response.get("error"):
+                err = direct_response.get("error") or {}
+                result["error"] = str(err.get("message") if isinstance(err, dict) else err)
+                result["status"] = "error"
+                return result
+            payload = direct_response.get("result", direct_response)
+            _absorb_openai_magnific_payload(payload, result)
+            result["mcp_tools_called"].append(forced_name)
+            if result.get("url") and result.get("status") in {None, "", "unknown", "queued", "processing"}:
+                result["status"] = "completed"
+            return result
+
+    schema_text = _magnific_tool_schema_text(relevant_tools)
+    history = []
+    max_steps = 7
+
+    for step in range(max_steps):
+        previous = json.dumps(history[-4:], ensure_ascii=False, default=str)[:12000]
+        planner_instructions = (
+            "You are a strict tool-call planner for Magnific MCP. Choose exactly ONE next tool call from the supplied live tool schemas. "
+            "Do not invent tool names or argument keys. Fill arguments using the user's task and prior MCP results. "
+            "Do not repeat a successful upload. If a prior result gives an upload URL/handle/identifier needed by a later generation tool, use it. "
+            "For generation, obey the requested model, duration, resolution, aspect ratio, reference/start-frame behavior, and sound/audio setting exactly. "
+            "Return ONLY JSON in one of these forms: "
+            "{\"done\":false,\"tool\":\"exact_tool_name\",\"arguments\":{...}} OR "
+            "{\"done\":true,\"result\":{\"creation_id\":\"...\",\"status\":\"queued|processing|completed\",\"url\":null,\"preview_url\":null}}. "
+            "Only say done when a real creation/task identifier or final output URL has already been returned by Magnific."
+        )
+        planner_text = (
+            f"TASK INSTRUCTIONS:\n{instructions}\n\nUSER TASK:\n{user_text}\n\n"
+            f"LIVE MAGNIFIC TOOL SCHEMAS:\n{schema_text}\n\n"
+            f"PREVIOUS MCP RESULTS:\n{previous or 'none'}"
+        )
+        plan = _openai_json_text(
+            api_key,
+            instructions=planner_instructions,
+            user_text=planner_text,
+            max_output_tokens=min(max_output_tokens, 900),
+        )
+        if plan.get("error"):
+            result["error"] = str(plan.get("error"))
+            result["status"] = "error"
+            return result
+
+        if plan.get("done"):
+            reported = plan.get("result") or {}
+            if isinstance(reported, dict):
+                _absorb_openai_magnific_payload(reported, result)
+            if result.get("creation_id") or result.get("url") or result.get("preview_url"):
+                break
+            result["error"] = "OpenAI planner stopped before Magnific returned a real creation/task ID."
+            result["status"] = "error"
+            return result
+
+        tool_name = str(plan.get("tool") or "").strip()
+        arguments = plan.get("arguments") or {}
+        allowed_names = {str(tool.get("name") or "") for tool in relevant_tools}
+        if tool_name not in allowed_names or not isinstance(arguments, dict):
+            result["error"] = f"OpenAI planner selected an invalid Magnific tool call: {tool_name or 'none'}."
+            result["status"] = "error"
+            return result
+
+        tool_response = mcp.call_tool(tool_name, arguments)
+        if tool_name not in result["mcp_tools_called"]:
+            result["mcp_tools_called"].append(tool_name)
+        if tool_response.get("error"):
+            err = tool_response.get("error") or {}
+            message = str(err.get("message") if isinstance(err, dict) else err)
+            errors.append(f"{tool_name}: {message}")
+            result["error"] = " | ".join(errors)[-2200:]
+            result["status"] = "error"
+            return result
+
+        tool_payload = tool_response.get("result", tool_response)
+        _absorb_openai_magnific_payload(tool_payload, result)
+        history.append({"tool": tool_name, "arguments": arguments, "result": tool_payload})
+
+        if result.get("creation_id") or result.get("url") or result.get("preview_url"):
+            break
 
     if result.get("creation_id") and result.get("status") in {None, "", "unknown"}:
         result["status"] = "queued"
     if result.get("url") and result.get("status") in {None, "", "unknown", "queued", "processing"}:
         result["status"] = "completed"
-    if errors and not (result.get("creation_id") or result.get("url") or result.get("preview_url")):
-        result["error"] = " | ".join(dict.fromkeys(errors))[:2200]
-        result["status"] = "error"
-    elif errors:
-        result["warning"] = " | ".join(dict.fromkeys(errors))[:2200]
     if not result.get("creation_id") and not result.get("url") and not result.get("preview_url") and not result.get("error"):
-        result["error"] = "OpenAI reached Magnific but no creation/task ID or output URL was returned."
+        result["error"] = "Magnific MCP made progress but did not return a creation/task ID after the allowed steps."
         result["status"] = "error"
     return result
 
@@ -3387,7 +3675,7 @@ def write_prompt(
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  VIDEO GENERATOR (OpenAI + Magnific MCP)
+#  VIDEO GENERATOR (OpenAI + direct Magnific MCP)
 # ═══════════════════════════════════════════════════════════════════
 
 GENERATE_SYSTEM = """You are a video production assistant. You have access to Magnific tools.
@@ -3459,7 +3747,7 @@ def generate_lifestyle_image_magnific(
     reference_urls: list[str],
     prompt: str,
 ) -> dict:
-    """Generate one 2K, 9:16 lifestyle approval image in Magnific using OpenAI GPT-5 mini for MCP orchestration."""
+    """Generate one 2K, 9:16 lifestyle approval image in Magnific using OpenAI GPT-5 mini for low-cost planning and direct Magnific MCP."""
     if not api_key:
         return {"creation_id": None, "status": "error", "error": "OpenAI API key is missing."}
     if not magnific_token:
@@ -3522,7 +3810,7 @@ def generate_lifestyle_kling_magnific(
     prompt: str,
     duration: int,
 ) -> dict:
-    """Animate an approved lifestyle still with Kling O1 using OpenAI remote MCP."""
+    """Animate an approved lifestyle still with Kling O1 using OpenAI planning + direct Magnific MCP."""
     duration = 5
     return _openai_magnific(
         api_key,
@@ -3614,7 +3902,7 @@ def _extract_status_payload(payload, result: dict):
 
 
 def check_creation_status(api_key: str, magnific_token: str, creation_id: str) -> dict:
-    """Check a Magnific creation through OpenAI remote MCP."""
+    """Check a Magnific creation through direct Magnific MCP."""
     result = _openai_magnific(
         api_key,
         magnific_token,
@@ -4489,7 +4777,7 @@ def generate_avatar_outfit_image_magnific(
     outfit_references: list[str],
     prompt: str,
 ) -> dict:
-    """Generate the Avatar Outfit still through Magnific using OpenAI remote MCP."""
+    """Generate the Avatar Outfit still through Magnific using OpenAI planning + direct Magnific MCP."""
     if not api_key:
         return {"creation_id": None, "status": "error", "error": "OpenAI API key is missing."}
     if not magnific_token:
@@ -4553,7 +4841,7 @@ def generate_avatar_outfit_kling_magnific(
     approved_image_url: str,
     prompt: str,
 ) -> dict:
-    """Animate the approved try-on image with Kling O1 using OpenAI remote MCP."""
+    """Animate the approved try-on image with Kling O1 using OpenAI planning + direct Magnific MCP."""
     if not api_key:
         return {"creation_id": None, "status": "error", "error": "OpenAI API key is missing."}
     if not magnific_token:
