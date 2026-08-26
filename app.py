@@ -1530,17 +1530,27 @@ HEADERS = {
 
 def _openai_output_text(payload: dict) -> str:
     """Collect assistant output text from an OpenAI Responses API payload."""
+    if not isinstance(payload, dict):
+        return ""
+    # Future-/SDK-compatible convenience field if present.
+    direct = payload.get("output_text")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
     parts = []
-    for item in (payload or {}).get("output", []) or []:
+    for item in payload.get("output", []) or []:
         if not isinstance(item, dict) or item.get("type") != "message":
             continue
         for content in item.get("content", []) or []:
-            if isinstance(content, dict) and content.get("type") == "output_text" and content.get("text"):
+            if not isinstance(content, dict):
+                continue
+            if content.get("type") == "output_text" and content.get("text"):
                 parts.append(str(content.get("text")))
+            elif content.get("type") == "refusal" and content.get("refusal"):
+                parts.append(str(content.get("refusal")))
     return "\n".join(parts).strip()
 
 
-def _openai_request(api_key: str, *, instructions: str, input_content, max_output_tokens: int = 800, tools=None, tool_choice=None) -> dict:
+def _openai_request(api_key: str, *, instructions: str, input_content, max_output_tokens: int = 800, tools=None, tool_choice=None, json_mode: bool = False) -> dict:
     """Call OpenAI Responses API without adding another SDK dependency."""
     if not api_key:
         return {"error": {"message": "OpenAI API key is missing."}}
@@ -1549,7 +1559,10 @@ def _openai_request(api_key: str, *, instructions: str, input_content, max_outpu
         "instructions": instructions,
         "input": input_content,
         "max_output_tokens": max(128, int(max_output_tokens)),
-        "text": {"verbosity": "low"},
+        "text": {
+            "verbosity": "low",
+            **({"format": {"type": "json_object"}} if json_mode else {}),
+        },
     }
     if tools:
         payload["tools"] = tools
@@ -1579,12 +1592,18 @@ def _openai_json_text(api_key: str, *, instructions: str, user_text: str, max_ou
         instructions=instructions,
         input_content=[{"role": "user", "content": [{"type": "input_text", "text": user_text}]}],
         max_output_tokens=max_output_tokens,
+        json_mode=True,
     )
     if payload.get("error"):
         return {"error": payload["error"].get("message", str(payload["error"]))}
     raw = _openai_output_text(payload)
     parsed = _extract_json_object(raw)
-    return parsed if isinstance(parsed, dict) else {"error": "Couldn't parse JSON", "raw": raw}
+    if isinstance(parsed, dict):
+        return parsed
+    # This should be extremely rare with JSON mode, but surface useful diagnostics.
+    status = str(payload.get("status") or "unknown")
+    incomplete = payload.get("incomplete_details") or {}
+    return {"error": f"OpenAI returned no parseable JSON (status: {status}).", "raw": raw, "incomplete_details": incomplete}
 
 
 def _openai_vision_json(api_key: str, *, instructions: str, content: list[dict], max_output_tokens: int = 700) -> dict:
@@ -1611,12 +1630,17 @@ def _openai_vision_json(api_key: str, *, instructions: str, content: list[dict],
         instructions=instructions,
         input_content=[{"role": "user", "content": normalized}],
         max_output_tokens=max_output_tokens,
+        json_mode=True,
     )
     if payload.get("error"):
         return {"error": payload["error"].get("message", str(payload["error"]))}
     raw = _openai_output_text(payload)
     parsed = _extract_json_object(raw)
-    return parsed if isinstance(parsed, dict) else {"error": "Couldn't parse JSON", "raw": raw}
+    if isinstance(parsed, dict):
+        return parsed
+    status = str(payload.get("status") or "unknown")
+    incomplete = payload.get("incomplete_details") or {}
+    return {"error": f"OpenAI returned no parseable JSON (status: {status}).", "raw": raw, "incomplete_details": incomplete}
 
 
 def _absorb_openai_magnific_payload(value, result: dict) -> None:
@@ -3189,6 +3213,7 @@ def recover_product_name_with_page_context(api_key: str, html: str, image_urls: 
         instructions="You identify retail product names from weak ecommerce page signals. Read only what is actually visible.",
         input_content=[{"role": "user", "content": content}],
         max_output_tokens=220,
+        json_mode=True,
     )
     if payload.get("error"):
         return ""
@@ -3362,6 +3387,7 @@ def recover_product_name_from_images(api_key: str, image_urls: list[str], produc
         instructions="Identify retail products from listing images accurately and conservatively.",
         input_content=[{"role": "user", "content": content}],
         max_output_tokens=220,
+        json_mode=True,
     )
     if payload.get("error"):
         return ""
@@ -3555,14 +3581,23 @@ def scrape_product(url: str, api_key: str = "") -> dict | None:
 # ═══════════════════════════════════════════════════════════════════
 
 def _extract_json_object(raw_text: str) -> dict | None:
-    cleaned = re.sub(r'```json\s*', '', raw_text)
-    cleaned = re.sub(r'```\s*', '', cleaned)
+    cleaned = str(raw_text or "").lstrip("\ufeff").strip()
+    cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\s*```$', '', cleaned).strip()
+    if not cleaned:
+        return None
+    try:
+        parsed = json.loads(cleaned)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
     json_start = cleaned.find("{")
     json_end = cleaned.rfind("}") + 1
     if json_start < 0 or json_end <= json_start:
         return None
     try:
-        return json.loads(cleaned[json_start:json_end])
+        parsed = json.loads(cleaned[json_start:json_end])
+        return parsed if isinstance(parsed, dict) else None
     except json.JSONDecodeError:
         return None
 
@@ -3659,7 +3694,12 @@ def write_prompt(
         max_output_tokens=900,
     )
     if parsed.get("error"):
-        return {"error": parsed.get("error"), "product_name": product_name}
+        # Do not abort the whole generation for a formatting-only model failure.
+        raw_fallback = re.sub(r"\s+", " ", str(parsed.get("raw") or "")).strip()
+        if raw_fallback and len(raw_fallback) >= 80:
+            parsed = {"product_name": product_name, "prompt": raw_fallback[:1899]}
+        else:
+            return {"error": parsed.get("error"), "product_name": product_name}
     prompt_text = str(parsed.get("prompt") or "").strip()
     if style == "warehouse" and len(prompt_text) >= 1900:
         # Avoid a second paid model call: trim at the nearest sentence boundary.
@@ -4673,6 +4713,7 @@ Return ONLY valid JSON with: avatar_description, outfit_description, shoes_descr
             instructions=system,
             input_content=[{"role": "user", "content": content}],
             max_output_tokens=650,
+            json_mode=True,
         )
         if payload.get("error"):
             return {"error": payload["error"].get("message", str(payload["error"]))}
