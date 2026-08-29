@@ -4880,6 +4880,13 @@ For the outfit, combine evidence from ALL outfit references. Describe ONLY the c
 
 Determine whether shoes are visibly included in any selected outfit reference. If shoes are visible, describe them. If not, return clean white sneakers as the default. If only a top is visible across all selected references with no matching bottom, set bottom_fallback to black fitted jogger pants; otherwise leave bottom_fallback empty.
 
+Also determine the pose focus for the try-on content. Use exactly one of: "shirt", "pants", "outfit", or "shoes".
+- Use "shirt" when the selected product is primarily a top such as a shirt, tee, blouse, hoodie, jacket, sweater, or similar upper-body garment.
+- Use "pants" when the selected product is primarily bottoms such as jeans, pants, shorts, leggings, joggers, or a skirt.
+- Use "outfit" when the selected product is a coordinated look or when both the top and bottom matter together, including dresses, matching sets, jumpsuits, rompers, or full outfits.
+- Use "shoes" only when the selected product is clearly footwear.
+Also set back_design_visible to true when the selected references show a notable back graphic, text, print, or design that should be shown in the try-on.
+
 Return ONLY valid JSON:
 {
   "avatar_description":"concise visible physical description",
@@ -4887,7 +4894,9 @@ Return ONLY valid JSON:
   "shoes_description":"visible shoes or clean white sneakers",
   "bottom_fallback":"black fitted jogger pants or empty string",
   "outfit_has_shoes":true,
-  "outfit_has_bottom":true
+  "outfit_has_bottom":true,
+  "pose_focus":"shirt|pants|outfit|shoes",
+  "back_design_visible":true
 }"""
 
     try:
@@ -4947,6 +4956,24 @@ Return ONLY valid JSON:
             return {"error": "Could not extract both avatar and outfit descriptions."}
         parsed["shoes_description"] = (parsed.get("shoes_description") or "clean white sneakers").strip()
         parsed["bottom_fallback"] = (parsed.get("bottom_fallback") or "").strip()
+        pose_focus = str(parsed.get("pose_focus") or "").strip().lower()
+        if pose_focus not in {"shirt", "pants", "outfit", "shoes"}:
+            desc = (parsed.get("outfit_description") or "").lower()
+            has_top_kw = any(k in desc for k in ["shirt", "tee", "t-shirt", "top", "blouse", "hoodie", "sweater", "jacket", "coat", "cardigan", "tank", "long-sleeve", "button-up", "button down", "undershirt"]) 
+            has_bottom_kw = any(k in desc for k in ["jean", "pant", "trouser", "legging", "jogger", "short", "skirt", "cargo", "denim", "waistband", "inseam"]) 
+            has_shoe_kw = any(k in desc for k in ["shoe", "sneaker", "boot", "heel", "sandal", "loafer", "clog", "slipper"])
+            if has_shoe_kw and not has_top_kw and not has_bottom_kw:
+                pose_focus = "shoes"
+            elif has_top_kw and has_bottom_kw:
+                pose_focus = "outfit"
+            elif has_top_kw:
+                pose_focus = "shirt"
+            elif has_bottom_kw:
+                pose_focus = "pants"
+            else:
+                pose_focus = "outfit" if parsed.get("outfit_has_bottom") else "shirt"
+        parsed["pose_focus"] = pose_focus
+        parsed["back_design_visible"] = bool(parsed.get("back_design_visible"))
         parsed["outfit_reference_count"] = usable_count
         return parsed
     except Exception as exc:
@@ -4957,11 +4984,25 @@ def build_avatar_outfit_image_prompt(
     outfit_description: str,
     shoes_description: str,
     bottom_fallback: str = "",
+    pose_focus: str = "outfit",
+    back_design_visible: bool = False,
 ) -> str:
     """Build the image prompt from the kling-tryon-image skill."""
     outfit_line = outfit_description.strip()
     if bottom_fallback:
         outfit_line += f" Pair the visible top with {bottom_fallback}."
+
+    pose_focus = (pose_focus or "outfit").strip().lower()
+    if pose_focus == "pants":
+        pose_direction = "Pose so the pants are clearly being shown off: full lower body visible, free hand naturally touching or gesturing toward the waistband, thigh, or pant leg, with a stance that highlights the fit and shape of the bottoms."
+    elif pose_focus == "shirt":
+        pose_direction = "Pose so the shirt or top is clearly being shown off: free hand lightly touching the chest, hem, sleeve, or collar area, with the upper garment remaining the obvious focus."
+    elif pose_focus == "shoes":
+        pose_direction = "Pose so the shoes are clearly being shown off: full body still visible, but the stance and leg angle should make the footwear easy to see, with one foot slightly forward."
+    else:
+        pose_direction = "Pose so the full outfit is clearly being shown off: natural styling pose that highlights both the top and the bottom together, with the whole look remaining the clear focus."
+    if back_design_visible:
+        pose_direction += " Include a natural slight turn or angled mirror pose so the back design is at least partially visible as well."
 
     prompt = f"""Generate an image that looks like an authentic iPhone 15 Pro mirror selfie taken in a dimly lit room at night. Portrait orientation, 9:16 aspect ratio.
 
@@ -4973,6 +5014,8 @@ Shoes: {shoes_description}. Also add a thick gold Cuban link chain necklace, gol
 
 Scene: full-body head-to-toe mirror selfie inside a luxury modern penthouse at night. The subject stands before a full-length mirror and holds a black iPhone 16 in the right hand at face level so the phone partially covers the face. Slightly off-center natural handheld composition. Behind the subject: floor-to-ceiling glass windows, illuminated blue infinity pool, night city skyline and palm trees, minimalist lounge furniture, warm polished tile floor and warm recessed ceiling lights.
 
+Pose direction: {pose_direction}
+
 iPhone UGC realism is critical: slight low-light sensor grain/noise in shadows; faint cool phone-screen glow on fingers and near side of face; barely visible mirror smudge/fingerprint; natural pores and skin texture; slightly muted warm iPhone nighttime colors; sharpest focus on torso/outfit with softer frame edges; very subtle free-hand motion blur; mixed warm ceiling light and cool blue pool light; no HDR, studio fill, rim light or beauty lighting; natural shadows; realistic fabric texture and slight worn creases.
 
 It must look like a real TikTok mirror selfie, not an AI render or polished fashion campaign. One person only. Full body entirely in frame. No extra people, pets or animals. No text, captions, prices, watermarks, logos added by the generator, or overlays."""
@@ -4983,21 +5026,54 @@ def build_avatar_outfit_kling_prompt(
     avatar_description: str,
     outfit_description: str,
     shoes_description: str,
+    pose_focus: str = "outfit",
+    back_design_visible: bool = False,
 ) -> str:
     """Build an 8-second Grok mirror-video prompt and keep it under 1,900 chars."""
     avatar = re.sub(r"\s+", " ", avatar_description.strip())[:180]
     outfit = re.sub(r"\s+", " ", outfit_description.strip())[:330]
     shoes = re.sub(r"\s+", " ", shoes_description.strip())[:100] or "clean white sneakers"
+    pose_focus = (pose_focus or "outfit").strip().lower()
 
+    if pose_focus == "pants":
+        motion_lines = [
+            "[00:00-00:02] Start in a full-body front-facing mirror pose with the pants fully visible from waist to hem. Gentle handheld sway.",
+            "[00:02-00:04] Shift weight and use the free hand to touch or gesture toward the waistband, upper thigh, or pant leg so the pants are clearly the focus.",
+            "[00:04-00:06] Step back slightly and angle the body to show the side fit and leg shape of the pants while keeping the full body in frame.",
+            "[00:06-00:08] Return to a confident slight-angle stance and lightly adjust or brush the pants so the ending still emphasizes the bottoms."
+        ]
+    elif pose_focus == "shirt":
+        third_line = "[00:04-00:06] Step back slightly and angle the body to show the shirt shape from the side while keeping the upper garment as the clear focus."
+        if back_design_visible:
+            third_line = "[00:04-00:06] Step back slightly and rotate naturally to give a clear partial view of the back design on the shirt, then ease into a side angle while keeping the mirror-selfie pose believable."
+        motion_lines = [
+            "[00:00-00:02] Start in a front-facing mirror pose with the shirt clearly visible and the full body still in frame. Gentle handheld sway.",
+            "[00:02-00:04] Shift weight and use the free hand to touch the chest, collar, hem, or sleeve so the shirt is clearly being shown off.",
+            third_line,
+            "[00:06-00:08] Return to a confident slight-angle pose and lightly adjust the shirt or hemline so the ending still emphasizes the top."
+        ]
+    elif pose_focus == "shoes":
+        motion_lines = [
+            "[00:00-00:02] Start in a full-body mirror pose with one foot slightly ahead so the shoes are easy to see. Gentle handheld sway.",
+            "[00:02-00:04] Shift weight and angle the legs to highlight the shoes, with a small downward body emphasis while keeping the phone at face level.",
+            "[00:04-00:06] Step back slightly and turn enough to show the shoes from the side and front. Full body remains visible.",
+            "[00:06-00:08] Return to a centered pose with one foot forward so the ending still emphasizes the shoes."
+        ]
+    else:
+        third_line = "[00:04-00:06] Step back for a wider full-body view and turn to show the outfit from the side so both the top and bottom read clearly together."
+        if back_design_visible:
+            third_line = "[00:04-00:06] Step back for a wider full-body view and rotate naturally so the full outfit is shown from the side and the back design is partially visible as well."
+        motion_lines = [
+            "[00:00-00:02] Start centered in mirror, full body head-to-toe, with the whole outfit clearly displayed from the front. Gentle handheld sway.",
+            "[00:02-00:04] Shift weight and use the free hand to touch or gesture across the top and lower outfit area so the full look is clearly being shown off.",
+            third_line,
+            "[00:06-00:08] Return to a confident slight-angle pose and lightly adjust the shirt, pants, hemline, or accessories so the ending still emphasizes the whole outfit."
+        ]
+
+    motion_block = "\n\n".join(motion_lines)
     prompt = f"""9:16 vertical video, single continuous mirror-selfie shot, no cuts. {avatar} stands before a full-length mirror in a luxury penthouse at night, holding a smartphone at face level in the right hand. The phone partially covers the face the entire video. The subject wears {outfit}, {shoes}, a thick gold Cuban link chain, gold luxury watch, and gold rings. Behind the subject: floor-to-ceiling glass, illuminated blue infinity pool, city skyline, palm trees, night sky, warm recessed lighting, polished tile floor.
 
-[00:00-00:02] Standing centered in mirror, full body head-to-toe, legs shoulder-width, upright and still. Outfit clearly displayed from front. Gentle handheld sway.
-
-[00:02-00:04] Shift weight to one side. Free hand lightly touches the shirt, pants, or key garment area so the clothing remains the focus. Slight quarter-turn showing the outfit at an angle. Phone stays at face level covering the face.
-
-[00:04-00:06] Step back for a wider full-body view, shift between legs and turn to show the outfit from the side. If the outfit has a notable back design, rotate enough to hint at the back while keeping the mirror-selfie pose natural. Full outfit remains visible head-to-toe.
-
-[00:06-00:08] Return to a centered confident pose at a slight angle and lightly adjust the hemline, shirt, pants, or accessories so the ending feels natural. Keep the full outfit visible and end calmly without freezing.
+{motion_block}
 
 Preserve the exact avatar identity, outfit colors/pattern/fit, shoes, penthouse environment and lighting from the approved start image. One person only. No animals. No voiceover, on-screen text, captions, subtitles, watermarks, music or sound. Photorealistic iPhone UGC realism."""
     prompt = re.sub(r"\s+", " ", prompt).strip()
@@ -5005,12 +5081,15 @@ Preserve the exact avatar identity, outfit colors/pattern/fit, shoes, penthouse 
     if len(prompt) >= 1900:
         avatar = avatar[:110]
         outfit = outfit[:220]
-        prompt = f"""9:16 vertical, single continuous mirror-selfie shot, no cuts. {avatar} stands before a full-length mirror in a luxury penthouse at night, holding a phone at face level so it partially covers the face throughout. Wearing {outfit}, {shoes}, thick gold Cuban link chain, gold watch, gold rings. Behind: floor-to-ceiling glass, illuminated blue infinity pool, city skyline, palm trees, warm recessed lights, polished tile.
-[00:00-00:02] Full body head-to-toe, front view, upright and still, gentle handheld sway.
-[00:02-00:04] Shift weight and have the free hand touch the most important garment area, with a slight quarter-turn. Phone remains at face level.
-[00:04-00:06] Step back, wider full-body view, turn to show the outfit from the side and hint at the back if needed, casual free-arm gesture.
-[00:06-00:08] Return to a confident slight-angle pose and lightly adjust the shirt, pants, watch, chain, or hemline. End calmly, no freeze.
-Preserve exact identity, outfit, shoes, setting and lighting from the approved start image. One person only. No animals. No voiceover, text, captions, subtitles, watermarks, music or sound. Photorealistic iPhone UGC."""
+        if pose_focus == "pants":
+            short_block = "[00:00-00:02] Full-body front view, pants fully visible. [00:02-00:04] Shift weight and touch or gesture to waistband, thigh, or pant leg. [00:04-00:06] Step back and angle body to show side fit of the pants. [00:06-00:08] End in a slight-angle stance still emphasizing the pants."
+        elif pose_focus == "shirt":
+            short_block = "[00:00-00:02] Front-facing mirror pose, shirt clearly visible. [00:02-00:04] Shift weight and touch chest, collar, hem, or sleeve to show the shirt. [00:04-00:06] Turn enough to show the shirt from the side" + (" and hint at the back design." if back_design_visible else ".") + " [00:06-00:08] End in a slight-angle pose still emphasizing the shirt."
+        elif pose_focus == "shoes":
+            short_block = "[00:00-00:02] Full-body mirror pose with one foot slightly forward. [00:02-00:04] Shift weight to emphasize the shoes. [00:04-00:06] Step back and show the shoes from the side and front. [00:06-00:08] End with one foot forward, still emphasizing the shoes."
+        else:
+            short_block = "[00:00-00:02] Full-body front view, whole outfit clearly shown. [00:02-00:04] Shift weight and gesture across the top and lower outfit area. [00:04-00:06] Step back and turn to show the whole outfit from the side" + (" and hint at the back design." if back_design_visible else ".") + " [00:06-00:08] End in a slight-angle pose still emphasizing the full outfit."
+        prompt = f"""9:16 vertical, single continuous mirror-selfie shot, no cuts. {avatar} stands before a full-length mirror in a luxury penthouse at night, holding a phone at face level so it partially covers the face throughout. Wearing {outfit}, {shoes}, thick gold Cuban link chain, gold watch, gold rings. Behind: floor-to-ceiling glass, illuminated blue infinity pool, city skyline, palm trees, warm recessed lights, polished tile. {short_block} Preserve exact identity, outfit, shoes, setting and lighting from the approved start image. One person only. No animals. No voiceover, text, captions, subtitles, watermarks, music or sound. Photorealistic iPhone UGC."""
         prompt = re.sub(r"\s+", " ", prompt).strip()
     return prompt[:1899]
 
@@ -5737,16 +5816,23 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
     if bottom_fallback:
         st.caption(f"Only a top was detected, so the image skill will pair it with: **{bottom_fallback}**")
 
+    pose_focus = analysis.get("pose_focus", "outfit")
+    back_design_visible = bool(analysis.get("back_design_visible", False))
+
     image_prompt = build_avatar_outfit_image_prompt(
         avatar_description=avatar_desc,
         outfit_description=outfit_desc,
         shoes_description=shoes_desc,
         bottom_fallback=bottom_fallback,
+        pose_focus=pose_focus,
+        back_design_visible=back_design_visible,
     )
     kling_prompt = build_avatar_outfit_kling_prompt(
         avatar_description=avatar_desc,
         outfit_description=outfit_desc,
         shoes_description=shoes_desc,
+        pose_focus=pose_focus,
+        back_design_visible=back_design_visible,
     )
 
     with st.expander("📋 Skill prompts", expanded=False):
