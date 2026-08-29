@@ -1506,6 +1506,10 @@ def lifestyle_images_zip_bytes(generations: list[dict]) -> tuple[bytes | None, i
 
 # ── Constants ───────────────────────────────────────────────────────
 MAGNIFIC_MCP_URL = "https://mcp.magnific.com"
+SOCIAVAULT_BASE_URL = "https://api.sociavault.com/v1"
+SOCIAVAULT_PRODUCT_DETAILS_URL = f"{SOCIAVAULT_BASE_URL}/scrape/tiktok-shop/product-details"
+SOCIAVAULT_PRODUCT_REVIEWS_URL = f"{SOCIAVAULT_BASE_URL}/scrape/tiktok-shop/product-reviews"
+SOCIAVAULT_REGION_DEFAULT = "US"
 XAI_IMAGE_API_URL = "https://api.x.ai/v1/images/edits"
 LIFESTYLE_MAGNIFIC_IMAGE_MODEL = "grok-imagine-image-quality"
 LIFESTYLE_MAGNIFIC_IMAGE_MODEL = "nano_banana_2"
@@ -2967,142 +2971,313 @@ def _best_product_name(candidates):
     return cleaned[0][:100]
 
 
-def scrape_product(url: str, api_key: str = "") -> dict | None:
+def _sv_values(value) -> list:
+    """Normalize SociaVault arrays, which may arrive as lists or numeric-key dictionaries."""
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        return list(value.values())
+    return []
+
+
+def _sv_first_url(value) -> str:
+    """Return the best full-size URL from a SociaVault image/media object."""
+    if isinstance(value, str):
+        return value.strip() if value.startswith(("http://", "https://")) else ""
+    if not isinstance(value, dict):
+        return ""
+
+    # Prefer original/full-resolution URL collections before thumbnail fields.
+    for key in ("url_list", "urlList", "urls", "review_images", "reviewImages"):
+        for candidate in _sv_values(value.get(key)):
+            url = _sv_first_url(candidate)
+            if url:
+                return url
+
+    for key in (
+        "url", "image_url", "imageUrl", "display_image_url", "displayImageUrl",
+        "original_url", "originalUrl", "preview_url", "previewUrl",
+    ):
+        url = _sv_first_url(value.get(key))
+        if url:
+            return url
+
+    # Last resort: use thumbnail collection when no full-size field exists.
+    for key in ("thumb_url_list", "thumbUrlList", "thumbnail_url", "thumbnailUrl"):
+        url = _sv_first_url(value.get(key))
+        if url:
+            return url
+    return ""
+
+
+def _sv_collect_media_urls(value, max_depth: int = 7) -> list[str]:
+    """Collect image URLs from a SociaVault media subtree without pulling avatars/UI images."""
+    urls: list[str] = []
+
+    def add(url: str):
+        url = str(url or "").strip()
+        if url.startswith(("http://", "https://")) and url not in urls:
+            urls.append(url)
+
+    def walk(node, depth=0, path=()):
+        if depth > max_depth:
+            return
+        if isinstance(node, str):
+            path_text = " ".join(path).lower()
+            if node.startswith(("http://", "https://")) and not any(
+                bad in path_text for bad in ("avatar", "profile", "seller", "shop_logo", "icon")
+            ):
+                add(node)
+            return
+        if isinstance(node, list):
+            for item in node:
+                walk(item, depth + 1, path)
+            return
+        if isinstance(node, dict):
+            # Image objects usually expose url_list; grab one best full-size URL instead of every CDN duplicate.
+            best = _sv_first_url(node)
+            path_text = " ".join(path).lower()
+            if best and not any(bad in path_text for bad in ("avatar", "profile", "seller", "shop_logo", "icon")):
+                add(best)
+            for key, child in node.items():
+                key_text = str(key).lower()
+                if key_text in {"url_list", "urllist", "thumb_url_list", "thumburllist"} and best:
+                    continue
+                walk(child, depth + 1, path + (key_text,))
+
+    walk(value)
+    return urls
+
+
+def _sv_flatten_specifications(value) -> list[str]:
+    """Create compact readable specification lines for later prompt/product context."""
+    lines: list[str] = []
+    for item in _sv_values(value):
+        if not isinstance(item, dict):
+            continue
+        name = str(
+            item.get("name") or item.get("label") or item.get("spec_name")
+            or item.get("specName") or item.get("key") or ""
+        ).strip()
+        raw_value = (
+            item.get("value") or item.get("text") or item.get("spec_value")
+            or item.get("specValue") or item.get("values")
+        )
+        if isinstance(raw_value, (list, dict)):
+            vals = []
+            for part in _sv_values(raw_value):
+                if isinstance(part, dict):
+                    part = part.get("name") or part.get("value") or part.get("text")
+                if part not in (None, ""):
+                    vals.append(str(part).strip())
+            value_text = ", ".join(v for v in vals if v)
+        else:
+            value_text = str(raw_value or "").strip()
+        line = f"{name}: {value_text}".strip(": ")
+        if line and line not in lines:
+            lines.append(line)
+    return lines[:40]
+
+
+def _sv_description_text(product_base: dict) -> str:
+    """Extract useful text from SociaVault's rich product description without pricing/stock noise."""
+    desc = product_base.get("desc_detailv3") or product_base.get("description") or ""
+    parts: list[str] = []
+
+    def walk(node, depth=0):
+        if depth > 8:
+            return
+        if isinstance(node, str):
+            cleaned = re.sub(r"\\s+", " ", html_unescape(node)).strip()
+            if 3 <= len(cleaned) <= 1000 and not cleaned.startswith(("http://", "https://")):
+                if cleaned not in parts:
+                    parts.append(cleaned)
+            return
+        if isinstance(node, list):
+            for child in node:
+                walk(child, depth + 1)
+        elif isinstance(node, dict):
+            for key, child in node.items():
+                if str(key).lower() in {"url", "uri", "url_list", "thumb_url_list", "image"}:
+                    continue
+                walk(child, depth + 1)
+
+    walk(desc)
+    return " ".join(parts)[:4000]
+
+
+def _sociavault_request(endpoint: str, api_key: str, params: dict) -> tuple[dict | None, str | None]:
+    """Call SociaVault and normalize its {success,data} envelope."""
+    if not api_key:
+        return None, "SociaVault API key is missing."
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
-        resp.raise_for_status()
-        html = resp.text
-
-        # og:image
-        img_match = re.search(
-            r'<meta\s+(?:property|name)=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
-            html, re.IGNORECASE
+        response = requests.get(
+            endpoint,
+            headers={"X-API-Key": api_key, "Accept": "application/json"},
+            params=params,
+            timeout=90,
         )
-        if not img_match:
-            img_match = re.search(
-                r'content=["\']([^"\']+)["\']\s+(?:property|name)=["\']og:image["\']',
-                html, re.IGNORECASE
-            )
+        try:
+            payload = response.json()
+        except Exception:
+            payload = None
+        if response.status_code >= 400:
+            detail = ""
+            if isinstance(payload, dict):
+                detail = str(payload.get("message") or payload.get("error") or payload.get("detail") or "")
+            return None, f"SociaVault HTTP {response.status_code}" + (f": {detail[:500]}" if detail else "")
+        if not isinstance(payload, dict):
+            return None, "SociaVault returned a non-JSON response."
+        if payload.get("success") is False:
+            return None, str(payload.get("message") or payload.get("error") or "SociaVault request failed.")
+        data = payload.get("data", payload)
+        if not isinstance(data, dict):
+            return None, "SociaVault response did not contain product data."
+        if data.get("success") is False:
+            return None, str(data.get("message") or data.get("error") or "SociaVault could not import this product.")
+        return data, None
+    except requests.Timeout:
+        return None, "SociaVault timed out while importing the product."
+    except Exception as exc:
+        return None, f"SociaVault request failed: {exc}"
 
-        meta_name_candidates, meta_url_candidates = _extract_meta_candidates(html)
 
-        listing_images = []
-        review_images = []
-        name_candidates = list(meta_name_candidates)
-        name_candidates.extend(_extract_raw_title_candidates(html))
-        if img_match:
-            listing_images.append(img_match.group(1))
+def scrape_product(url: str, api_key: str = "", socialvault_api_key: str = "") -> dict | None:
+    """Import a TikTok Shop product through SociaVault instead of scraping TikTok HTML directly.
 
-        # JSON-LD normally contains official listing images.
-        ld_blocks = re.findall(
-            r'<script\s+type=["\']application/ld\+json["\']>\s*(.*?)\s*</script>',
-            html, re.DOTALL | re.IGNORECASE
-        )
-        for block in ld_blocks:
-            try:
-                ld = json.loads(html_unescape(block))
-                name_candidates.extend(_find_product_names_in_dict(ld))
-                ld_listing, ld_review = _collect_categorized_images(ld)
-                listing_images.extend(ld_listing)
-                review_images.extend(ld_review)
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-        # Parse all hydration/application JSON payloads. TikTok often places review media
-        # in these blocks even when it is not visible in the initial HTML markup.
-        json_blocks = re.findall(
-            r'<script[^>]*type=["\']application/json["\'][^>]*>\s*(.*?)\s*</script>',
-            html, re.DOTALL | re.IGNORECASE
-        )
-        for block in json_blocks:
-            try:
-                payload = json.loads(html_unescape(block))
-            except (json.JSONDecodeError, TypeError):
-                continue
-            name_candidates.extend(_find_product_names_in_dict(payload))
-            payload_listing, payload_review = _collect_categorized_images(payload)
-            listing_images.extend(payload_listing)
-            review_images.extend(payload_review)
-
-        # Image URLs in raw HTML. Nearby review-related text determines the bucket.
-        raw_image_pattern = re.compile(
-            r'https?://[^"\'\s<>]+(?:\.jpg|\.jpeg|\.png|\.webp|\.avif)(?:\?[^"\'\s<>]*)?',
-            re.IGNORECASE,
-        )
-        for match in raw_image_pattern.finditer(html):
-            image_url = match.group(0)
-            context = html[max(0, match.start() - 450): min(len(html), match.end() + 450)].lower()
-            if any(token in context for token in REVIEW_IMAGE_HINTS):
-                review_images.append(image_url)
-            elif any(token in image_url.lower() for token in ("product", "pdp", "origin", "large", "800", "1000", "1200")):
-                listing_images.append(image_url)
-
-        listing_images = _dedupe_image_urls(listing_images)
-        review_images = _dedupe_image_urls(review_images)
-
-        # Do not repeat official listing images inside the review-photo section.
-        listing_set = set(listing_images)
-        review_images = [image for image in review_images if image not in listing_set]
-
-        if not listing_images and review_images:
-            # A review photo can still be used as the primary reference if that is all TikTok exposes.
-            listing_images = [review_images[0]]
-
-        all_images = _dedupe_image_urls(listing_images + review_images)
-        if not all_images:
-            return None
-
-        name = _best_product_name(name_candidates)
-        name_source = "page_metadata" if name else ""
-        if not name or name == "Unknown Product":
-            # Slug-based PDP and short-share redirects can still expose a readable name.
-            fallback_urls = [resp.url] + meta_url_candidates + [url]
-            for fallback_url in fallback_urls:
-                candidate_name = _name_from_url(fallback_url)
-                if candidate_name and candidate_name != "Unknown Product":
-                    name = candidate_name
-                    name_source = "url_slug"
-                    break
-
-        product_id = _product_id_from_url(resp.url) or _product_id_from_url(url)
-        if (not name or name == "Unknown Product") and api_key:
-            recovered_name = recover_product_name_with_page_context(
-                api_key=api_key,
-                html=html,
-                image_urls=all_images,
-                page_url=resp.url,
-                product_id=product_id,
-            )
-            if recovered_name:
-                name = recovered_name
-                name_source = "page_context_fallback"
-
-        if (not name or name == "Unknown Product") and api_key:
-            recovered_name = recover_product_name_from_images(
-                api_key=api_key,
-                image_urls=all_images,
-                product_id=product_id,
-            )
-            if recovered_name:
-                name = recovered_name
-                name_source = "image_fallback"
-
-        if not name:
-            name = "Unknown Product"
-            name_source = "unresolved"
-
-        return {
-            "name": name[:100],
-            "name_source": name_source,
-            "product_id": product_id,
-            "images": all_images[:36],
-            "listing_images": listing_images[:18],
-            "review_images": review_images[:24],
-            "source_url": url,
-        }
-
-    except Exception:
+    The legacy ``api_key`` argument is kept so existing call sites remain compatible; it is
+    no longer used for product scraping. SociaVault supplies the title, official listing
+    images, product metadata, and review/customer images in structured JSON.
+    """
+    _ = api_key  # Backward-compatible argument; Claude is no longer involved in importing products.
+    product_url = str(url or "").strip()
+    if not product_url:
         return None
+
+    sv_key = str(socialvault_api_key or "").strip()
+    if not sv_key:
+        try:
+            sv_key = str(st.session_state.get("runtime_sociavault_api_key", "") or "").strip()
+        except Exception:
+            sv_key = ""
+    if not sv_key:
+        try:
+            sv_key = str(get_secret("SOCIAVAULT_API_KEY") or "").strip()
+        except Exception:
+            sv_key = str(os.environ.get("SOCIAVAULT_API_KEY", "") or "").strip()
+
+    region = ""
+    try:
+        region = str(get_secret("SOCIAVAULT_REGION") or "").strip().upper()
+    except Exception:
+        region = str(os.environ.get("SOCIAVAULT_REGION", "") or "").strip().upper()
+    region = region or SOCIAVAULT_REGION_DEFAULT
+
+    data, error = _sociavault_request(
+        SOCIAVAULT_PRODUCT_DETAILS_URL,
+        sv_key,
+        {"url": product_url, "get_related_videos": "false", "region": region},
+    )
+    if error or not data:
+        try:
+            st.session_state["last_sociavault_error"] = error or "SociaVault returned no product data."
+        except Exception:
+            pass
+        return None
+
+    product_base = data.get("product_base") or data.get("product") or {}
+    if not isinstance(product_base, dict):
+        product_base = {}
+
+    product_id = str(data.get("product_id") or product_base.get("id") or _product_id_from_url(product_url) or "").strip()
+    name = _clean_product_name_candidate(product_base.get("title") or product_base.get("name") or "")
+    if not name:
+        name = _name_from_url(product_url)
+    if not name:
+        name = "Unknown Product"
+
+    listing_images: list[str] = []
+    for image in _sv_values(product_base.get("images")):
+        best = _sv_first_url(image)
+        if best and best not in listing_images:
+            listing_images.append(best)
+    # Some response variants expose a share/cover image outside product_base.
+    if not listing_images:
+        for candidate in _sv_collect_media_urls(data.get("share_info") or {}):
+            if candidate not in listing_images:
+                listing_images.append(candidate)
+
+    review_images: list[str] = []
+    review_block = data.get("product_detail_review") or {}
+    review_items = _sv_values(review_block.get("review_items") if isinstance(review_block, dict) else None)
+    for item in review_items:
+        if not isinstance(item, dict):
+            continue
+        review = item.get("review") if isinstance(item.get("review"), dict) else item
+        for candidate in _sv_collect_media_urls({
+            "images": review.get("images"),
+            "media": review.get("media"),
+            "review_images": review.get("review_images"),
+            "display_image_url": review.get("display_image_url"),
+        }):
+            if candidate not in review_images and candidate not in listing_images:
+                review_images.append(candidate)
+
+    # Product Details usually includes review visuals. Only spend a second SociaVault
+    # credit when it exposes none, using the dedicated reviews endpoint as a fallback.
+    if not review_images and product_id:
+        review_data, _review_error = _sociavault_request(
+            SOCIAVAULT_PRODUCT_REVIEWS_URL,
+            sv_key,
+            {"product_id": product_id, "page": 1},
+        )
+        if review_data:
+            review_products = review_data.get("product_reviews") or {}
+            for review in _sv_values(review_products):
+                if not isinstance(review, dict):
+                    continue
+                for candidate in _sv_collect_media_urls({
+                    "review_images": review.get("review_images"),
+                    "display_image_url": review.get("display_image_url"),
+                }):
+                    if candidate not in review_images and candidate not in listing_images:
+                        review_images.append(candidate)
+
+    listing_images = _dedupe_image_urls(listing_images)[:18]
+    review_images = [u for u in _dedupe_image_urls(review_images) if u not in set(listing_images)][:24]
+    all_images = _dedupe_image_urls(listing_images + review_images)
+    if not all_images:
+        try:
+            st.session_state["last_sociavault_error"] = "SociaVault found the product but returned no usable product images."
+        except Exception:
+            pass
+        return None
+
+    seller = data.get("seller") if isinstance(data.get("seller"), dict) else {}
+    specs = _sv_flatten_specifications(product_base.get("specifications"))
+    description = _sv_description_text(product_base)
+
+    try:
+        st.session_state.pop("last_sociavault_error", None)
+    except Exception:
+        pass
+
+    return {
+        "name": name[:180],
+        "name_source": "SociaVault product_base.title",
+        "product_id": product_id,
+        "images": all_images[:36],
+        "listing_images": listing_images,
+        "review_images": review_images,
+        "source_url": product_url,
+        "import_source": "SociaVault",
+        "seller_name": str(seller.get("name") or "").strip(),
+        "category": str(product_base.get("category_name") or "").strip(),
+        "specifications": specs,
+        "description": description,
+        "product_rating": (review_block.get("product_rating") if isinstance(review_block, dict) else None),
+        "review_count": (review_block.get("review_count") if isinstance(review_block, dict) else None),
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -4287,11 +4462,11 @@ def normalize_sniper_batch_products(
     progress_callback=None,
     api_key: str = "",
 ) -> tuple[list[dict], list[str]]:
-    """Re-scrape Sniper TikTok links with Seedance's normal scrape flow.
+    """Import Sniper TikTok links through Seedance's SociaVault product flow.
 
     This intentionally ignores transferred image URLs whenever a TikTok product
-    link is available. That gives imported products the same official listing
-    photos and review/customer photos as products pasted directly into Step 1.
+    link is available. That gives imported products the same SociaVault listing
+    title, official product photos, and review/customer photos as products pasted directly into Step 1.
     Older queue batches remain compatible because queued images are used only as
     a fallback when TikTok cannot be scraped.
     """
@@ -4335,7 +4510,7 @@ def normalize_sniper_batch_products(
                 "sniper_meta": dict(raw_product.get("sniper_meta") or {}),
                 "sniper_batch_id": batch.get("batch_id"),
                 "sniper_preset": batch.get("preset"),
-                "sniper_transfer_mode": "tiktok_link_rescrape",
+                "sniper_transfer_mode": "sociavault_product_import",
             })
             continue
 
@@ -5305,18 +5480,18 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
                 "TikTok Shop clothing link",
                 key="avatar_outfit_tiktok_link",
                 placeholder="https://www.tiktok.com/view/product/...",
-                help="Scrape official product photos and customer review photos, then select multiple references below.",
+                help="Import the product through SociaVault, then select official listing photos and customer review photos below.",
             ).strip()
             if st.button(
-                "🔎 Scrape outfit product",
+                "📦 Import outfit with SociaVault",
                 key="avatar_outfit_scrape_link_btn",
                 use_container_width=True,
                 disabled=not bool(outfit_link),
             ):
-                with st.spinner("Scraping listing and customer review photos..."):
+                with st.spinner("Importing listing and customer review photos from SociaVault..."):
                     scraped = scrape_product(outfit_link, api_key=api_key)
                 if not scraped:
-                    st.error("Could not scrape that TikTok Shop outfit link.")
+                    st.error("Could not import that TikTok Shop outfit link through SociaVault.")
                 else:
                     st.session_state["avatar_outfit_scraped_product"] = scraped
                     st.session_state["avatar_outfit_scraped_source_url"] = outfit_link
@@ -5329,7 +5504,7 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
 
             if scraped:
                 outfit_name_prefill = scraped.get("name") or ""
-                st.success(f"Scraped product: {scraped.get('name', 'Unknown Product')}")
+                st.success(f"Imported product: {scraped.get('name', 'Unknown Product')}")
                 if scraped.get("name_source"):
                     st.caption(f"Name source: {scraped.get('name_source')}")
                 product_name_manual = st.text_input(
@@ -5880,6 +6055,7 @@ def main():
     # ── Always-visible video setup ──
     api_key_from_secrets = get_secret("ANTHROPIC_API_KEY")
     token_from_secrets = get_secret("MAGNIFIC_AUTH_TOKEN")
+    socialvault_key_from_secrets = get_secret("SOCIAVAULT_API_KEY")
     xai_key_from_secrets = get_secret("XAI_API_KEY")
     director_key_from_secrets = get_secret("DIRECTOR_INGEST_KEY")
     director_url_from_secrets = get_secret("DIRECTOR_INGEST_URL") or DIRECTOR_INGEST_URL_DEFAULT
@@ -5892,6 +6068,8 @@ def main():
         st.session_state["runtime_anthropic_api_key"] = api_key_from_secrets
     if "runtime_magnific_token" not in st.session_state:
         st.session_state["runtime_magnific_token"] = token_from_secrets
+    if "runtime_sociavault_api_key" not in st.session_state:
+        st.session_state["runtime_sociavault_api_key"] = socialvault_key_from_secrets
     if "runtime_xai_api_key" not in st.session_state:
         st.session_state["runtime_xai_api_key"] = xai_key_from_secrets
     if "runtime_director_ingest_key" not in st.session_state:
@@ -5981,6 +6159,7 @@ def main():
         api_key = st.session_state.get("runtime_anthropic_api_key", "")
         magnific_token = st.session_state.get("runtime_magnific_token", "")
         xai_api_key = st.session_state.get("runtime_xai_api_key", "")
+        socialvault_api_key = st.session_state.get("runtime_sociavault_api_key", "")
         director_ingest_key = st.session_state.get("runtime_director_ingest_key", "")
         director_ingest_url = st.session_state.get("runtime_director_ingest_url", DIRECTOR_INGEST_URL_DEFAULT)
         queue_token = st.session_state.get("runtime_seedance_queue_token", "")
@@ -5996,7 +6175,10 @@ def main():
             status_col_2.success("Magnific connected")
         else:
             status_col_2.info("Magnific needed for video")
-        status_col_3.info("Nano Banana + Kling via Magnific")
+        if socialvault_api_key:
+            status_col_3.success("SociaVault connected")
+        else:
+            status_col_3.warning("SociaVault key needed")
         if director_ingest_key:
             status_col_4.success("Director connected")
         else:
@@ -6007,7 +6189,7 @@ def main():
             status_col_5.info("Sniper inbox optional")
         st.caption(f"{STYLE_LABELS[style]} · {resolved_style_duration(style, duration)}s")
 
-        required_connections_ready = bool(api_key and magnific_token)
+        required_connections_ready = bool(api_key and magnific_token and socialvault_api_key)
         with st.expander("API connection", expanded=not required_connections_ready):
             if api_key_from_secrets:
                 st.success("Anthropic API key loaded from Streamlit secrets.")
@@ -6017,6 +6199,17 @@ def main():
                     type="password",
                     value=st.session_state.get("runtime_anthropic_api_key", ""),
                     key="runtime_anthropic_api_key_input",
+                )
+
+            if socialvault_key_from_secrets:
+                st.success("SociaVault API key loaded from Streamlit secrets. Product imports use SociaVault.")
+            else:
+                st.session_state["runtime_sociavault_api_key"] = st.text_input(
+                    "SociaVault API Key",
+                    type="password",
+                    value=st.session_state.get("runtime_sociavault_api_key", ""),
+                    key="runtime_sociavault_api_key_input",
+                    help="Used for TikTok Shop product titles, official listing images, specifications, and customer review images.",
                 )
 
             if xai_key_from_secrets or st.session_state.get("runtime_xai_api_key", ""):
@@ -6084,6 +6277,7 @@ def main():
             magnific_token = st.session_state.get("runtime_magnific_token", "")
             api_key = st.session_state.get("runtime_anthropic_api_key", "")
             xai_api_key = st.session_state.get("runtime_xai_api_key", "")
+            socialvault_api_key = st.session_state.get("runtime_sociavault_api_key", "")
             director_ingest_key = st.session_state.get("runtime_director_ingest_key", "")
             director_ingest_url = st.session_state.get("runtime_director_ingest_url", DIRECTOR_INGEST_URL_DEFAULT)
             queue_token = st.session_state.get("runtime_seedance_queue_token", "")
@@ -6137,8 +6331,8 @@ def main():
             st.markdown("### 📥 Momentum Sniper Inbox")
             st.caption(
                 "Momentum Sniper sends the TikTok links and research data. When you import a batch, "
-                "Seedance re-scrapes every TikTok page using the same flow as pasted links so you get "
-                "official listing photos and customer review photos."
+                "Seedance imports every TikTok product through SociaVault using the same flow as pasted links so you get "
+                "the exact listing title, official product photos, and customer review photos."
             )
         with inbox_refresh_col:
             if st.button(
@@ -6304,7 +6498,7 @@ def main():
     # ════════════════════════════════════════════════════════════════
     #  STEP 1 — PASTE LINKS
     # ════════════════════════════════════════════════════════════════
-    st.subheader("① Paste Product Links")
+    st.subheader("① Import TikTok Shop Products")
     links_input = st.text_area(
         "One TikTok Shop URL per line",
         placeholder=(
@@ -6315,7 +6509,7 @@ def main():
         label_visibility="collapsed",
     )
 
-    scrape_btn = st.button("🔍 Scrape Product & Review Photos", use_container_width=True)
+    scrape_btn = st.button("📦 Import with SociaVault", use_container_width=True)
 
     links = [
         line.strip() for line in links_input.strip().split("\n")
@@ -6334,16 +6528,17 @@ def main():
         st.caption("Choose official listing photos, customer review photos, or both. Multiple references improve product accuracy.")
 
         scraped_products = []
-        progress = st.progress(0, text="Scraping...")
+        progress = st.progress(0, text="Importing from SociaVault...")
 
         for i, url in enumerate(links):
-            progress.progress(i / len(links), text=f"Scraping {i+1}/{len(links)}...")
+            progress.progress(i / len(links), text=f"Importing {i+1}/{len(links)} with SociaVault...")
             scraped = scrape_product(url, api_key=api_key)
 
             if scraped and scraped["images"]:
                 scraped_products.append(scraped)
             else:
-                st.error(f"❌ Couldn't scrape: {url[:70]}...")
+                sv_error = st.session_state.get("last_sociavault_error", "")
+                st.error(f"❌ Couldn't import: {url[:70]}..." + (f" — {sv_error}" if sv_error else ""))
 
         progress.progress(1.0, text=f"Found {len(scraped_products)} product(s)")
 
@@ -6353,7 +6548,7 @@ def main():
             st.session_state["scraped"] = scraped_products
             st.session_state["product_hooks"] = {}
         else:
-            st.error("No products could be scraped. Check your links.")
+            st.error("No products could be imported. Check your SociaVault key and TikTok Shop links.")
 
     # ── Show image selection if we have scraped data (doesn't block the rest of the page) ──
     if "scraped" in st.session_state:
