@@ -5019,18 +5019,18 @@ Preserve exact identity, outfit, shoes, setting and lighting from the approved s
 
 AVATAR_OUTFIT_IMAGE_GENERATE_SYSTEM = """You are an image production assistant with access to Magnific tools.
 Use the same Magnific MCP account already configured in the app.
+This is a dependent MULTI-STEP MCP workflow. The task is NOT complete after uploading the references.
 1. Upload EVERY provided reference image to Magnific using creations_upload_image.
-2. Reference image 1 is the avatar/identity reference. Preserve this exact person's appearance and identity.
-3. Reference images 2+ are outfit/clothing references from official listing photos and/or customer review photos.
-4. Use ALL provided outfit references together for clothing accuracy: garment type, colors, pattern, fit, silhouette, fabric, details, and styling.
-5. Generate EXACTLY ONE final mirror-selfie try-on image.
-6. You MUST use model slug gpt_image_2.
-7. You MUST use quality high.
-8. You MUST use resolution 2k.
-9. You MUST use aspect ratio 9:16.
-10. Do not use GPT Image 1, Nano Banana, Grok, Auto, or any default fallback image model.
-11. Submit the generation ONCE and return immediately after you receive the creation identifier. DO NOT call creations_get, DO NOT poll, and DO NOT wait for the image to finish.
-12. Return ONLY valid JSON (no markdown): {"creation_id":"the magnific creation identifier","status":"queued","url":null,"preview_url":null,"error":null}
+2. After the uploads succeed, CONTINUE in the same workflow and call images_generate. Do not stop to narrate after upload.
+3. Reference image 1 is the avatar/identity reference. Preserve this exact person's appearance and identity.
+4. Reference images 2+ are outfit/clothing references from official listing photos and/or customer review photos.
+5. Use ALL provided outfit references together for clothing accuracy: garment type, colors, pattern, fit, silhouette, fabric, details, and styling.
+6. Generate EXACTLY ONE final mirror-selfie try-on image.
+7. Use the requested image model/settings already specified by the task: model slug gpt_image_2, quality high, resolution 2k, aspect ratio 9:16.
+8. Do not use GPT Image 1, Nano Banana, Grok, Auto, or any default fallback image model.
+9. Submit the generation ONCE and return immediately after you receive the REAL Magnific creation identifier. DO NOT call creations_get, DO NOT poll, and DO NOT wait for the image to finish.
+10. Never treat a successful upload identifier as the final generated-image identifier.
+11. Return ONLY valid JSON (no markdown): {"creation_id":"the magnific creation identifier","status":"queued","url":null,"preview_url":null,"error":null}
 """
 
 
@@ -5041,7 +5041,7 @@ def generate_avatar_outfit_image_magnific(
     outfit_references: list[str],
     prompt: str,
 ) -> dict:
-    """Use Magnific GPT Image 2 High at 2K with one avatar plus multiple outfit references."""
+    """Use Magnific for one avatar + multiple outfit refs, continuing upload -> images_generate across MCP turns."""
     if not api_key:
         return {"creation_id": None, "status": "error", "error": "The Anthropic API key is missing."}
     if not magnific_token:
@@ -5052,7 +5052,6 @@ def generate_avatar_outfit_image_magnific(
     if not avatar_reference or not outfit_references:
         return {"creation_id": None, "status": "error", "error": "Choose an avatar and at least one outfit reference."}
 
-    # Keep the MCP payload compact while still preserving multi-reference support.
     original_outfit_count = len(outfit_references)
     outfit_references = outfit_references[:5]
     avatar_reference, outfit_references, payload_omitted = _trim_magnific_reference_payload(
@@ -5080,28 +5079,46 @@ def generate_avatar_outfit_image_magnific(
 
     try:
         client = anthropic.Anthropic(api_key=api_key)
-        response = client.beta.messages.create(
-            model=MODEL,
-            max_tokens=2048,
+        result = _run_magnific_mcp_sequence(
+            client=client,
             system=AVATAR_OUTFIT_IMAGE_GENERATE_SYSTEM,
-            messages=[{
-                "role": "user",
-                "content": (
-                    "Generate one Avatar Outfit mirror-selfie try-on image.\n"
-                    "Required Magnific settings: model slug = gpt_image_2, quality = high, resolution = 2k, aspect ratio = 9:16.\n"
-                    "Use all supplied reference images together. Reference image 1 is the avatar identity to preserve exactly. "
-                    "Reference images 2+ are outfit / clothing / shoe references from official listing images and customer reviews.\n"
-                    "Upload every provided reference to Magnific using creations_upload_image, then generate the final image.\n"
-                    "Submit the generation exactly once and return as soon as you receive the real Magnific creation ID. Do not poll.\n\n"
-                    f"{refs_text}\n\n"
-                    f"Final image prompt:\n{prompt}"
-                ),
-            }],
+            initial_content=(
+                "Generate one Avatar Outfit mirror-selfie try-on image.\n"
+                "This is a multi-step Magnific task: upload ALL references first, then CONTINUE to images_generate. "
+                "Do not stop after uploading and do not repeat successful uploads.\n"
+                "Required Magnific settings: model slug = gpt_image_2, quality = high, resolution = 2k, aspect ratio = 9:16.\n"
+                "Reference image 1 is the avatar identity to preserve exactly. Reference images 2+ are outfit / clothing / shoe references.\n"
+                "Submit exactly ONE final image generation and stop only after Magnific returns the REAL generated-image creation ID. Do not poll.\n\n"
+                f"{refs_text}\n\n"
+                f"Final image prompt:\n{prompt}"
+            ),
             mcp_servers=mcp_servers,
-            tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
-            betas=[MCP_BETA],
+            max_turns=8,
+            continuation_instruction=(
+                "Continue the SAME Avatar Outfit image task now. Do NOT repeat any successful reference uploads. "
+                "Use the uploaded reference identifiers/results from the previous MCP steps as the references for images_generate. "
+                "Reference 1 is the avatar identity and references 2+ are outfit references. Generate exactly ONE 9:16, 2k, high-quality image "
+                "with the requested gpt_image_2 model. Stop only after images_generate returns the REAL generated-image creation/task ID. "
+                "Do not call creations_get and do not poll."
+            ),
         )
-        result = _parse_magnific_creation_response(response)
+
+        creation_id = result.get("creation_id")
+        if not _is_real_magnific_creation_id(creation_id):
+            if result.get("error"):
+                return result
+            return {
+                "creation_id": None,
+                "status": "error",
+                "url": None,
+                "preview_url": None,
+                "error": "Magnific MCP did not return a real generated-image creation ID, so the Avatar Outfit image was not confirmed as submitted.",
+                "mcp_tools_called": result.get("mcp_tools_called", []),
+            }
+
+        if not (result.get("url") or result.get("preview_url")):
+            result["status"] = "queued"
+        result["error"] = None
         result["provider"] = "Magnific"
         result["image_model"] = "gpt_image_2"
         result["image_quality"] = "high"
