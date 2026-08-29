@@ -6,10 +6,7 @@ generate videos automatically OR get prompts to generate manually.
 """
 
 import streamlit as st
-try:
-    import anthropic
-except Exception:
-    anthropic = None
+import anthropic
 import base64
 import csv
 import hashlib
@@ -1509,7 +1506,6 @@ def lifestyle_images_zip_bytes(generations: list[dict]) -> tuple[bytes | None, i
 
 # ── Constants ───────────────────────────────────────────────────────
 MAGNIFIC_MCP_URL = "https://mcp.magnific.com"
-MAGNIFIC_LEGACY_OAUTH_MCP_URL = "https://mcp.magnific.com"
 XAI_IMAGE_API_URL = "https://api.x.ai/v1/images/edits"
 LIFESTYLE_MAGNIFIC_IMAGE_MODEL = "grok-imagine-image-quality"
 LIFESTYLE_MAGNIFIC_IMAGE_MODEL = "nano_banana_2"
@@ -1518,10 +1514,8 @@ DIRECTOR_INGEST_URL_DEFAULT = "https://app.momentumacademy.co/api/director/inges
 SEEDANCE_QUEUE_SCHEMA = "momentum.seedance.batch.v1"
 SEEDANCE_QUEUE_PATH_DEFAULT = "seedance_inbox"
 MAGNIFIC_MCP_NAME = "magnific"
-MODEL = "gpt-4o-mini"
-MAGNIFIC_MCP_MODEL = "claude-haiku-4-5-20251001"
+MODEL = "claude-haiku-4-5-20251001"
 MCP_BETA = "mcp-client-2025-11-20"
-OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 
 HEADERS = {
     "User-Agent": (
@@ -1532,986 +1526,6 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-
-
-
-def _openai_output_text(payload: dict) -> str:
-    """Collect assistant output text from an OpenAI Responses API payload."""
-    if not isinstance(payload, dict):
-        return ""
-    # Future-/SDK-compatible convenience field if present.
-    direct = payload.get("output_text")
-    if isinstance(direct, str) and direct.strip():
-        return direct.strip()
-    parts = []
-    for item in payload.get("output", []) or []:
-        if not isinstance(item, dict) or item.get("type") != "message":
-            continue
-        for content in item.get("content", []) or []:
-            if not isinstance(content, dict):
-                continue
-            if content.get("type") == "output_text" and content.get("text"):
-                parts.append(str(content.get("text")))
-            elif content.get("type") == "refusal" and content.get("refusal"):
-                parts.append(str(content.get("refusal")))
-    return "\n".join(parts).strip()
-
-
-def _openai_request(api_key: str, *, instructions: str, input_content, max_output_tokens: int = 800, tools=None, tool_choice=None, json_mode: bool = False) -> dict:
-    """Call the low-cost OpenAI Responses API with one automatic max-token retry."""
-    if not api_key:
-        return {"error": {"message": "OpenAI API key is missing."}}
-
-    requested_tokens = max(256, int(max_output_tokens))
-
-    def make_payload(token_limit: int) -> dict:
-        payload = {
-            "model": MODEL,
-            "instructions": instructions,
-            "input": input_content,
-            "max_output_tokens": token_limit,
-            "store": False,
-            "text": ({"format": {"type": "json_object"}} if json_mode else {"format": {"type": "text"}}),
-        }
-        if tools:
-            payload["tools"] = tools
-        if tool_choice is not None:
-            payload["tool_choice"] = tool_choice
-        return payload
-
-    try:
-        for attempt, token_limit in enumerate((requested_tokens, max(1600, requested_tokens * 2))):
-            response = requests.post(
-                OPENAI_RESPONSES_URL,
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json=make_payload(token_limit),
-                timeout=180,
-            )
-            if not response.ok:
-                try:
-                    detail = response.json()
-                except Exception:
-                    detail = {"message": response.text[:1500]}
-                return {"error": {"message": f"OpenAI API {response.status_code}: {detail}"}}
-
-            data = response.json()
-            status = str(data.get("status") or "").lower()
-            incomplete = data.get("incomplete_details") or {}
-            reason = str(incomplete.get("reason") or "").lower()
-
-            # A truncated structured response is safe to retry once with more output room.
-            if status == "incomplete" and reason in {"max_output_tokens", "max_tokens"} and attempt == 0:
-                continue
-            return data
-
-        return data
-    except Exception as exc:
-        return {"error": {"message": f"OpenAI API request failed: {exc}"}}
-
-
-def _openai_json_text(api_key: str, *, instructions: str, user_text: str, max_output_tokens: int = 1000) -> dict:
-    payload = _openai_request(
-        api_key,
-        instructions=instructions,
-        input_content=[{"role": "user", "content": [{"type": "input_text", "text": user_text}]}],
-        max_output_tokens=max_output_tokens,
-        json_mode=True,
-    )
-    if payload.get("error"):
-        return {"error": payload["error"].get("message", str(payload["error"]))}
-    raw = _openai_output_text(payload)
-    parsed = _extract_json_object(raw)
-    if isinstance(parsed, dict):
-        return parsed
-    # This should be extremely rare with JSON mode, but surface useful diagnostics.
-    status = str(payload.get("status") or "unknown")
-    incomplete = payload.get("incomplete_details") or {}
-    return {"error": f"OpenAI returned no parseable JSON (status: {status}, reason: {incomplete.get('reason') or 'n/a'}).", "raw": raw, "incomplete_details": incomplete}
-
-
-def _openai_vision_json(api_key: str, *, instructions: str, content: list[dict], max_output_tokens: int = 1200) -> dict:
-    normalized = []
-    for item in content:
-        if not isinstance(item, dict):
-            continue
-        item_type = item.get("type")
-        if item_type in {"input_text", "input_image"}:
-            normalized.append(item)
-        elif item_type == "text":
-            normalized.append({"type": "input_text", "text": str(item.get("text") or "")})
-        elif item_type == "image":
-            source = item.get("source") or {}
-            if source.get("type") == "base64" and source.get("data"):
-                media_type = source.get("media_type") or "image/jpeg"
-                normalized.append({
-                    "type": "input_image",
-                    "image_url": f"data:{media_type};base64,{source['data']}",
-                    "detail": "low",
-                })
-    payload = _openai_request(
-        api_key,
-        instructions=instructions,
-        input_content=[{"role": "user", "content": normalized}],
-        max_output_tokens=max_output_tokens,
-        json_mode=True,
-    )
-    if payload.get("error"):
-        return {"error": payload["error"].get("message", str(payload["error"]))}
-    raw = _openai_output_text(payload)
-    parsed = _extract_json_object(raw)
-    if isinstance(parsed, dict):
-        return parsed
-    status = str(payload.get("status") or "unknown")
-    incomplete = payload.get("incomplete_details") or {}
-    return {"error": f"OpenAI returned no parseable JSON (status: {status}, reason: {incomplete.get('reason') or 'n/a'}).", "raw": raw, "incomplete_details": incomplete}
-
-
-def _absorb_openai_magnific_payload(value, result: dict) -> None:
-    """Extract Magnific IDs, status and output URLs from MCP tool output."""
-    status_aliases = {
-        "created": "queued", "submitted": "queued", "pending": "queued",
-        "running": "processing", "succeeded": "completed", "success": "completed",
-        "done": "completed", "finished": "completed", "failed": "error", "failure": "error",
-    }
-    url_candidates = []
-
-    def walk(node, path=()):
-        if isinstance(node, dict):
-            for key in ("identifier", "creation_id", "creationId", "task_id", "taskId", "generation_id", "generationId", "job_id", "jobId"):
-                candidate = node.get(key)
-                if candidate and not result.get("creation_id"):
-                    result["creation_id"] = str(candidate)
-                    break
-            for key in ("status", "state", "creation_status", "creationStatus"):
-                candidate = node.get(key)
-                if isinstance(candidate, str) and candidate.strip():
-                    normalized = candidate.strip().lower()
-                    result["status"] = status_aliases.get(normalized, normalized)
-                    break
-            for key, child in node.items():
-                key_lower = str(key).lower()
-                child_path = path + (key_lower,)
-                if isinstance(child, str) and child.startswith(("http://", "https://")):
-                    path_text = " ".join(child_path)
-                    score = 0
-                    is_preview = "preview" in path_text
-                    if any(t in key_lower for t in ("video_url", "videourl", "image_url", "imageurl", "download_url", "downloadurl")):
-                        score += 130
-                    elif any(t in key_lower for t in ("output", "result", "media", "url")):
-                        score += 85
-                    if any(t in path_text for t in ("output", "result", "generated", "video", "image", "media", "download")):
-                        score += 30
-                    if any(t in path_text for t in ("input", "reference", "source", "upload")):
-                        score -= 90
-                    url_candidates.append((score, is_preview, child))
-                walk(child, child_path)
-        elif isinstance(node, list):
-            for idx, child in enumerate(node):
-                walk(child, path + (str(idx),))
-
-    walk(value)
-    if url_candidates:
-        url_candidates.sort(key=lambda x: x[0], reverse=True)
-        for _score, is_preview, url in url_candidates:
-            if is_preview and not result.get("preview_url"):
-                result["preview_url"] = url
-            elif not is_preview and not result.get("url"):
-                result["url"] = url
-        if not result.get("url"):
-            result["url"] = url_candidates[0][2]
-
-
-
-def _mcp_http_json(response) -> dict:
-    """Parse a Streamable-HTTP MCP response (JSON or SSE) into one JSON-RPC object."""
-    raw = response.text or ""
-    ctype = (response.headers.get("content-type") or "").lower()
-    if "application/json" in ctype:
-        try:
-            data = response.json()
-            return data if isinstance(data, dict) else {"result": data}
-        except Exception:
-            pass
-
-    events = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line.startswith("data:"):
-            continue
-        payload = line[5:].strip()
-        if not payload or payload == "[DONE]":
-            continue
-        try:
-            obj = json.loads(payload)
-            if isinstance(obj, dict):
-                events.append(obj)
-        except Exception:
-            continue
-    if events:
-        # Prefer an actual JSON-RPC result/error event over progress notifications.
-        for obj in reversed(events):
-            if "result" in obj or "error" in obj:
-                return obj
-        return events[-1]
-    try:
-        data = json.loads(raw)
-        return data if isinstance(data, dict) else {"result": data}
-    except Exception:
-        return {"error": {"message": raw[:1800] or f"Magnific MCP HTTP {response.status_code}"}}
-
-
-class _MagnificDirectMCP:
-    """Minimal Streamable-HTTP client for Magnific's OAuth MCP endpoint."""
-    def __init__(self, auth_token: str):
-        token = str(auth_token or "").strip()
-        if token.lower().startswith("bearer "):
-            token = token[7:].strip()
-        self.auth_token = token
-        self.session_id = None
-        self.protocol_version = "2025-03-26"
-        self.next_id = 1
-        self.initialized = False
-
-    def _headers(self, include_protocol: bool = True) -> dict:
-        headers = {
-            "Authorization": f"Bearer {self.auth_token}",
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
-            "User-Agent": "SeedanceStudio/3.0 MCP-Client",
-        }
-        if self.session_id:
-            headers["Mcp-Session-Id"] = self.session_id
-        if include_protocol and self.initialized:
-            headers["MCP-Protocol-Version"] = self.protocol_version
-        return headers
-
-    def _post(self, payload: dict, *, include_protocol: bool = True, allow_empty: bool = False) -> dict:
-        last_exc = None
-        response = None
-        # Magnific's remote OAuth MCP can occasionally drop a TLS handshake. Retry a
-        # few times with a fresh connection before surfacing the error to the user.
-        for attempt in range(3):
-            try:
-                headers = self._headers(include_protocol=include_protocol)
-                if attempt > 0:
-                    headers["Connection"] = "close"
-                response = requests.post(
-                    MAGNIFIC_MCP_URL,
-                    headers=headers,
-                    json=payload,
-                    timeout=(20, 120),
-                )
-                break
-            except requests.exceptions.SSLError as exc:
-                last_exc = exc
-                if attempt < 2:
-                    time.sleep(0.7 * (attempt + 1))
-                    continue
-            except requests.exceptions.RequestException as exc:
-                last_exc = exc
-                if attempt < 2:
-                    time.sleep(0.5 * (attempt + 1))
-                    continue
-            except Exception as exc:
-                last_exc = exc
-                break
-
-        if response is None:
-            return {"error": {"message": f"Could not reach Magnific OAuth MCP after retries: {last_exc}"}}
-
-        sid = response.headers.get("Mcp-Session-Id") or response.headers.get("mcp-session-id")
-        if sid:
-            self.session_id = sid
-
-        if response.status_code in (401, 403):
-            return {
-                "error": {
-                    "message": (
-                        "Magnific OAuth authorization was rejected or expired. Your OpenAI key is OK. "
-                        "Refresh the Magnific OAuth token and update MAGNIFIC_AUTH_TOKEN in Streamlit secrets."
-                    ),
-                    "http_status": response.status_code,
-                }
-            }
-        if not response.ok:
-            parsed = _mcp_http_json(response)
-            message = parsed.get("error") if isinstance(parsed, dict) else None
-            if isinstance(message, dict):
-                message = message.get("message") or message.get("detail") or str(message)
-            return {
-                "error": {
-                    "message": f"Magnific MCP HTTP {response.status_code}: {message or (response.text or '')[:1500]}",
-                    "http_status": response.status_code,
-                }
-            }
-        if allow_empty and not (response.text or "").strip():
-            return {"result": {}}
-        return _mcp_http_json(response)
-
-    def initialize(self) -> dict:
-        if self.initialized:
-            return {"result": {"protocolVersion": self.protocol_version}}
-        request_id = self.next_id
-        self.next_id += 1
-        payload = {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": self.protocol_version,
-                "capabilities": {},
-                "clientInfo": {"name": "Seedance Studio", "version": "3.0"},
-            },
-        }
-        result = self._post(payload, include_protocol=False)
-        if result.get("error"):
-            return result
-        negotiated = ((result.get("result") or {}).get("protocolVersion") if isinstance(result.get("result"), dict) else None)
-        if negotiated:
-            self.protocol_version = str(negotiated)
-        self.initialized = True
-        # Streamable HTTP servers accept the initialized notification without a JSON-RPC id.
-        notify = {
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized",
-            "params": {},
-        }
-        self._post(notify, allow_empty=True)
-        return result
-
-    def request(self, method: str, params: dict | None = None) -> dict:
-        init = self.initialize()
-        if init.get("error"):
-            return init
-        request_id = self.next_id
-        self.next_id += 1
-        payload = {"jsonrpc": "2.0", "id": request_id, "method": method}
-        if params is not None:
-            payload["params"] = params
-        return self._post(payload)
-
-    def list_tools(self) -> tuple[list[dict], str | None]:
-        """Return the COMPLETE live Magnific tool catalog, following MCP pagination cursors."""
-        all_tools = []
-        seen_names = set()
-        cursor = None
-        for _page in range(20):
-            params = {"cursor": cursor} if cursor else {}
-            response = self.request("tools/list", params)
-            if response.get("error"):
-                err = response.get("error") or {}
-                return [], str(err.get("message") if isinstance(err, dict) else err)
-            result = response.get("result") or {}
-            if not isinstance(result, dict):
-                break
-            for tool in list(result.get("tools") or []):
-                name = str(tool.get("name") or "").strip()
-                if name and name not in seen_names:
-                    seen_names.add(name)
-                    all_tools.append(tool)
-            next_cursor = result.get("nextCursor") or result.get("next_cursor")
-            if not next_cursor or next_cursor == cursor:
-                break
-            cursor = next_cursor
-        return all_tools, None
-
-    def call_tool(self, name: str, arguments: dict | None = None) -> dict:
-        return self.request("tools/call", {"name": name, "arguments": arguments or {}})
-
-
-def _magnific_relevant_tools(tools: list[dict], task_text: str, forced_name: str | None = None) -> list[dict]:
-    """Keep the planner prompt small while retaining upload/generation/status dependencies."""
-    if forced_name:
-        exact = [tool for tool in tools if str(tool.get("name") or "") == forced_name]
-        if exact:
-            return exact
-    lower = (task_text or "").lower()
-    wanted = []
-    for tool in tools:
-        name = str(tool.get("name") or "")
-        n = name.lower()
-        keep = False
-        if any(token in lower for token in ("check the status", "creation status", "creations_get")):
-            keep = n in {"creations_get", "creation_status", "creations_wait"}
-        elif "image" in lower and "video" not in lower:
-            keep = (
-                n.startswith("images_")
-                or n in {"creations_request_upload", "creations_upload", "creations_finalize_upload", "creations_get"}
-                or "upload" in n
-            )
-        else:
-            keep = (
-                n.startswith("video_")
-                or n in {"creations_request_upload", "creations_upload", "creations_finalize_upload", "creations_get"}
-                or "upload" in n
-            )
-        if keep:
-            wanted.append(tool)
-    return wanted or tools[:20]
-
-
-def _magnific_tool_schema_text(tools: list[dict], max_chars: int = 26000) -> str:
-    compact = []
-    for tool in tools:
-        compact.append({
-            "name": tool.get("name"),
-            "description": str(tool.get("description") or "")[:900],
-            "inputSchema": tool.get("inputSchema") or tool.get("input_schema") or {},
-        })
-    raw = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
-    return raw[:max_chars]
-
-
-def _extract_creation_id_from_text(value: str) -> str:
-    text = str(value or "")
-    # UUID-like IDs first, then the generic Magnific IDs already handled elsewhere.
-    patterns = [
-        r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b",
-        r"(?i)(?:creation|task|job|generation)[ _-]?(?:id|identifier)\s*[:=]?\s*[\"']?([A-Za-z0-9_-]{8,})",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text)
-        if match:
-            return match.group(1) if match.lastindex else match.group(0)
-    return ""
-
-
-def _direct_status_call(mcp: _MagnificDirectMCP, tools: list[dict], forced_name: str, user_text: str) -> dict | None:
-    """Avoid an OpenAI planning call for a simple creations_get/status request."""
-    tool = next((item for item in tools if str(item.get("name") or "") == forced_name), None)
-    if not tool:
-        return None
-    creation_id = _extract_creation_id_from_text(user_text)
-    if not creation_id:
-        return None
-    schema = tool.get("inputSchema") or tool.get("input_schema") or {}
-    props = schema.get("properties") if isinstance(schema, dict) else {}
-    props = props if isinstance(props, dict) else {}
-    key = next((candidate for candidate in ("identifier", "creation_id", "creationId", "id", "task_id", "taskId") if candidate in props), None)
-    if not key:
-        required = schema.get("required") if isinstance(schema, dict) else []
-        if isinstance(required, list) and len(required) == 1:
-            key = required[0]
-    if not key:
-        return None
-    return mcp.call_tool(forced_name, {key: creation_id})
-
-
-
-def _absorb_magnific_toon_text(raw_text, result: dict, include_creation_id: bool = True):
-    """Parse Magnific MCP TOON/human-readable creation payloads into our normalized result."""
-    raw = str(raw_text or "").strip()
-    if not raw or not isinstance(result, dict):
-        return result
-
-    # A tool result may itself be JSON whose only useful field is a TOON text blob.
-    try:
-        wrapped = json.loads(raw)
-        if isinstance(wrapped, dict):
-            nested_text = wrapped.get("text")
-            if isinstance(nested_text, str) and nested_text.strip() and nested_text.strip() != raw:
-                _absorb_magnific_toon_text(nested_text, result, include_creation_id=include_creation_id)
-            if include_creation_id and not result.get("creation_id"):
-                for key in ("identifier", "creation_id", "creationId", "task_id", "taskId", "id"):
-                    if wrapped.get(key):
-                        result["creation_id"] = str(wrapped[key])
-                        break
-            if isinstance(wrapped.get("status"), str):
-                raw_status = wrapped["status"].strip().lower()
-                aliases = {
-                    "succeeded": "completed", "success": "completed", "done": "completed", "finished": "completed",
-                    "pending": "queued", "running": "processing", "failed": "error", "failure": "error",
-                }
-                result["status"] = aliases.get(raw_status, raw_status)
-            for source_key, target_key in (("url", "url"), ("previewUrl", "preview_url"), ("preview_url", "preview_url")):
-                value = wrapped.get(source_key)
-                if isinstance(value, str) and value.startswith(("http://", "https://")):
-                    result[target_key] = value
-    except Exception:
-        pass
-
-    if include_creation_id and not result.get("creation_id"):
-        match = re.search(r"(?im)^\s*(?:identifier|creation[_ -]?id|task[_ -]?id|job[_ -]?id)\s*:\s*[\"']?([A-Za-z0-9_-]{6,})", raw)
-        if match:
-            result["creation_id"] = match.group(1)
-
-    status_match = re.search(r"(?im)^\s*(?:status|state|creation_status)\s*:\s*[\"']?([A-Za-z_-]+)", raw)
-    if status_match:
-        raw_status = status_match.group(1).strip().lower()
-        aliases = {
-            "succeeded": "completed", "success": "completed", "done": "completed", "finished": "completed",
-            "pending": "queued", "running": "processing", "failed": "error", "failure": "error",
-        }
-        result["status"] = aliases.get(raw_status, raw_status)
-
-    url_match = re.search(r"(?im)^\s*url\s*:\s*[\"']?(https?://[^\s\"']+)", raw)
-    preview_match = re.search(r"(?im)^\s*(?:previewUrl|preview_url)\s*:\s*[\"']?(https?://[^\s\"']+)", raw)
-    thumb_match = re.search(r"(?im)^\s*(?:thumbnailUrl|thumbnail_url)\s*:\s*[\"']?(https?://[^\s\"']+)", raw)
-    if url_match:
-        result["url"] = url_match.group(1)
-    if preview_match:
-        result["preview_url"] = preview_match.group(1)
-    elif thumb_match and not result.get("preview_url"):
-        result["preview_url"] = thumb_match.group(1)
-    return result
-
-def _parse_magnific_creation_response(response) -> dict:
-    """Normalize Magnific MCP responses and preserve the actual MCP failure when one occurs."""
-    result = {
-        "creation_id": None,
-        "status": "unknown",
-        "url": None,
-        "preview_url": None,
-        "error": None,
-        "mcp_tools_called": [],
-        "mcp_stop_reason": getattr(response, "stop_reason", None),
-    }
-
-    status_aliases = {
-        "created": "queued",
-        "submitted": "queued",
-        "succeeded": "completed",
-        "success": "completed",
-        "done": "completed",
-        "finished": "completed",
-        "pending": "queued",
-        "running": "processing",
-        "failed": "error",
-        "failure": "error",
-    }
-    tool_names_by_id = {}
-    tool_error_messages = []
-    plain_text_messages = []
-
-    def normalize_status(value):
-        if not isinstance(value, str):
-            return None
-        normalized = value.strip().lower()
-        return status_aliases.get(normalized, normalized)
-
-    def absorb(payload):
-        if isinstance(payload, str):
-            _absorb_magnific_toon_text(payload, result)
-            return
-        if not isinstance(payload, (dict, list)):
-            return
-        if isinstance(payload, dict):
-            # Magnific creations_get commonly returns {"text": "identifier: ...\nstatus: ...\nurl: ..."}.
-            for toon_key in ("text", "content", "message"):
-                toon_value = payload.get(toon_key)
-                if isinstance(toon_value, str):
-                    _absorb_magnific_toon_text(toon_value, result)
-        url_candidates = []
-
-        def walk(value, path=()):
-            if isinstance(value, dict):
-                for id_key in (
-                    "identifier", "creation_id", "creationId", "task_id", "taskId",
-                    "generation_id", "generationId", "job_id", "jobId", "id",
-                ):
-                    candidate = value.get(id_key)
-                    if candidate and not result.get("creation_id"):
-                        result["creation_id"] = str(candidate)
-                        break
-
-                for status_key in ("status", "state", "creation_status", "creationStatus"):
-                    candidate = normalize_status(value.get(status_key))
-                    if candidate:
-                        result["status"] = candidate
-                        break
-
-                for error_key in ("error", "error_message", "errorMessage"):
-                    candidate = value.get(error_key)
-                    if candidate:
-                        if isinstance(candidate, dict):
-                            candidate = candidate.get("message") or candidate.get("detail") or json.dumps(candidate)[:1000]
-                        tool_error_messages.append(str(candidate)[:1200])
-
-                for key, child in value.items():
-                    key_lower = str(key).lower()
-                    child_path = path + (key_lower,)
-                    if isinstance(child, str) and child.startswith(("http://", "https://")):
-                        path_text = " ".join(child_path)
-                        score = 0
-                        is_preview = "preview" in key_lower or "preview" in path_text
-                        if key_lower in {"imageurl", "image_url", "videourl", "video_url", "downloadurl", "download_url"}:
-                            score += 130
-                        elif key_lower in {"outputurl", "output_url", "resulturl", "result_url", "mediaurl", "media_url", "generated"}:
-                            score += 115
-                        elif key_lower in {"url", "fileurl", "file_url"}:
-                            score += 80
-                        elif is_preview:
-                            score += 60
-                        if any(token in path_text for token in ("output", "result", "generated", "image", "video", "media", "asset", "download")):
-                            score += 25
-                        if any(token in path_text for token in ("input", "reference", "source", "uploaded")):
-                            score -= 90
-                        url_candidates.append((score, is_preview, child))
-                    walk(child, child_path)
-            elif isinstance(value, list):
-                for index, child in enumerate(value):
-                    walk(child, path + (str(index),))
-
-        walk(payload)
-        if url_candidates:
-            url_candidates.sort(key=lambda item: item[0], reverse=True)
-            for _score, is_preview, url in url_candidates:
-                if is_preview and not result.get("preview_url"):
-                    result["preview_url"] = url
-                elif not is_preview and not result.get("url"):
-                    result["url"] = url
-            if not result.get("url"):
-                result["url"] = url_candidates[0][2]
-
-    for block in getattr(response, "content", []) or []:
-        block_type = getattr(block, "type", "")
-
-        if block_type == "mcp_tool_use":
-            tool_name = str(getattr(block, "name", "") or "unknown_tool")
-            tool_id = str(getattr(block, "id", "") or "")
-            if tool_id:
-                tool_names_by_id[tool_id] = tool_name
-            if tool_name not in result["mcp_tools_called"]:
-                result["mcp_tools_called"].append(tool_name)
-            continue
-
-        if block_type == "text":
-            raw = getattr(block, "text", "") or ""
-            if raw.strip():
-                plain_text_messages.append(raw.strip()[:1500])
-            try:
-                cleaned = re.sub(r'```json\s*|```\s*', '', raw)
-                start_json = cleaned.find("{")
-                end_json = cleaned.rfind("}") + 1
-                if start_json >= 0 and end_json > start_json:
-                    parsed = json.loads(cleaned[start_json:end_json])
-                    if isinstance(parsed, dict):
-                        if parsed.get("creation_id"):
-                            result["creation_id"] = str(parsed["creation_id"])
-                        if parsed.get("identifier") and not result.get("creation_id"):
-                            result["creation_id"] = str(parsed["identifier"])
-                        if parsed.get("task_id") and not result.get("creation_id"):
-                            result["creation_id"] = str(parsed["task_id"])
-                        if parsed.get("status"):
-                            result["status"] = normalize_status(str(parsed["status"])) or result["status"]
-                        if parsed.get("url"):
-                            result["url"] = parsed["url"]
-                        if parsed.get("preview_url"):
-                            result["preview_url"] = parsed["preview_url"]
-                        if parsed.get("error"):
-                            tool_error_messages.append(str(parsed["error"])[:1200])
-                        absorb(parsed)
-            except (json.JSONDecodeError, TypeError, ValueError):
-                pass
-            continue
-
-        if block_type == "mcp_tool_result":
-            tool_use_id = str(getattr(block, "tool_use_id", "") or "")
-            tool_name = tool_names_by_id.get(tool_use_id, "Magnific MCP tool")
-            is_error = bool(getattr(block, "is_error", False))
-            subcontents = getattr(block, "content", None) or []
-            if isinstance(subcontents, str):
-                subcontents = [subcontents]
-
-            raw_parts = []
-            for sub in subcontents:
-                raw = sub if isinstance(sub, str) else getattr(sub, "text", None)
-                if raw:
-                    raw_text = str(raw)
-                    raw_parts.append(raw_text)
-                    _absorb_magnific_toon_text(raw_text, result)
-                    try:
-                        absorb(json.loads(raw_text))
-                    except (json.JSONDecodeError, TypeError, ValueError):
-                        pass
-            raw_joined = "\n".join(raw_parts).strip()
-            if is_error:
-                if raw_joined:
-                    tool_error_messages.append(f"{tool_name}: {raw_joined[:1600]}")
-                else:
-                    tool_error_messages.append(f"{tool_name} returned an MCP error with no message.")
-            elif raw_joined and not result.get("creation_id"):
-                # Some MCP servers return human-readable text instead of JSON.
-                id_patterns = [
-                    r'(?i)(?:creation|task|job|generation)[ _-]?(?:id|identifier)\s*[:=]\s*["\']?([A-Za-z0-9_-]{8,})',
-                    r'(?i)identifier\s*[:=]\s*["\']?([A-Za-z0-9_-]{8,})',
-                ]
-                for pattern in id_patterns:
-                    match = re.search(pattern, raw_joined)
-                    if match:
-                        result["creation_id"] = match.group(1)
-                        break
-
-    if result.get("creation_id") and result.get("status") in {None, "", "unknown"}:
-        result["status"] = "queued"
-
-    if tool_error_messages:
-        result["error"] = " | ".join(dict.fromkeys(tool_error_messages))[:2200]
-        if result.get("status") in {None, "", "unknown"}:
-            result["status"] = "error"
-
-    if not result.get("creation_id") and not result.get("url") and not result.get("preview_url") and not result.get("error"):
-        if not result.get("mcp_tools_called"):
-            extra = f" Claude stop reason: {result.get('mcp_stop_reason')}." if result.get("mcp_stop_reason") else ""
-            text_hint = f" Response: {plain_text_messages[-1][:800]}" if plain_text_messages else ""
-            result["error"] = (
-                "Claude did not call any Magnific MCP tool, so the image generation was never submitted to Magnific."
-                + extra + text_hint
-            )
-        else:
-            tools = ", ".join(result.get("mcp_tools_called") or [])
-            text_hint = f" Last response: {plain_text_messages[-1][:800]}" if plain_text_messages else ""
-            result["error"] = f"Magnific MCP tool(s) ran ({tools}) but no creation/task ID or output URL was returned.{text_hint}"
-
-    return result
-
-def _anthropic_blocks_to_message_params(blocks) -> list[dict]:
-    """Serialize Anthropic response blocks so completed MCP results can be round-tripped."""
-    serialized = []
-    for block in blocks or []:
-        try:
-            if hasattr(block, "model_dump"):
-                data = block.model_dump(mode="json", exclude_none=True)
-            elif isinstance(block, dict):
-                data = dict(block)
-            else:
-                continue
-            if isinstance(data, dict) and data.get("type"):
-                serialized.append(data)
-        except Exception:
-            continue
-    return serialized
-
-def _magnific_result_is_incomplete_only(result: dict) -> bool:
-    """Return True when MCP made progress but generation has not been submitted yet."""
-    if not isinstance(result, dict):
-        return True
-    if _is_real_magnific_creation_id(result.get("creation_id")) or result.get("url") or result.get("preview_url"):
-        return False
-    error = str(result.get("error") or "")
-    if not error:
-        return True
-    markers = (
-        "Magnific MCP tool(s) ran",
-        "Claude did not call any Magnific MCP tool",
-        "no creation/task ID or output URL was returned",
-    )
-    return any(marker in error for marker in markers)
-
-def _run_magnific_mcp_sequence(
-    client,
-    system: str,
-    initial_content: str,
-    mcp_servers: list[dict],
-    continuation_instruction: str,
-    max_turns: int = 8,
-) -> dict:
-    """Continue dependent Magnific MCP actions across Claude turns until generation is submitted.
-
-    Some Magnific tasks require upload -> generate. The remote MCP connector can finish an
-    upload and let Claude end the turn. We round-trip that MCP result and tell Claude to
-    continue, rather than incorrectly treating the upload as the end of the workflow.
-    """
-    messages = [{"role": "user", "content": initial_content}]
-    tools = [{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}]
-    all_tools = []
-    last_text = ""
-    last_result = {}
-
-    for turn_index in range(max(1, int(max_turns))):
-        try:
-            response = client.beta.messages.create(
-                model=MAGNIFIC_MCP_MODEL,
-                max_tokens=2048,
-                system=system,
-                messages=messages,
-                mcp_servers=mcp_servers,
-                tools=tools,
-                betas=[MCP_BETA],
-            )
-        except Exception as exc:
-            return {
-                "creation_id": None,
-                "status": "error",
-                "error": f"Magnific MCP sequence failed on step {turn_index + 1}: {exc}",
-                "mcp_tools_called": all_tools,
-                "mcp_turns": turn_index + 1,
-            }
-
-        parsed = _parse_magnific_creation_response(response)
-        last_result = dict(parsed or {})
-        for tool_name in parsed.get("mcp_tools_called") or []:
-            if tool_name not in all_tools:
-                all_tools.append(tool_name)
-
-        text_parts = []
-        for block in getattr(response, "content", []) or []:
-            if getattr(block, "type", "") == "text":
-                value = str(getattr(block, "text", "") or "").strip()
-                if value:
-                    text_parts.append(value)
-        if text_parts:
-            last_text = text_parts[-1][:1400]
-
-        if _is_real_magnific_creation_id(parsed.get("creation_id")) or parsed.get("url") or parsed.get("preview_url"):
-            parsed["mcp_tools_called"] = all_tools
-            parsed["mcp_turns"] = turn_index + 1
-            return parsed
-
-        # Stop only for a real MCP error. Generic "upload happened but no ID yet"
-        # means the dependent workflow needs another Claude turn.
-        if parsed.get("error") and not _magnific_result_is_incomplete_only(parsed):
-            parsed["mcp_tools_called"] = all_tools
-            parsed["mcp_turns"] = turn_index + 1
-            return parsed
-
-        assistant_content = _anthropic_blocks_to_message_params(getattr(response, "content", []) or [])
-        stop_reason = str(getattr(response, "stop_reason", "") or "").strip().lower()
-
-        # Remote MCP calls are server-executed tools. If Anthropic pauses the
-        # server-side loop (or returns an MCP tool-use block whose result has not
-        # arrived yet), resume by passing the paused assistant content back AS-IS.
-        # Do not add a user continuation message until every mcp_tool_use has a
-        # corresponding mcp_tool_result, or the API rejects the request with 400.
-        pending_tool_ids = set()
-        completed_tool_ids = set()
-        for block in assistant_content:
-            block_type = str(block.get("type") or "") if isinstance(block, dict) else ""
-            if block_type == "mcp_tool_use" and block.get("id"):
-                pending_tool_ids.add(str(block.get("id")))
-            elif block_type == "mcp_tool_result" and block.get("tool_use_id"):
-                completed_tool_ids.add(str(block.get("tool_use_id")))
-        unresolved_mcp_ids = pending_tool_ids - completed_tool_ids
-
-        if assistant_content:
-            messages.append({"role": "assistant", "content": assistant_content})
-
-        if stop_reason == "pause_turn" or unresolved_mcp_ids:
-            # Resume the still-open server-tool turn with the same MCP toolset.
-            # No user message is allowed here.
-            continue
-
-        # The previous assistant turn is complete, but it only made partial
-        # progress (for example, uploaded references and then narrated). Now it
-        # is safe to send a fresh user instruction telling Claude to perform the
-        # remaining Magnific generation action without repeating completed work.
-        messages.append({
-            "role": "user",
-            "content": continuation_instruction + "\nContinue from the successful MCP results above; do not restart or repeat completed uploads.",
-        })
-
-    return {
-        "creation_id": None,
-        "status": "error",
-        "error": (
-            f"Magnific MCP made progress but did not reach the generation call after {max_turns} turns. "
-            f"Tools seen: {', '.join(all_tools) or 'none'}."
-            + (f" Last response: {last_text}" if last_text else "")
-        ),
-        "mcp_tools_called": all_tools,
-        "mcp_turns": max_turns,
-        "last_partial_result": last_result,
-    }
-
-def _openai_magnific(api_key: str, magnific_token: str, *, instructions: str, user_text: str, max_output_tokens: int = 900, tool_choice=None) -> dict:
-    """Reliable Magnific OAuth MCP bridge.
-
-    OpenAI GPT-4o mini remains the low-cost model for prompts/vision elsewhere in the app.
-    Magnific tool execution is intentionally routed through Anthropic's native remote-MCP
-    connector because that is the proven path for this OAuth server: Anthropic executes the
-    MCP tools server-side, preserves mcp_tool_use/mcp_tool_result blocks, and correctly resumes
-    pause_turn / dependent upload -> generate workflows.
-    """
-    if not magnific_token:
-        return {"creation_id": None, "status": "error", "error": "Magnific OAuth token is missing. Add MAGNIFIC_AUTH_TOKEN to Streamlit secrets."}
-    if anthropic is None:
-        return {"creation_id": None, "status": "error", "error": "The anthropic package is missing. Keep `anthropic` in requirements.txt for the Magnific MCP bridge."}
-
-    anthropic_key = ""
-    try:
-        anthropic_key = str(st.secrets.get("ANTHROPIC_API_KEY", "") or "").strip()
-    except Exception:
-        anthropic_key = str(os.environ.get("ANTHROPIC_API_KEY", "") or "").strip()
-    if not anthropic_key:
-        anthropic_key = str(st.session_state.get("runtime_anthropic_api_key", "") or "").strip()
-    if not anthropic_key:
-        return {
-            "creation_id": None,
-            "status": "error",
-            "error": (
-                "Anthropic API key is missing for the Magnific MCP bridge. OpenAI is still used for prompt/vision work; "
-                "add ANTHROPIC_API_KEY only for Magnific tool execution."
-            ),
-        }
-
-    mcp_server = {
-        "type": "url",
-        "url": MAGNIFIC_MCP_URL,
-        "name": MAGNIFIC_MCP_NAME,
-        "authorization_token": magnific_token,
-    }
-
-    # For status checks, restricting the server to creations_get avoids an unnecessary agent loop.
-    forced_name = None
-    if isinstance(tool_choice, dict) and tool_choice.get("type") == "mcp":
-        forced_name = str(tool_choice.get("name") or "").strip() or None
-    if forced_name:
-        mcp_server["tool_configuration"] = {"enabled": True, "allowed_tools": [forced_name]}
-
-    try:
-        client = anthropic.Anthropic(api_key=anthropic_key)
-    except Exception as exc:
-        return {"creation_id": None, "status": "error", "error": f"Could not initialize the Magnific MCP bridge: {exc}"}
-
-    mcp_servers = [mcp_server]
-
-    # A status lookup is a single dependent-free call.
-    if forced_name:
-        try:
-            response = client.beta.messages.create(
-                model=MAGNIFIC_MCP_MODEL,
-                max_tokens=max(512, min(int(max_output_tokens or 900), 1400)),
-                system=instructions,
-                messages=[{"role": "user", "content": user_text}],
-                mcp_servers=mcp_servers,
-                tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
-                betas=[MCP_BETA],
-            )
-            return _parse_magnific_creation_response(response)
-        except Exception as exc:
-            return {"creation_id": None, "status": "error", "error": f"Magnific MCP status call failed: {exc}"}
-
-    # Generation can be upload -> upload -> generate and the remote MCP connector may pause
-    # between those server-side tool calls. Preserve the assistant tool blocks exactly and
-    # resume the same task until Magnific returns a real creation ID.
-    continuation = (
-        "Continue the SAME Magnific task. Do not repeat successful uploads. Complete the remaining generation call now, "
-        "using the successful MCP tool results already in this conversation. Stop only after Magnific returns a REAL "
-        "creation/task identifier. Do not poll for completion."
-    )
-    result = _run_magnific_mcp_sequence(
-        client=client,
-        system=instructions,
-        initial_content=user_text,
-        mcp_servers=mcp_servers,
-        continuation_instruction=continuation,
-        max_turns=10,
-    )
-
-    # A real Magnific creation ID means the generation was actually submitted.
-    # Do not let an incidental upload/connector status mark that asynchronous job as
-    # terminal Error before we have polled the creation itself. Preserve the message
-    # as a warning, then let creations_get determine the real final state.
-    if _is_real_magnific_creation_id(result.get("creation_id")) and not (result.get("url") or result.get("preview_url")):
-        if str(result.get("status") or "").lower() in {"", "unknown", "error", "failed", "failure"}:
-            if result.get("error"):
-                result["submission_warning"] = result.get("error")
-            result["status"] = "queued"
-            result["error"] = None
-
-    result["mcp_bridge_model"] = MAGNIFIC_MCP_MODEL
-    result["mcp_connection"] = "anthropic_native_oauth"
-    return result
 
 # ═══════════════════════════════════════════════════════════════════
 #  SYSTEM PROMPTS
@@ -3638,42 +2652,70 @@ def _extract_visible_text_excerpt(html: str, limit: int = 2400) -> str:
 
 
 def recover_product_name_with_page_context(api_key: str, html: str, image_urls: list[str], page_url: str = "", product_id: str = "") -> str:
-    """Fallback product-name recovery using OpenAI GPT-4o mini vision/text."""
+    """Fallback product-name recovery using page text plus up to 3 images."""
     if not api_key:
         return ""
+
     visible_text = _extract_visible_text_excerpt(html)
-    content = []
-    if visible_text:
-        content.append({"type": "input_text", "text": f"Visible page text excerpt:\n{visible_text[:2400]}"})
+    image_blocks = []
     for image_url in list(image_urls or [])[:3]:
-        if isinstance(image_url, str) and image_url.startswith(("http://", "https://")):
-            content.append({"type": "input_image", "image_url": image_url, "detail": "low"})
-    if not content:
+        try:
+            response = requests.get(image_url, headers=HEADERS, timeout=30)
+            response.raise_for_status()
+            media_type = (response.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip().lower()
+            if media_type not in {"image/jpeg", "image/png", "image/webp", "image/gif"}:
+                suffix = Path(urlparse(image_url).path).suffix.lower()
+                media_type = {
+                    ".png": "image/png",
+                    ".webp": "image/webp",
+                    ".gif": "image/gif",
+                }.get(suffix, "image/jpeg")
+            image_blocks.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": base64.b64encode(response.content).decode("ascii"),
+                },
+            })
+        except Exception:
+            continue
+
+    if not visible_text and not image_blocks:
         return ""
-    content.append({
-        "type": "input_text",
-        "text": (
-            "Recover the real product name for this TikTok Shop item. Use only the visible page text and listing images. "
-            + (f"TikTok product ID: {product_id}. " if product_id else "")
-            + (f"Page URL: {page_url}. " if page_url else "")
-            + "Return ONLY JSON: {\"product_name\":\"...\",\"confidence\":\"high|medium|low\"}. "
-            "Do not invent claims, sizes, variants, or marketplace wording that are not visible."
-        ),
-    })
-    payload = _openai_request(
-        api_key,
-        instructions="You identify retail product names from weak ecommerce page signals. Read only what is actually visible.",
-        input_content=[{"role": "user", "content": content}],
-        max_output_tokens=500,
-        json_mode=True,
-    )
-    if payload.get("error"):
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        content = []
+        if visible_text:
+            content.append({"type": "text", "text": f"Visible page text excerpt:\n{visible_text[:2400]}"})
+        content.extend(image_blocks)
+        content.append({
+            "type": "text",
+            "text": (
+                "Recover the real product name for this TikTok Shop item. Use the visible page text and listing images. "
+                + (f"TikTok product ID: {product_id}. " if product_id else "")
+                + (f"Page URL: {page_url}. " if page_url else "")
+                + "Return the clearest concise retail product name only, based on what is actually visible. Do not invent claims, sizes, or variants that are not visible."
+            ),
+        })
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=250,
+            system=(
+                "You identify retail product names from weak e-commerce page signals. Read only what is actually shown in the page text or images. "
+                "Return ONLY JSON: {\"product_name\":\"...\",\"confidence\":\"high|medium|low\"}."
+            ),
+            messages=[{"role": "user", "content": content}],
+        )
+        text_blocks = [block.text for block in response.content if getattr(block, "type", "") == "text"]
+        parsed = _extract_json_object("\n".join(text_blocks))
+        candidate = _clean_product_name_candidate((parsed or {}).get("product_name", ""))
+        if candidate.lower() in {"", "unknown", "unknown product", "product"}:
+            return ""
+        return candidate[:100]
+    except Exception:
         return ""
-    parsed = _extract_json_object(_openai_output_text(payload)) or {}
-    candidate = _clean_product_name_candidate(parsed.get("product_name", ""))
-    if candidate.lower() in {"", "unknown", "unknown product", "product"}:
-        return ""
-    return candidate[:100]
 
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".avif")
@@ -3816,38 +2858,73 @@ def _clean_product_name_candidate(value: str) -> str:
 
 
 def recover_product_name_from_images(api_key: str, image_urls: list[str], product_id: str = "") -> str:
-    """Use OpenAI GPT-4o mini vision only when scraping exposes no usable product title."""
+    """Use Claude vision only as a fallback when an ID-only TikTok page exposes no title.
+
+    The model is told to read visible brand/product wording and avoid fabricating a
+    long marketplace title. This call runs only for an otherwise unnamed product.
+    """
     if not api_key:
         return ""
-    content = []
+
+    image_blocks = []
     for image_url in list(image_urls or [])[:3]:
-        if isinstance(image_url, str) and image_url.startswith(("http://", "https://")):
-            content.append({"type": "input_image", "image_url": image_url, "detail": "low"})
-    if not content:
+        try:
+            response = requests.get(image_url, headers=HEADERS, timeout=30)
+            response.raise_for_status()
+            media_type = (response.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip().lower()
+            if media_type not in {"image/jpeg", "image/png", "image/webp", "image/gif"}:
+                suffix = Path(urlparse(image_url).path).suffix.lower()
+                media_type = {
+                    ".png": "image/png",
+                    ".webp": "image/webp",
+                    ".gif": "image/gif",
+                }.get(suffix, "image/jpeg")
+            image_blocks.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": base64.b64encode(response.content).decode("ascii"),
+                },
+            })
+        except Exception:
+            continue
+
+    if not image_blocks:
         return ""
-    content.append({
-        "type": "input_text",
-        "text": (
-            "Read the product identity from these TikTok Shop listing images. "
-            + (f"TikTok product ID: {product_id}. " if product_id else "")
-            + "Return ONLY JSON: {\"product_name\":\"...\",\"confidence\":\"high|medium|low\"}. "
-            "Use visible brand/product/variant wording only. Do not invent benefits, size, flavor, model, or marketplace wording."
-        ),
-    })
-    payload = _openai_request(
-        api_key,
-        instructions="Identify retail products from listing images accurately and conservatively.",
-        input_content=[{"role": "user", "content": content}],
-        max_output_tokens=500,
-        json_mode=True,
-    )
-    if payload.get("error"):
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=300,
+            system=(
+                "Identify a retail product from TikTok Shop listing images. Read only visible brand, product, variant, "
+                "and packaging wording. Return a concise, useful product name. Do not invent benefits, size, flavor, "
+                "model, or marketplace wording that is not visible. If the exact long listing title is unavailable, "
+                "return the visible brand plus the clearest product type. Return ONLY JSON: "
+                '{"product_name":"...","confidence":"high|medium|low"}'
+            ),
+            messages=[{
+                "role": "user",
+                "content": image_blocks + [{
+                    "type": "text",
+                    "text": (
+                        "Read the product name from these listing images. "
+                        + (f"TikTok product ID: {product_id}. " if product_id else "")
+                        + "Do not return Unknown Product unless there is truly no readable product identity."
+                    ),
+                }],
+            }],
+        )
+        text_blocks = [block.text for block in response.content if getattr(block, "type", "") == "text"]
+        parsed = _extract_json_object("\n".join(text_blocks))
+        candidate = _clean_product_name_candidate((parsed or {}).get("product_name", ""))
+        if candidate.lower() in {"", "unknown", "unknown product", "product"}:
+            return ""
+        return candidate[:100]
+    except Exception:
         return ""
-    parsed = _extract_json_object(_openai_output_text(payload)) or {}
-    candidate = _clean_product_name_candidate(parsed.get("product_name", ""))
-    if candidate.lower() in {"", "unknown", "unknown product", "product"}:
-        return ""
-    return candidate[:100]
 
 
 def _best_product_name(candidates):
@@ -4029,102 +3106,43 @@ def scrape_product(url: str, api_key: str = "") -> dict | None:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  PROMPT WRITER (OpenAI GPT-4o mini)
+#  PROMPT WRITER (Claude only — no MCP, cheap + fast)
 # ═══════════════════════════════════════════════════════════════════
 
 def _extract_json_object(raw_text: str) -> dict | None:
-    cleaned = str(raw_text or "").lstrip("\ufeff").strip()
-    cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r'\s*```$', '', cleaned).strip()
-    if not cleaned:
-        return None
-    try:
-        parsed = json.loads(cleaned)
-        return parsed if isinstance(parsed, dict) else None
-    except json.JSONDecodeError:
-        pass
+    cleaned = re.sub(r'```json\s*', '', raw_text)
+    cleaned = re.sub(r'```\s*', '', cleaned)
     json_start = cleaned.find("{")
     json_end = cleaned.rfind("}") + 1
     if json_start < 0 or json_end <= json_start:
         return None
     try:
-        parsed = json.loads(cleaned[json_start:json_end])
-        return parsed if isinstance(parsed, dict) else None
+        return json.loads(cleaned[json_start:json_end])
     except json.JSONDecodeError:
         return None
 
 
 def write_hooks(api_key: str, product_name: str, style: str = "texthook_broll") -> dict:
-    """Choose five hooks locally from the shared library. No AI call and no token cost."""
-    templates = [
-        "I am SO sorry if you already grabbed a [product] because the discount is huge today",
-        "Sincerely apologize to anyone who already got a [product] cus they are TRIPLE discounted today 😭",
-        "Sorry to the ladies who bought these [product] before the new Summer Reductions this week 😭😭",
-        "Condolences to the ladies who bought this New [product] before this Summer Half Off Reduction 😭😭",
-        "POV: You wake up and the [product] is SO affordable on TikTok now 🤯😱",
-        "Glad I waited to grab the [product] because they are TRIPLE DISCOUNTED RIGHT NOW 😱🤑",
-        "You got BLESSED today bc the [product] is now SUPER cheap 🤩",
-        "If you waited until today you absolutely won cause the [product] is soooo low 🤑",
-        "Yall must have bullied the price down because the [product] are crazy cheap rn 😭",
-        "TikTok bullied the price down and now the [product] is on a massive sale…..only for a limited time don't miss out 😅",
-        "Someone fcked up at TikTok cus today the [product] is violently low right now",
-        "Apparently if your TikTok account is old enough you can get the [product] on a mega discount… its only for today though",
-        "Anyone else grabbing a boatload of the [product] or am I just stupid",
-        "I am so sorry if you already grabbed a [product], because the discount is huge today.",
-        "Before you ask...No it's not a typo. Yes the [product] is literal Pennie's today..😱😅",
-        "This is your sign to finally grab the [product].",
-        "Do NOT scroll past the [product] if it has been sitting in your cart.",
-        "POV: you found the [product] before everyone else did.",
-        "If you have been waiting on the [product], now is the time.",
-        "Run, do not walk, to grab the [product].",
-        "The [product] everyone has been asking me about is finally back.",
-        "Stop overthinking the [product] and just tap the cart.",
-        "Me telling you to grab the [product] before it sells out again.",
-        "Your future self will thank you for grabbing the [product] today.",
-        "Adding the [product] to my cart before I change my mind.",
-        "The [product] is about to be everywhere. Get it first.",
-        "I can not believe how good the [product] is for the price.",
-        "Consider this your reminder to grab the [product] you keep eyeing.",
-        "Trust me, you want the [product] in your cart today.",
-    ]
-    chosen = random.SystemRandom().sample(templates, k=5)
-    hooks = [template.replace("[product]", product_name) for template in chosen]
-    category_tags = re.findall(r"[A-Za-z0-9]+", product_name.lower())[:4]
-    tags = ["#tiktokshop", "#tiktokmademebuyit", "#tiktokshopfinds", "#deals", "#shoppingfinds"]
-    tags.extend(f"#{tag}" for tag in category_tags if len(tag) > 2)
-    if style == "warehouse":
-        tags.extend(["#costcofinds", "#warehousedeals"])
-    tags = list(dict.fromkeys(tags))[:12]
-    return {
-        "product_name": product_name,
-        "hook_options": hooks,
-        "caption": f"today's find: {product_name}",
-        "hashtags": " ".join(tags),
-        "sound_tip": "The app assigns a random soundtrack after generation.",
-    }
-
-
-def _local_seedance_prompt_fallback(
-    product_name: str,
-    style: str,
-    duration: int,
-    broll_scene: str | None = None,
-    voice_script: str | None = None,
-) -> str:
-    """Deterministic emergency prompt so an OpenAI formatting/API hiccup never blocks generation."""
-    name = re.sub(r"\s+", " ", (product_name or "product").strip())
-    if style == "shoe_video":
-        audio = (
-            f'Include this voiceover in a warm casual female voice: "{re.sub(r"\\s+", " ", voice_script.strip())[:500]}".'
-            if voice_script else "Ambient sound only; no voiceover."
+    """Generate five hooks from the shared library used by every workflow. Cheap/fast — no MCP."""
+    system = WAREHOUSE_HOOKS_SYSTEM
+    task = (
+        f"Write 5 deal-drop/FOMO text hooks for this product: {product_name}. "
+        f"The video style is {style}. Use the shared hook library for every workflow and choose five different angles."
+    )
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=1400,
+            system=system,
+            messages=[{"role": "user", "content": task}],
         )
-        return re.sub(r"\s+", " ", f"""9:16 vertical TikTok UGC video, {int(duration)} seconds. Match every supplied reference image exactly for the {name}: exact shoe silhouette, color, material, sole, straps/laces, logo placement and proportions. Uploaded images are visual references only, never a literal start frame. Show feet-and-shoes only; never show a person above the ankle. Warm natural phone-camera lighting, casual handheld movement, no polished commercial look, no digital zoom, no rendered text/captions/subtitles/overlays/prices/watermarks. [00:00-00:05] Looking-down POV of both feet wearing the exact shoes on a realistic surface, one small natural stance shift. [00:05-00:10] Low side angle focused on the shoe profile and sole; one foot lifts slightly then sets down. [00:10-00:{int(duration):02d}] Return to overhead/three-quarter POV with a small natural step or weight shift, keeping the shoes dominant and accurate. {audio}""").strip()[:1899]
-    if style == "warehouse":
-        return re.sub(r"\s+", " ", f"""9:16 vertical TikTok UGC, exactly 5 seconds, completely silent. Match the exact {name} packaging, colors, labels, shape and proportions from all supplied references; reference 1 has highest product-accuracy priority. Images are general references only, never a start frame. One continuous first-person shopper POV already standing directly beside a real warehouse display at arm's length. No people, hands, faces, bodies or animals. [00:00-00:02] Product display already fills about 75-85% of frame, slightly off-center, natural phone micro-shake. [00:02-00:05] One tiny 6-12 inch lean-in/half-step and gentle reframe so repeated units fill about 90-95% of frame. Real metal racking, fluorescent light, concrete floor and pallet edges around the display. No walking sequence, cuts, audio, digital zoom, rendered text, captions, prices, sale graphics or watermarks.""").strip()[:1899]
-    if style == "pool":
-        return re.sub(r"\s+", " ", f"""9:16 vertical realistic TikTok Shop UGC, exactly 8 seconds, silent. Match the exact {name} package, colors, branding, shape and proportions from supplied references; keep one unchanged accurate product throughout. References are visual references only, never a start frame. Bright natural summer daylight beside a residential backyard pool. [00:00-00:03] One natural hand holds the product upright beside the turquoise pool, package facing camera and filling 65-75% of frame, slight wrist movement and phone micro-shake. [00:03-00:05.5] Clean cut: product stands upright on a small patio table; short casual half-orbit and tiny push-in. [00:05.5-00:08] Clean cut: product held upright again while camera makes one or two small natural steps along pool edge. No packaging changes, duplicates, warped hands, invented words, rendered text/captions/prices/watermarks, voiceover, music or digital zoom.""").strip()[:1899]
-    scene = re.sub(r"\s+", " ", (broll_scene or choose_broll_scene()).strip())
-    return re.sub(r"\s+", " ", f"""9:16 vertical TikTok UGC, exactly 8 seconds, completely silent, no rendered text/captions/subtitles/overlays/signs/watermarks. Uploaded product images are general references only and must be matched exactly; never use them as a start frame. [00:00-00:03] Show this exact unrelated opening scene and do not substitute another scene: {scene}. Casual handheld iPhone footage, natural micro-shake, ordinary daylight. [00:03-00:08] Hard cut to an outdoor or casual real-life surface. One natural hand holds up the exact {name}, matching reference packaging/colors/shape/logo/proportions, slowly rotating and tilting it in warm natural light with a softly blurred background. No face or person above wrist, no product changes, no digital zoom, no audio.""").strip()[:1899]
+        parsed = _extract_json_object(response.content[0].text)
+        if parsed is not None:
+            return parsed
+        return {"error": "Couldn't parse JSON", "product_name": product_name}
+    except Exception as e:
+        return {"error": str(e), "product_name": product_name}
 
 
 def write_prompt(
@@ -4136,7 +3154,7 @@ def write_prompt(
     selected_hook: str | None = None,
     broll_scene: str | None = None,
 ) -> dict:
-    """Use low-cost OpenAI GPT-4o mini to write the Seedance prompt."""
+    """Use Claude to write the Seedance prompt. No MCP, no Magnific."""
     if style == "shoe_video":
         vo = VOICEOVER_WITH_SCRIPT.format(script=voice_script) if voice_script else VOICEOVER_SILENT
         system = SHOE_VIDEO_SYSTEM.format(voiceover_instruction=vo)
@@ -4145,6 +3163,7 @@ def write_prompt(
     elif style == "pool":
         system = POOL_PROMPT_SYSTEM
     else:
+        # The selected hook is added after generation with FFmpeg.
         system = TEXTHOOK_PROMPT_SYSTEM
 
     dur = resolved_style_duration(style, duration)
@@ -4162,50 +3181,71 @@ def write_prompt(
             "The generator will receive the selected reference images separately, so instruct it to match them exactly."
         )
 
-    parsed = _openai_json_text(
-        api_key,
-        instructions=system,
-        user_text=user_task,
-        max_output_tokens=1400,
-    )
-    if parsed.get("error"):
-        # Never block the actual video run because the inexpensive prompt-writer call was truncated or unavailable.
-        raw_fallback = re.sub(r"\s+", " ", str(parsed.get("raw") or "")).strip()
-        fallback_prompt = raw_fallback[:1899] if len(raw_fallback) >= 80 else _local_seedance_prompt_fallback(
-            product_name=product_name,
-            style=style,
-            duration=dur,
-            broll_scene=chosen_broll_scene,
-            voice_script=voice_script,
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=2048,
+            system=system,
+            messages=[{"role": "user", "content": user_task}],
         )
-        parsed = {
-            "product_name": product_name,
-            "prompt": fallback_prompt,
-            "openai_prompt_warning": parsed.get("error"),
-            "used_local_prompt_fallback": not bool(raw_fallback and len(raw_fallback) >= 80),
-        }
-    prompt_text = str(parsed.get("prompt") or "").strip()
-    if style == "warehouse" and len(prompt_text) >= 1900:
-        # Avoid a second paid model call: trim at the nearest sentence boundary.
-        shortened = prompt_text[:1875]
-        cut = max(shortened.rfind(". "), shortened.rfind("; "))
-        prompt_text = shortened[:cut + 1] if cut > 1400 else shortened
-        parsed["prompt"] = prompt_text
-    parsed["char_count"] = len(prompt_text)
-    parsed.setdefault("product_name", product_name)
-    if chosen_broll_scene:
-        parsed["broll_scene"] = chosen_broll_scene
-    return parsed
+
+        parsed = _extract_json_object(response.content[0].text)
+        if parsed is None:
+            return {
+                "prompt": response.content[0].text,
+                "product_name": product_name,
+                "error": "Couldn't parse JSON",
+            }
+
+        prompt_text = str(parsed.get("prompt") or "").strip()
+        parsed["char_count"] = len(prompt_text)
+
+        # The Warehouse skill requires a verified, actual count below 1,900 characters.
+        if style == "warehouse" and prompt_text and len(prompt_text) >= 1900:
+            retry = client.messages.create(
+                model=MODEL,
+                max_tokens=2048,
+                system=system,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"Rewrite this Warehouse prompt so the actual Python len() is under 1900 characters. "
+                        f"Preserve every product-accuracy detail and all hard rules; trim only background wording.\n\n"
+                        f"Product: {product_name}\nPrompt to shorten:\n{prompt_text}"
+                    ),
+                }],
+            )
+            retry_parsed = _extract_json_object(retry.content[0].text)
+            if retry_parsed and retry_parsed.get("prompt"):
+                parsed = retry_parsed
+                prompt_text = str(parsed.get("prompt") or "").strip()
+                parsed["char_count"] = len(prompt_text)
+
+        if style == "warehouse" and len(prompt_text) >= 1900:
+            return {
+                "error": f"Warehouse prompt is {len(prompt_text)} characters; it must be under 1900.",
+                "product_name": product_name,
+                "prompt": prompt_text,
+                "char_count": len(prompt_text),
+            }
+
+        if chosen_broll_scene:
+            parsed["broll_scene"] = chosen_broll_scene
+        return parsed
+
+    except Exception as e:
+        return {"error": str(e), "product_name": product_name}
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  VIDEO GENERATOR (OpenAI prompts + Claude Haiku native Magnific MCP bridge)
+#  VIDEO GENERATOR (Claude + Magnific MCP)
 # ═══════════════════════════════════════════════════════════════════
 
 GENERATE_SYSTEM = """You are a video production assistant. You have access to Magnific tools.
 
 Your job:
-1. Upload every provided product image using the appropriate upload tool from the LIVE Magnific tool list. Do not assume or invent an upload tool name.
+1. Upload every provided product image to Magnific using creations_upload_image.
 2. Generate a video using video_generate with:
    - The prompt provided
    - EVERY uploaded image attached only as a general image/reference input for visual accuracy
@@ -4228,28 +3268,85 @@ def generate_video(
     duration: int,
     image_urls: list[str] | None = None,
 ) -> dict:
-    """Generate a Seedance video through Magnific OAuth MCP; OpenAI writes prompts, Claude Haiku only executes MCP tools."""
-    refs = [u for u in (image_urls or [image_url]) if u] or [image_url]
-    refs_text = "\n".join(f"Reference image {i+1}: {url}" for i, url in enumerate(refs) if url)
-    return _openai_magnific(
-        api_key,
-        magnific_token,
-        instructions=GENERATE_SYSTEM,
-        user_text=(
-            f"Upload every image below and generate a {duration}s video.\n"
-            "Attach ALL uploaded images only as general image/reference inputs. "
-            "NEVER use any image as a start frame, start_image, initial frame, end frame, or keyframe.\n"
-            "Image 1 has the highest product-accuracy priority, but it must remain a general reference only.\n"
-            f"{refs_text}\n\nPrompt:\n{prompt}"
-        ),
-        max_output_tokens=700,
-    )
+    """Upload one or more reference images + generate video via Magnific MCP."""
+    mcp_servers = [{
+        "type": "url",
+        "url": MAGNIFIC_MCP_URL,
+        "name": MAGNIFIC_MCP_NAME,
+    }]
+    if magnific_token:
+        mcp_servers[0]["authorization_token"] = magnific_token
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        refs = [u for u in (image_urls or [image_url]) if u]
+        if not refs:
+            refs = [image_url]
+        refs_text = "\n".join(f"Reference image {i+1}: {url}" for i, url in enumerate(refs))
+
+        response = client.beta.messages.create(
+            model=MODEL,
+            max_tokens=2048,
+            system=GENERATE_SYSTEM,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Upload every image below and generate a {duration}s video.\n"
+                    f"Attach ALL uploaded images only as general image/reference inputs. "
+                    f"NEVER use any image as a start frame, start_image, initial frame, end frame, or keyframe.\n"
+                    f"Image 1 has the highest product-accuracy priority, but it must still remain a general reference only.\n"
+                    f"{refs_text}\n\n"
+                    f"Prompt:\n{prompt}"
+                ),
+            }],
+            mcp_servers=mcp_servers,
+            tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
+            betas=[MCP_BETA],
+        )
+
+        result = {"creation_id": None, "status": "unknown", "error": None}
+
+        # Parse text response
+        for block in response.content:
+            if block.type == "text":
+                try:
+                    cleaned = re.sub(r'```json\s*|```\s*', '', block.text)
+                    j = cleaned.find("{")
+                    k = cleaned.rfind("}") + 1
+                    if j >= 0 and k > j:
+                        parsed = json.loads(cleaned[j:k])
+                        result.update({k2: v for k2, v in parsed.items() if v is not None})
+                except json.JSONDecodeError:
+                    pass
+
+            elif block.type == "mcp_tool_result":
+                if hasattr(block, "content") and block.content:
+                    for sub in block.content:
+                        if hasattr(sub, "text"):
+                            try:
+                                tr = json.loads(sub.text)
+                                if isinstance(tr, dict):
+                                    if "creations" in tr:
+                                        for c in tr["creations"]:
+                                            if "identifier" in c:
+                                                result["creation_id"] = c["identifier"]
+                                                result["status"] = c.get("status", "queued")
+                                    elif "identifier" in tr:
+                                        result["creation_id"] = tr["identifier"]
+                                        result["status"] = tr.get("status", "queued")
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+
+        return result
+
+    except Exception as e:
+        return {"creation_id": None, "status": "error", "error": str(e)}
 
 
 
 LIFESTYLE_IMAGE_GENERATE_SYSTEM = """You are an image production assistant with access to Magnific tools.
 Use the same Magnific MCP account already configured in the app.
-1. Upload EVERY provided reference image using the appropriate upload tool from the LIVE Magnific tool list. Do not assume or invent an upload tool name.
+1. Upload EVERY provided reference image to Magnific using creations_upload_image.
 2. REFERENCE IMAGE 1 IS AUTHORITATIVE for the product as sold: exact package/container/form factor, silhouette, dimensions, closure, branding, label layout, colors, materials, and included parts. Never override reference 1 with a secondary image.
 3. References 2+ may be official alternate views or customer review photos. Use them only to improve secondary detail, real-world scale, texture, and appearance. If a review photo shows the product decanted, transferred, opened, poured, placed in another jar/bottle/container, or otherwise used differently from reference 1, IGNORE that alternate container/state for the final product form.
 4. HARD PRODUCT-FORM LOCK: never repackage, decant, transfer, reshape, or substitute the product. A pouch/bag must remain that exact pouch/bag; a sachet/stick pack must remain that exact sachet/stick pack; a bottle remains that bottle; a jar/tub remains that jar/tub; a box/carton remains that box/carton; a can/canister remains that can/canister; a tube remains that tube; an appliance/device remains its exact housing. Never convert one package type into another.
@@ -4271,11 +3368,12 @@ def generate_lifestyle_image_magnific(
     reference_urls: list[str],
     prompt: str,
 ) -> dict:
-    """Generate one 2K, 9:16 lifestyle approval image in Magnific; Claude Haiku is used only as the native MCP bridge."""
+    """Generate one 2K, 9:16 lifestyle approval image in Magnific with Nano Banana 2 Pro."""
     if not api_key:
-        return {"creation_id": None, "status": "error", "error": "OpenAI API key is missing."}
+        return {"creation_id": None, "status": "error", "error": "The Anthropic API key is missing."}
     if not magnific_token:
-        return {"creation_id": None, "status": "error", "error": "Magnific OAuth token is missing. Add MAGNIFIC_AUTH_TOKEN to Streamlit secrets."}
+        return {"creation_id": None, "status": "error", "error": "The Magnific authorization token is missing."}
+
     refs = []
     for url in reference_urls or []:
         cleaned = str(url or "").strip()
@@ -4283,29 +3381,252 @@ def generate_lifestyle_image_magnific(
             refs.append(cleaned)
         if len(refs) == 6:
             break
+
     if not refs:
         return {"creation_id": None, "status": "error", "error": "Select at least one product reference image."}
-    refs_text = "\n\n".join(f"Reference image {idx}: {ref}" for idx, ref in enumerate(refs, start=1))
-    result = _openai_magnific(
-        api_key,
-        magnific_token,
-        instructions=LIFESTYLE_IMAGE_GENERATE_SYSTEM,
-        user_text=(
-            f"Generate exactly one lifestyle approval image for {product_name}.\n"
-            "Required Magnific settings: use Nano Banana 2, quality Pro, resolution 2k, and aspect ratio 9:16.\n"
-            "Reference image 1 is the PRIMARY source of truth for the exact sold package/container/form. Secondary images may show alternate views or customer usage but MUST NOT override the package type or physical form from reference 1. Preserve the product exactly while placing it into the requested clean, realistic lifestyle scene.\n\n"
-            f"{refs_text}\n\nFinal image prompt:\n{prompt}"
-        ),
-        max_output_tokens=700,
-    )
-    result["provider"] = "Magnific"
-    result["image_model"] = LIFESTYLE_MAGNIFIC_IMAGE_MODEL
-    result["image_quality"] = LIFESTYLE_MAGNIFIC_IMAGE_QUALITY
-    result["image_resolution"] = "2K"
-    result["image_aspect_ratio"] = "9:16"
-    result["reference_count"] = len(refs)
-    return result
 
+    mcp_servers = [{
+        "type": "url",
+        "url": MAGNIFIC_MCP_URL,
+        "name": MAGNIFIC_MCP_NAME,
+        "authorization_token": magnific_token,
+    }]
+
+    reference_lines = []
+    for idx, ref in enumerate(refs, start=1):
+        reference_lines.append(f"Reference image {idx}: {ref}")
+    refs_text = "\n\n".join(reference_lines)
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.beta.messages.create(
+            model=MODEL,
+            max_tokens=2048,
+            system=LIFESTYLE_IMAGE_GENERATE_SYSTEM,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Generate exactly one lifestyle approval image for {product_name}.\n"
+                    "Required Magnific settings: use Nano Banana 2, quality Pro, resolution 2k, and aspect ratio 9:16.\n"
+                    "Reference image 1 is the PRIMARY source of truth for the exact sold package/container/form. Secondary images may show alternate views or customer usage but MUST NOT override the package type or physical form from reference 1. Preserve the product exactly while placing it into the requested clean, realistic lifestyle scene.\n\n"
+                    f"{refs_text}\n\n"
+                    f"Final image prompt:\n{prompt}"
+                ),
+            }],
+            mcp_servers=mcp_servers,
+            tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
+            betas=[MCP_BETA],
+        )
+        result = _parse_magnific_creation_response(response)
+        result["provider"] = "Magnific"
+        result["image_model"] = LIFESTYLE_MAGNIFIC_IMAGE_MODEL
+        result["image_quality"] = LIFESTYLE_MAGNIFIC_IMAGE_QUALITY
+        result["image_resolution"] = "2K"
+        result["image_aspect_ratio"] = "9:16"
+        result["reference_count"] = len(refs)
+        return result
+    except Exception as exc:
+        return {"creation_id": None, "status": "error", "error": f"Magnific lifestyle image generation failed: {exc}"}
+
+
+def _parse_magnific_creation_response(response) -> dict:
+    """Normalize Magnific MCP responses and preserve the actual MCP failure when one occurs."""
+    result = {
+        "creation_id": None,
+        "status": "unknown",
+        "url": None,
+        "preview_url": None,
+        "error": None,
+        "mcp_tools_called": [],
+        "mcp_stop_reason": getattr(response, "stop_reason", None),
+    }
+
+    status_aliases = {
+        "created": "queued",
+        "submitted": "queued",
+        "succeeded": "completed",
+        "success": "completed",
+        "done": "completed",
+        "finished": "completed",
+        "pending": "queued",
+        "running": "processing",
+        "failed": "error",
+        "failure": "error",
+    }
+    tool_names_by_id = {}
+    tool_error_messages = []
+    plain_text_messages = []
+
+    def normalize_status(value):
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip().lower()
+        return status_aliases.get(normalized, normalized)
+
+    def absorb(payload):
+        if not isinstance(payload, (dict, list)):
+            return
+        url_candidates = []
+
+        def walk(value, path=()):
+            if isinstance(value, dict):
+                for id_key in (
+                    "identifier", "creation_id", "creationId", "task_id", "taskId",
+                    "generation_id", "generationId", "job_id", "jobId", "id",
+                ):
+                    candidate = value.get(id_key)
+                    if candidate and not result.get("creation_id"):
+                        result["creation_id"] = str(candidate)
+                        break
+
+                for status_key in ("status", "state", "creation_status", "creationStatus"):
+                    candidate = normalize_status(value.get(status_key))
+                    if candidate:
+                        result["status"] = candidate
+                        break
+
+                for error_key in ("error", "error_message", "errorMessage"):
+                    candidate = value.get(error_key)
+                    if candidate:
+                        if isinstance(candidate, dict):
+                            candidate = candidate.get("message") or candidate.get("detail") or json.dumps(candidate)[:1000]
+                        tool_error_messages.append(str(candidate)[:1200])
+
+                for key, child in value.items():
+                    key_lower = str(key).lower()
+                    child_path = path + (key_lower,)
+                    if isinstance(child, str) and child.startswith(("http://", "https://")):
+                        path_text = " ".join(child_path)
+                        score = 0
+                        is_preview = "preview" in key_lower or "preview" in path_text
+                        if key_lower in {"imageurl", "image_url", "videourl", "video_url", "downloadurl", "download_url"}:
+                            score += 130
+                        elif key_lower in {"outputurl", "output_url", "resulturl", "result_url", "mediaurl", "media_url", "generated"}:
+                            score += 115
+                        elif key_lower in {"url", "fileurl", "file_url"}:
+                            score += 80
+                        elif is_preview:
+                            score += 60
+                        if any(token in path_text for token in ("output", "result", "generated", "image", "video", "media", "asset", "download")):
+                            score += 25
+                        if any(token in path_text for token in ("input", "reference", "source", "uploaded")):
+                            score -= 90
+                        url_candidates.append((score, is_preview, child))
+                    walk(child, child_path)
+            elif isinstance(value, list):
+                for index, child in enumerate(value):
+                    walk(child, path + (str(index),))
+
+        walk(payload)
+        if url_candidates:
+            url_candidates.sort(key=lambda item: item[0], reverse=True)
+            for _score, is_preview, url in url_candidates:
+                if is_preview and not result.get("preview_url"):
+                    result["preview_url"] = url
+                elif not is_preview and not result.get("url"):
+                    result["url"] = url
+            if not result.get("url"):
+                result["url"] = url_candidates[0][2]
+
+    for block in getattr(response, "content", []) or []:
+        block_type = getattr(block, "type", "")
+
+        if block_type == "mcp_tool_use":
+            tool_name = str(getattr(block, "name", "") or "unknown_tool")
+            tool_id = str(getattr(block, "id", "") or "")
+            if tool_id:
+                tool_names_by_id[tool_id] = tool_name
+            if tool_name not in result["mcp_tools_called"]:
+                result["mcp_tools_called"].append(tool_name)
+            continue
+
+        if block_type == "text":
+            raw = getattr(block, "text", "") or ""
+            if raw.strip():
+                plain_text_messages.append(raw.strip()[:1500])
+            try:
+                cleaned = re.sub(r'```json\s*|```\s*', '', raw)
+                start_json = cleaned.find("{")
+                end_json = cleaned.rfind("}") + 1
+                if start_json >= 0 and end_json > start_json:
+                    parsed = json.loads(cleaned[start_json:end_json])
+                    if isinstance(parsed, dict):
+                        if parsed.get("creation_id"):
+                            result["creation_id"] = str(parsed["creation_id"])
+                        if parsed.get("identifier") and not result.get("creation_id"):
+                            result["creation_id"] = str(parsed["identifier"])
+                        if parsed.get("task_id") and not result.get("creation_id"):
+                            result["creation_id"] = str(parsed["task_id"])
+                        if parsed.get("status"):
+                            result["status"] = normalize_status(str(parsed["status"])) or result["status"]
+                        if parsed.get("url"):
+                            result["url"] = parsed["url"]
+                        if parsed.get("preview_url"):
+                            result["preview_url"] = parsed["preview_url"]
+                        if parsed.get("error"):
+                            tool_error_messages.append(str(parsed["error"])[:1200])
+                        absorb(parsed)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+            continue
+
+        if block_type == "mcp_tool_result":
+            tool_use_id = str(getattr(block, "tool_use_id", "") or "")
+            tool_name = tool_names_by_id.get(tool_use_id, "Magnific MCP tool")
+            is_error = bool(getattr(block, "is_error", False))
+            subcontents = getattr(block, "content", None) or []
+            if isinstance(subcontents, str):
+                subcontents = [subcontents]
+
+            raw_parts = []
+            for sub in subcontents:
+                raw = sub if isinstance(sub, str) else getattr(sub, "text", None)
+                if raw:
+                    raw_parts.append(str(raw))
+                    try:
+                        absorb(json.loads(str(raw)))
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        pass
+            raw_joined = "\n".join(raw_parts).strip()
+            if is_error:
+                if raw_joined:
+                    tool_error_messages.append(f"{tool_name}: {raw_joined[:1600]}")
+                else:
+                    tool_error_messages.append(f"{tool_name} returned an MCP error with no message.")
+            elif raw_joined and not result.get("creation_id"):
+                # Some MCP servers return human-readable text instead of JSON.
+                id_patterns = [
+                    r'(?i)(?:creation|task|job|generation)[ _-]?(?:id|identifier)\s*[:=]\s*["\']?([A-Za-z0-9_-]{8,})',
+                    r'(?i)identifier\s*[:=]\s*["\']?([A-Za-z0-9_-]{8,})',
+                ]
+                for pattern in id_patterns:
+                    match = re.search(pattern, raw_joined)
+                    if match:
+                        result["creation_id"] = match.group(1)
+                        break
+
+    if result.get("creation_id") and result.get("status") in {None, "", "unknown"}:
+        result["status"] = "queued"
+
+    if tool_error_messages:
+        result["error"] = " | ".join(dict.fromkeys(tool_error_messages))[:2200]
+        if result.get("status") in {None, "", "unknown"}:
+            result["status"] = "error"
+
+    if not result.get("creation_id") and not result.get("url") and not result.get("preview_url") and not result.get("error"):
+        if not result.get("mcp_tools_called"):
+            extra = f" Claude stop reason: {result.get('mcp_stop_reason')}." if result.get("mcp_stop_reason") else ""
+            text_hint = f" Response: {plain_text_messages[-1][:800]}" if plain_text_messages else ""
+            result["error"] = (
+                "Claude did not call any Magnific MCP tool, so the image generation was never submitted to Magnific."
+                + extra + text_hint
+            )
+        else:
+            tools = ", ".join(result.get("mcp_tools_called") or [])
+            text_hint = f" Last response: {plain_text_messages[-1][:800]}" if plain_text_messages else ""
+            result["error"] = f"Magnific MCP tool(s) ran ({tools}) but no creation/task ID or output URL was returned.{text_hint}"
+
+    return result
 
 def _is_real_magnific_creation_id(value) -> bool:
     """Reject template/example IDs that can make the UI think an MCP job was submitted."""
@@ -4327,6 +3648,156 @@ def _is_real_magnific_creation_id(value) -> bool:
 
 
 
+def _anthropic_blocks_to_message_params(blocks) -> list[dict]:
+    """Serialize Anthropic response blocks so completed MCP results can be round-tripped."""
+    serialized = []
+    for block in blocks or []:
+        try:
+            if hasattr(block, "model_dump"):
+                data = block.model_dump(mode="json", exclude_none=True)
+            elif isinstance(block, dict):
+                data = dict(block)
+            else:
+                continue
+            if isinstance(data, dict) and data.get("type"):
+                serialized.append(data)
+        except Exception:
+            continue
+    return serialized
+
+
+def _magnific_result_is_incomplete_only(result: dict) -> bool:
+    """Return True when MCP made progress but generation has not been submitted yet."""
+    if not isinstance(result, dict):
+        return True
+    if _is_real_magnific_creation_id(result.get("creation_id")) or result.get("url") or result.get("preview_url"):
+        return False
+    error = str(result.get("error") or "")
+    if not error:
+        return True
+    markers = (
+        "Magnific MCP tool(s) ran",
+        "Claude did not call any Magnific MCP tool",
+        "no creation/task ID or output URL was returned",
+    )
+    return any(marker in error for marker in markers)
+
+
+def _run_magnific_mcp_sequence(
+    client,
+    system: str,
+    initial_content: str,
+    mcp_servers: list[dict],
+    continuation_instruction: str,
+    max_turns: int = 8,
+) -> dict:
+    """Continue dependent Magnific MCP actions across Claude turns until generation is submitted.
+
+    Some Magnific tasks require upload -> generate. The remote MCP connector can finish an
+    upload and let Claude end the turn. We round-trip that MCP result and tell Claude to
+    continue, rather than incorrectly treating the upload as the end of the workflow.
+    """
+    messages = [{"role": "user", "content": initial_content}]
+    tools = [{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}]
+    all_tools = []
+    last_text = ""
+    last_result = {}
+
+    for turn_index in range(max(1, int(max_turns))):
+        try:
+            response = client.beta.messages.create(
+                model=MODEL,
+                max_tokens=2048,
+                system=system,
+                messages=messages,
+                mcp_servers=mcp_servers,
+                tools=tools,
+                betas=[MCP_BETA],
+            )
+        except Exception as exc:
+            return {
+                "creation_id": None,
+                "status": "error",
+                "error": f"Magnific MCP sequence failed on step {turn_index + 1}: {exc}",
+                "mcp_tools_called": all_tools,
+                "mcp_turns": turn_index + 1,
+            }
+
+        parsed = _parse_magnific_creation_response(response)
+        last_result = dict(parsed or {})
+        for tool_name in parsed.get("mcp_tools_called") or []:
+            if tool_name not in all_tools:
+                all_tools.append(tool_name)
+
+        text_parts = []
+        for block in getattr(response, "content", []) or []:
+            if getattr(block, "type", "") == "text":
+                value = str(getattr(block, "text", "") or "").strip()
+                if value:
+                    text_parts.append(value)
+        if text_parts:
+            last_text = text_parts[-1][:1400]
+
+        if _is_real_magnific_creation_id(parsed.get("creation_id")) or parsed.get("url") or parsed.get("preview_url"):
+            parsed["mcp_tools_called"] = all_tools
+            parsed["mcp_turns"] = turn_index + 1
+            return parsed
+
+        # Stop only for a real MCP error. Generic "upload happened but no ID yet"
+        # means the dependent workflow needs another Claude turn.
+        if parsed.get("error") and not _magnific_result_is_incomplete_only(parsed):
+            parsed["mcp_tools_called"] = all_tools
+            parsed["mcp_turns"] = turn_index + 1
+            return parsed
+
+        assistant_content = _anthropic_blocks_to_message_params(getattr(response, "content", []) or [])
+        stop_reason = str(getattr(response, "stop_reason", "") or "").strip().lower()
+
+        # Remote MCP calls are server-executed tools. If Anthropic pauses the
+        # server-side loop (or returns an MCP tool-use block whose result has not
+        # arrived yet), resume by passing the paused assistant content back AS-IS.
+        # Do not add a user continuation message until every mcp_tool_use has a
+        # corresponding mcp_tool_result, or the API rejects the request with 400.
+        pending_tool_ids = set()
+        completed_tool_ids = set()
+        for block in assistant_content:
+            block_type = str(block.get("type") or "") if isinstance(block, dict) else ""
+            if block_type == "mcp_tool_use" and block.get("id"):
+                pending_tool_ids.add(str(block.get("id")))
+            elif block_type == "mcp_tool_result" and block.get("tool_use_id"):
+                completed_tool_ids.add(str(block.get("tool_use_id")))
+        unresolved_mcp_ids = pending_tool_ids - completed_tool_ids
+
+        if assistant_content:
+            messages.append({"role": "assistant", "content": assistant_content})
+
+        if stop_reason == "pause_turn" or unresolved_mcp_ids:
+            # Resume the still-open server-tool turn with the same MCP toolset.
+            # No user message is allowed here.
+            continue
+
+        # The previous assistant turn is complete, but it only made partial
+        # progress (for example, uploaded references and then narrated). Now it
+        # is safe to send a fresh user instruction telling Claude to perform the
+        # remaining Magnific generation action without repeating completed work.
+        messages.append({
+            "role": "user",
+            "content": continuation_instruction + "\nContinue from the successful MCP results above; do not restart or repeat completed uploads.",
+        })
+
+    return {
+        "creation_id": None,
+        "status": "error",
+        "error": (
+            f"Magnific MCP made progress but did not reach the generation call after {max_turns} turns. "
+            f"Tools seen: {', '.join(all_tools) or 'none'}."
+            + (f" Last response: {last_text}" if last_text else "")
+        ),
+        "mcp_tools_called": all_tools,
+        "mcp_turns": max_turns,
+        "last_partial_result": last_result,
+    }
+
 def generate_lifestyle_kling_magnific(
     api_key: str,
     magnific_token: str,
@@ -4334,19 +3805,36 @@ def generate_lifestyle_kling_magnific(
     prompt: str,
     duration: int,
 ) -> dict:
-    """Animate an approved lifestyle still with Kling O1 through the native Magnific MCP bridge."""
+    """Animate an approved lifestyle still with Kling O1 through the same Magnific MCP connection."""
     duration = 5
-    return _openai_magnific(
-        api_key,
-        magnific_token,
-        instructions=LIFESTYLE_KLING_GENERATE_SYSTEM,
-        user_text=(
-            f"Approved lifestyle image: {approved_image_url}\n"
-            "Generate a 5-second Kling O1 video with start frame behavior from the approved image, 720p resolution, 9:16 aspect ratio, and sound off.\n\n"
-            f"Kling prompt:\n{prompt}"
-        ),
-        max_output_tokens=650,
-    )
+    mcp_servers = [{
+        "type": "url",
+        "url": MAGNIFIC_MCP_URL,
+        "name": MAGNIFIC_MCP_NAME,
+    }]
+    if magnific_token:
+        mcp_servers[0]["authorization_token"] = magnific_token
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.beta.messages.create(
+            model=MODEL,
+            max_tokens=2048,
+            system=LIFESTYLE_KLING_GENERATE_SYSTEM,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Approved lifestyle image: {approved_image_url}\n"
+                    f"Generate a 5-second Kling O1 video with start frame behavior from the approved image, 720p resolution, 9:16 aspect ratio, and sound off.\n\nKling prompt:\n{prompt}"
+                ),
+            }],
+            mcp_servers=mcp_servers,
+            tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
+            betas=[MCP_BETA],
+        )
+        return _parse_magnific_creation_response(response)
+    except Exception as exc:
+        return {"creation_id": None, "status": "error", "error": str(exc)}
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -4357,23 +3845,14 @@ CHECK_STATUS_SYSTEM = """You have access to Magnific tools. Check the status of 
 and return its details.
 
 Use creations_get with the identifier provided. Return ONLY valid JSON (no markdown):
-{"status": "completed|queued|processing|error", "url": "full-resolution IMAGE OR VIDEO output URL or null", "preview_url": "preview URL or null"}
+{"status": "completed|queued|processing|error", "url": "full-res video URL or null", "preview_url": "preview URL or null"}
 
-The creation may be an image or a video. If it is completed, return the actual generated media URL.
-Do not return an input/reference/upload URL as the output. Extract the finished output from fields such
-as imageUrl, videoUrl, outputUrl, resultUrl, mediaUrl, downloadUrl, url, or previewUrl.
+If the creation is a video and it's completed, the url field should contain the video URL.
+Extract URLs from the creation data — look for fields like url, videoUrl, previewUrl, etc.
 """
 
 def _extract_status_payload(payload, result: dict):
-    """Extract status and output URLs from JSON or Magnific TOON/text creation responses."""
-    if isinstance(payload, str):
-        _absorb_magnific_toon_text(payload, result, include_creation_id=False)
-        return result
-    if isinstance(payload, dict):
-        for toon_key in ("text", "content", "message"):
-            toon_value = payload.get(toon_key)
-            if isinstance(toon_value, str):
-                _absorb_magnific_toon_text(toon_value, result, include_creation_id=False)
+    """Extract status and output URLs from nested Magnific creation responses."""
     url_candidates = []
 
     def walk(value, path=()):
@@ -4400,8 +3879,8 @@ def _extract_status_payload(payload, result: dict):
                 if isinstance(child, str) and child.startswith(("http://", "https://")):
                     path_text = " ".join(child_path)
                     score = 0
-                    if key_lower in {"imageurl", "image_url", "image", "videourl", "video_url", "video", "downloadurl", "download_url"}:
-                        score += 135
+                    if key_lower in {"videourl", "video_url", "video", "downloadurl", "download_url"}:
+                        score += 120
                     elif key_lower in {"outputurl", "output_url", "resulturl", "result_url", "mediaurl", "media_url"}:
                         score += 105
                     elif key_lower in {"url", "fileurl", "file_url"}:
@@ -4435,112 +3914,64 @@ def _extract_status_payload(payload, result: dict):
 
 
 def check_creation_status(api_key: str, magnific_token: str, creation_id: str) -> dict:
-    """Check one Magnific creation using the proven Anthropic native OAuth MCP path.
-
-    Keep this separate from the generation planner. Status checks are deterministic:
-    call creations_get for the saved identifier and extract the finished media URL.
-    """
-    if not creation_id:
-        return {"status": "error", "url": None, "preview_url": None, "error": "Missing Magnific creation ID."}
-    if not magnific_token:
-        return {"status": "error", "url": None, "preview_url": None, "error": "Magnific OAuth token is missing."}
-    if anthropic is None:
-        return {"status": "error", "url": None, "preview_url": None, "error": "The anthropic package is missing for the Magnific MCP bridge."}
-
-    anthropic_key = ""
-    try:
-        anthropic_key = str(st.secrets.get("ANTHROPIC_API_KEY", "") or "").strip()
-    except Exception:
-        anthropic_key = str(os.environ.get("ANTHROPIC_API_KEY", "") or "").strip()
-    if not anthropic_key:
-        anthropic_key = str(st.session_state.get("runtime_anthropic_api_key", "") or "").strip()
-    if not anthropic_key:
-        return {"status": "error", "url": None, "preview_url": None, "error": "Anthropic API key is missing for Magnific status refresh."}
-
+    """Check a Magnific creation's status via MCP."""
     mcp_servers = [{
         "type": "url",
         "url": MAGNIFIC_MCP_URL,
         "name": MAGNIFIC_MCP_NAME,
-        "authorization_token": magnific_token,
     }]
+    if magnific_token:
+        mcp_servers[0]["authorization_token"] = magnific_token
 
     try:
-        client = anthropic.Anthropic(api_key=anthropic_key)
+        client = anthropic.Anthropic(api_key=api_key)
         response = client.beta.messages.create(
-            model=MAGNIFIC_MCP_MODEL,
-            max_tokens=1200,
+            model=MODEL,
+            max_tokens=2048,
             system=CHECK_STATUS_SYSTEM,
             messages=[{
                 "role": "user",
-                "content": f"Check the status of creation: {creation_id}. Call creations_get with this exact identifier and return the finished image/video URL when available."
+                "content": f"Check the status of creation: {creation_id}"
             }],
             mcp_servers=mcp_servers,
             tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
             betas=[MCP_BETA],
         )
 
-        result = {"status": "unknown", "url": None, "preview_url": None, "error": None}
-        saw_tool_result = False
-        raw_debug = []
+        result = {"status": "unknown", "url": None, "preview_url": None}
 
-        for block in getattr(response, "content", []) or []:
-            block_type = getattr(block, "type", "")
-            if block_type == "text":
-                raw = str(getattr(block, "text", "") or "")
-                if raw.strip():
-                    raw_debug.append(raw.strip()[:1200])
+        for block in response.content:
+            if block.type == "text":
                 try:
-                    cleaned = re.sub(r'```json\s*|```\s*', '', raw)
+                    cleaned = re.sub(r'```json\s*|```\s*', '', block.text)
                     j = cleaned.find("{")
                     k = cleaned.rfind("}") + 1
                     if j >= 0 and k > j:
                         parsed = json.loads(cleaned[j:k])
-                        if isinstance(parsed, dict):
-                            _extract_status_payload(parsed, result)
-                            for field in ("status", "url", "preview_url"):
-                                if parsed.get(field):
-                                    result[field] = parsed[field]
-                except (json.JSONDecodeError, TypeError, ValueError):
+                        _extract_status_payload(parsed, result)
+                        for field in ("status", "url", "preview_url"):
+                            if parsed.get(field):
+                                result[field] = parsed[field]
+                except (json.JSONDecodeError, TypeError):
                     pass
 
-            elif block_type == "mcp_tool_result" and getattr(block, "content", None):
-                saw_tool_result = True
+            elif block.type == "mcp_tool_result" and getattr(block, "content", None):
                 for sub in block.content:
-                    raw = sub if isinstance(sub, str) else getattr(sub, "text", None)
-                    if not raw:
+                    if not hasattr(sub, "text"):
                         continue
-                    raw_debug.append(str(raw)[:1800])
-                    raw_text = str(raw)
-                    _absorb_magnific_toon_text(raw_text, result, include_creation_id=False)
                     try:
-                        payload = json.loads(raw_text)
-                        _extract_status_payload(payload, result)
-                    except (json.JSONDecodeError, TypeError, ValueError):
-                        # Some MCP results are text-wrapped JSON; try to isolate the object.
-                        j = raw_text.find("{")
-                        k = raw_text.rfind("}") + 1
-                        if j >= 0 and k > j:
-                            try:
-                                payload = json.loads(raw_text[j:k])
-                                _extract_status_payload(payload, result)
-                            except Exception:
-                                pass
+                        tool_payload = json.loads(sub.text)
+                        _extract_status_payload(tool_payload, result)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
 
-        # Finished media beats any nested status from references/uploads.
-        if result.get("url") or result.get("preview_url"):
-            result["status"] = "completed"
-            result["error"] = None
-        elif result.get("status") == "completed":
+        # Never mark the job finished until an actual output URL is available.
+        if result.get("status") == "completed" and not (result.get("url") or result.get("preview_url")):
             result["status"] = "processing"
-        elif result.get("status") in {None, "", "unknown"} and not saw_tool_result:
-            result["error"] = "Magnific status refresh did not return a creations_get result."
-
-        if result.get("error") and raw_debug:
-            result["debug"] = raw_debug[-1][:1800]
         return result
 
-    except Exception as exc:
-        return {"status": "error", "url": None, "preview_url": None, "error": f"Magnific status refresh failed: {exc}"}
+    except Exception as e:
+        return {"status": "error", "url": None, "error": str(e)}
 
 def push_generated_image_to_director(
     ingest_key: str,
@@ -5073,7 +4504,7 @@ def _prepare_image_for_avatar_analysis(
     max_bytes: int = 3 * 1024 * 1024,
     max_edge: int = 1600,
 ) -> tuple[bytes, str]:
-    """Resize/compress a reference image for OpenAI vision only.
+    """Resize/compress a reference image for Claude vision only.
 
     The original image bytes are left untouched elsewhere and are still used for
     Magnific GPT Image 2 generation. This only prevents oversized base64 images
@@ -5159,7 +4590,7 @@ def _prepare_image_for_magnific_mcp_reference(
     """Create a compact reference copy for Magnific MCP transport.
 
     Local images cannot be referenced by a public URL, so the MCP bridge needs a
-    data URI. Sending the original multi-megabyte file inside the OpenAI request
+    data URI. Sending the original multi-megabyte file inside the Claude message
     can blow past the prompt-token limit. This makes a small JPEG reference copy
     while leaving the original source file untouched.
     """
@@ -5228,7 +4659,7 @@ def _prepare_image_for_magnific_mcp_reference(
 
 
 def _trim_magnific_reference_payload(avatar_reference: str, outfit_references: list[str], max_data_uri_chars: int = 520_000) -> tuple[str, list[str], int]:
-    """Keep MCP reference payload safely below the AI request limit.
+    """Keep MCP reference payload safely below Claude's prompt limit.
 
     Hosted HTTP(S) URLs are tiny and are always retained. Data-URI references are
     retained in priority order until the conservative character budget is reached.
@@ -5258,25 +4689,45 @@ def analyze_avatar_outfit_images(
     avatar_mime: str,
     outfit_images: list[dict],
 ) -> dict:
-    """Analyze avatar + outfit refs using low-cost OpenAI GPT-4o mini vision."""
+    """Analyze one avatar plus multiple outfit/listing/review references."""
     if not api_key:
-        return {"error": "OpenAI API key is missing."}
+        return {"error": "Anthropic API key is missing."}
     if not avatar_bytes or not outfit_images:
         return {"error": "Choose an avatar and at least one outfit image."}
 
     system = """You analyze images for an AI-avatar clothing try-on workflow.
 Image 1 is always the AVATAR. Every later image is an OUTFIT REFERENCE. Outfit references may include official listing photos and customer review photos showing the same product from different angles or in real use.
+
 For the avatar, describe ONLY visible physical appearance: build, descriptive skin tone, hair style/length/color, visible facial hair, visible face details, and clearly visible tattoos/piercings/features. Do NOT describe the avatar's current clothing. Do NOT use age words. Do NOT use race or ethnicity labels. Do not guess.
-For the outfit, combine evidence from ALL outfit references. Describe ONLY the clothing/footwear product, never the people modeling it. Prioritize clear official listing images for product color/design; use review photos for real-world fit and details. Do NOT use brand names.
-Determine whether shoes are included. If not, return clean white sneakers. If only a top is visible and there is no matching bottom, set bottom_fallback to black fitted jogger pants; otherwise leave it empty.
-Return ONLY valid JSON with: avatar_description, outfit_description, shoes_description, bottom_fallback, outfit_has_shoes, outfit_has_bottom."""
+
+For the outfit, combine evidence from ALL outfit references. Describe ONLY the clothing/footwear product, never the people modeling it. Use repeated views to improve accuracy for garment pieces, silhouette/fit, neckline/collar, visible material look, colors, pattern/print, buttons/zippers/drawstrings/pockets, front/back/side construction, and footwear. If a customer review image conflicts with a clearer official listing image, prioritize the official listing image for product color/design while using review photos for real-world fit and details. Do NOT use brand names; describe visual design instead.
+
+Determine whether shoes are visibly included in any selected outfit reference. If shoes are visible, describe them. If not, return clean white sneakers as the default. If only a top is visible across all selected references with no matching bottom, set bottom_fallback to black fitted jogger pants; otherwise leave bottom_fallback empty.
+
+Return ONLY valid JSON:
+{
+  "avatar_description":"concise visible physical description",
+  "outfit_description":"rich but concise combined outfit description from all selected references",
+  "shoes_description":"visible shoes or clean white sneakers",
+  "bottom_fallback":"black fitted jogger pants or empty string",
+  "outfit_has_shoes":true,
+  "outfit_has_bottom":true
+}"""
 
     try:
         analysis_avatar_bytes, analysis_avatar_mime = _prepare_image_for_avatar_analysis(avatar_bytes, avatar_mime)
         content = [
-            {"type": "input_image", "image_url": f"data:{analysis_avatar_mime};base64,{base64.b64encode(analysis_avatar_bytes).decode('ascii')}", "detail": "low"},
-            {"type": "input_text", "text": "IMAGE 1 — AVATAR. Analyze identity/appearance only. Ignore current clothing."},
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": analysis_avatar_mime,
+                    "data": base64.b64encode(analysis_avatar_bytes).decode("ascii"),
+                },
+            },
+            {"type": "text", "text": "IMAGE 1 — AVATAR. Analyze identity/appearance only. Ignore current clothing."},
         ]
+
         usable_count = 0
         for index, item in enumerate(outfit_images[:10], start=2):
             raw_bytes = item.get("bytes") or b""
@@ -5290,21 +4741,32 @@ Return ONLY valid JSON with: avatar_description, outfit_description, shoes_descr
             label = str(item.get("label") or f"Outfit reference {usable_count}")
             source_type = str(item.get("source_type") or "outfit reference")
             content.extend([
-                {"type": "input_image", "image_url": f"data:{prepared_mime};base64,{base64.b64encode(prepared_bytes).decode('ascii')}", "detail": "low"},
-                {"type": "input_text", "text": f"IMAGE {index} — OUTFIT REFERENCE ({source_type}): {label}. Analyze clothing/footwear only; ignore any person wearing it."},
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": prepared_mime,
+                        "data": base64.b64encode(prepared_bytes).decode("ascii"),
+                    },
+                },
+                {
+                    "type": "text",
+                    "text": f"IMAGE {index} — OUTFIT REFERENCE ({source_type}): {label}. Analyze clothing/footwear only; ignore any person wearing it.",
+                },
             ])
+
         if usable_count == 0:
             return {"error": "None of the selected outfit images could be loaded for analysis."}
-        payload = _openai_request(
-            api_key,
-            instructions=system,
-            input_content=[{"role": "user", "content": content}],
-            max_output_tokens=650,
-            json_mode=True,
+
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=1000,
+            system=system,
+            messages=[{"role": "user", "content": content}],
         )
-        if payload.get("error"):
-            return {"error": payload["error"].get("message", str(payload["error"]))}
-        parsed = _extract_json_object(_openai_output_text(payload)) or {}
+        text_blocks = [block.text for block in response.content if getattr(block, "type", "") == "text"]
+        parsed = _extract_json_object("\n".join(text_blocks)) or {}
         if not parsed.get("avatar_description") or not parsed.get("outfit_description"):
             return {"error": "Could not extract both avatar and outfit descriptions."}
         parsed["shoes_description"] = (parsed.get("shoes_description") or "clean white sneakers").strip()
@@ -5313,7 +4775,6 @@ Return ONLY valid JSON with: avatar_description, outfit_description, shoes_descr
         return parsed
     except Exception as exc:
         return {"error": f"Avatar/outfit analysis failed: {exc}"}
-
 
 def build_avatar_outfit_image_prompt(
     avatar_description: str,
@@ -5383,7 +4844,7 @@ Preserve exact identity, outfit, shoes, setting and lighting from the approved s
 
 AVATAR_OUTFIT_IMAGE_GENERATE_SYSTEM = """You are an image production assistant with access to Magnific tools.
 Use the same Magnific MCP account already configured in the app.
-1. Upload EVERY provided reference image using the appropriate upload tool from the LIVE Magnific tool list. Do not assume or invent an upload tool name.
+1. Upload EVERY provided reference image to Magnific using creations_upload_image.
 2. Reference image 1 is the avatar/identity reference. Preserve this exact person's appearance and identity.
 3. Reference images 2+ are outfit/clothing references from official listing photos and/or customer review photos.
 4. Use ALL provided outfit references together for clothing accuracy: garment type, colors, pattern, fit, silhouette, fabric, details, and styling.
@@ -5405,15 +4866,18 @@ def generate_avatar_outfit_image_magnific(
     outfit_references: list[str],
     prompt: str,
 ) -> dict:
-    """Generate the Avatar Outfit still through the native Magnific MCP bridge."""
+    """Use Magnific GPT Image 2 High at 2K with one avatar plus multiple outfit references."""
     if not api_key:
-        return {"creation_id": None, "status": "error", "error": "OpenAI API key is missing."}
+        return {"creation_id": None, "status": "error", "error": "The Anthropic API key is missing."}
     if not magnific_token:
-        return {"creation_id": None, "status": "error", "error": "Magnific OAuth token is missing. Add MAGNIFIC_AUTH_TOKEN to Streamlit secrets."}
+        return {"creation_id": None, "status": "error", "error": "The Magnific authorization token is missing."}
+
     avatar_reference = str(avatar_reference or "").strip()
     outfit_references = [str(ref or "").strip() for ref in (outfit_references or []) if str(ref or "").strip()]
     if not avatar_reference or not outfit_references:
         return {"creation_id": None, "status": "error", "error": "Choose an avatar and at least one outfit reference."}
+
+    # Keep the MCP payload compact while still preserving multi-reference support.
     original_outfit_count = len(outfit_references)
     outfit_references = outfit_references[:5]
     avatar_reference, outfit_references, payload_omitted = _trim_magnific_reference_payload(
@@ -5421,32 +4885,59 @@ def generate_avatar_outfit_image_magnific(
     )
     omitted_reference_count = max(0, original_outfit_count - len(outfit_references)) + int(payload_omitted or 0)
     if not outfit_references:
-        return {"creation_id": None, "status": "error", "error": "The selected local outfit references are too large. Try fewer manual images or TikTok-hosted product photos."}
-    refs_text = "\n\n".join(
-        [f"Reference image 1 (AVATAR identity): {avatar_reference}"]
-        + [f"Reference image {idx} (OUTFIT reference): {ref}" for idx, ref in enumerate(outfit_references, start=2)]
-    )
-    result = _openai_magnific(
-        api_key,
-        magnific_token,
-        instructions=AVATAR_OUTFIT_IMAGE_GENERATE_SYSTEM,
-        user_text=(
-            "Generate one Avatar Outfit mirror-selfie try-on image.\n"
-            "Required Magnific settings: model slug = gpt_image_2, quality = high, resolution = 2k, aspect ratio = 9:16.\n"
-            "Use all supplied reference images together. Reference image 1 is the avatar identity to preserve exactly. References 2+ are outfit/clothing/shoe references.\n"
-            f"{refs_text}\n\nFinal image prompt:\n{prompt}"
-        ),
-        max_output_tokens=700,
-    )
-    result["provider"] = "Magnific"
-    result["image_model"] = "gpt_image_2"
-    result["image_quality"] = "high"
-    result["image_resolution"] = "2K"
-    result["image_aspect_ratio"] = "9:16"
-    result["reference_count"] = 1 + len(outfit_references)
-    result["outfit_reference_count"] = len(outfit_references)
-    result["omitted_reference_count"] = omitted_reference_count
-    return result
+        return {
+            "creation_id": None,
+            "status": "error",
+            "error": "The selected local outfit references are still too large for the MCP request. Try fewer manual images or use TikTok-hosted product photos.",
+        }
+
+    mcp_servers = [{
+        "type": "url",
+        "url": MAGNIFIC_MCP_URL,
+        "name": MAGNIFIC_MCP_NAME,
+        "authorization_token": magnific_token,
+    }]
+
+    reference_lines = [f"Reference image 1 (AVATAR identity): {avatar_reference}"]
+    for idx, ref in enumerate(outfit_references, start=2):
+        reference_lines.append(f"Reference image {idx} (OUTFIT reference): {ref}")
+    refs_text = "\n\n".join(reference_lines)
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.beta.messages.create(
+            model=MODEL,
+            max_tokens=2048,
+            system=AVATAR_OUTFIT_IMAGE_GENERATE_SYSTEM,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "Generate one Avatar Outfit mirror-selfie try-on image.\n"
+                    "Required Magnific settings: model slug = gpt_image_2, quality = high, resolution = 2k, aspect ratio = 9:16.\n"
+                    "Use all supplied reference images together. Reference image 1 is the avatar identity to preserve exactly. "
+                    "Reference images 2+ are outfit / clothing / shoe references from official listing images and customer reviews.\n"
+                    "Upload every provided reference to Magnific using creations_upload_image, then generate the final image.\n"
+                    "Submit the generation exactly once and return as soon as you receive the real Magnific creation ID. Do not poll.\n\n"
+                    f"{refs_text}\n\n"
+                    f"Final image prompt:\n{prompt}"
+                ),
+            }],
+            mcp_servers=mcp_servers,
+            tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
+            betas=[MCP_BETA],
+        )
+        result = _parse_magnific_creation_response(response)
+        result["provider"] = "Magnific"
+        result["image_model"] = "gpt_image_2"
+        result["image_quality"] = "high"
+        result["image_resolution"] = "2K"
+        result["image_aspect_ratio"] = "9:16"
+        result["reference_count"] = 1 + len(outfit_references)
+        result["outfit_reference_count"] = len(outfit_references)
+        result["omitted_reference_count"] = omitted_reference_count
+        return result
+    except Exception as exc:
+        return {"creation_id": None, "status": "error", "error": f"Avatar Outfit image generation failed: {exc}"}
 
 
 
@@ -5469,29 +4960,59 @@ def generate_avatar_outfit_kling_magnific(
     approved_image_url: str,
     prompt: str,
 ) -> dict:
-    """Animate the approved try-on image with Kling O1 through the native Magnific MCP bridge."""
+    """Animate the approved try-on image with Kling O1 using a multi-turn MCP sequence."""
     if not api_key:
-        return {"creation_id": None, "status": "error", "error": "OpenAI API key is missing."}
+        return {"creation_id": None, "status": "error", "error": "Anthropic API key is missing."}
     if not magnific_token:
-        return {"creation_id": None, "status": "error", "error": "Magnific OAuth token is missing. Add MAGNIFIC_AUTH_TOKEN to Streamlit secrets."}
+        return {"creation_id": None, "status": "error", "error": "Magnific token is missing."}
     if not approved_image_url:
         return {"creation_id": None, "status": "error", "error": "Approve a generated try-on image first."}
-    result = _openai_magnific(
-        api_key,
-        magnific_token,
-        instructions=AVATAR_OUTFIT_KLING_SYSTEM,
-        user_text=(
-            f"Approved Avatar Outfit start image: {approved_image_url}\n"
-            "Upload the approved image, then call video_generate. Use Kling O1, 720p, 9:16, EXACTLY 10 seconds, sound off. "
-            "Use the approved image as the FIRST/START frame. Submit exactly once and return the real creation/task ID. Do not poll.\n\n"
-            f"Kling prompt:\n{prompt}"
-        ),
-        max_output_tokens=700,
-    )
-    if result.get("creation_id") and not (result.get("url") or result.get("preview_url")):
-        result["status"] = "queued"
-    result["submitted_at"] = datetime.now().isoformat(timespec="seconds")
-    return result
+
+    mcp_servers = [{
+        "type": "url",
+        "url": MAGNIFIC_MCP_URL,
+        "name": MAGNIFIC_MCP_NAME,
+        "authorization_token": magnific_token,
+    }]
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        result = _run_magnific_mcp_sequence(
+            client=client,
+            system=AVATAR_OUTFIT_KLING_SYSTEM,
+            initial_content=(
+                f"Approved Avatar Outfit start image: {approved_image_url}\n"
+                "Submit this to Magnific now. This is a multi-step task: upload the approved image, then CONTINUE to video_generate. "
+                "Use Kling O1, 720p, 9:16, EXACTLY 10 seconds, sound off. Use the approved image as the FIRST/START frame. "
+                "Stop only after Magnific returns the REAL creation/task ID. Do not poll.\n\n"
+                f"Kling prompt:\n{prompt}"
+            ),
+            mcp_servers=mcp_servers,
+            max_turns=6,
+            continuation_instruction=(
+                "Continue the SAME Magnific Kling O1 task now. Do not repeat a successful upload. "
+                "Use the uploaded start-frame handle/URL from the previous MCP result, call video_generate with Kling O1, "
+                "720p, 9:16, 10 seconds, sound off, and stop only after the REAL creation/task ID is returned. Do not narrate."
+            ),
+        )
+        creation_id = result.get("creation_id")
+        if not _is_real_magnific_creation_id(creation_id):
+            if result.get("error"):
+                return result
+            return {
+                "creation_id": None,
+                "status": "error",
+                "url": None,
+                "preview_url": None,
+                "error": "Magnific MCP did not return a real Kling creation ID, so the video was not confirmed as submitted.",
+                "mcp_tools_called": result.get("mcp_tools_called", []),
+            }
+        if not (result.get("url") or result.get("preview_url")):
+            result["status"] = "queued"
+        result["submitted_at"] = datetime.now().isoformat(timespec="seconds")
+        return result
+    except Exception as exc:
+        return {"creation_id": None, "status": "error", "error": str(exc)}
+
 
 def _reset_avatar_outfit_generated_state() -> None:
     """Clear generated outputs but leave the uploaded input widgets alone."""
@@ -5729,7 +5250,7 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
         "Selected outfit photos are analyzed together and sent to Magnific GPT Image 2 High at 2K as supporting references. The Avatar Outfit video remains a clean, silent Kling O1 mirror try-on with no hook text, captions, voiceover, music, or soundtrack."
     )
     st.caption(
-        "Large avatar/outfit files are optimized automatically. OpenAI vision gets a resized copy, and local images get a separate compact reference copy for the Magnific MCP request so the request stays lightweight while still using the simpler one-pass GPT Image 2 flow."
+        "Large avatar/outfit files are optimized automatically. Claude analysis gets a resized copy, and local images get a separate compact reference copy for the Magnific MCP request so the request stays lightweight while still using the simpler one-pass GPT Image 2 flow."
     )
 
     _render_avatar_outfit_bulk_queue(api_key, magnific_token)
@@ -5984,7 +5505,7 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
             st.rerun()
 
     if not api_key:
-        st.warning("Connect the OpenAI API key above to analyze the avatar and outfit references.")
+        st.warning("Connect the Anthropic API key above to analyze the avatar and outfit references.")
     if not magnific_token:
         st.warning("Connect Magnific above to generate the Avatar Outfit try-on image and run the Kling O1 video step.")
 
@@ -6350,15 +5871,14 @@ def main():
         <section class="apple-hero">
             <div class="apple-kicker">✦ AI VIDEO WORKSPACE</div>
             <h1>Seedance Studio</h1>
-            <p>Turn TikTok Shop products into multiple video formats, or create Avatar Outfit mirror try-ons from an avatar + clothing reference using the existing Magnific workflows, with low-cost OpenAI GPT-4o mini for prompts/vision and Claude Haiku only as the reliable Magnific OAuth MCP bridge, then refine supported workflows with the existing editor.</p>
+            <p>Turn TikTok Shop products into multiple video formats, or create Avatar Outfit mirror try-ons from an avatar + clothing reference using Magnific GPT Image 2 + Kling O1, then refine supported workflows with the existing editor.</p>
         </section>
         """,
         unsafe_allow_html=True,
     )
 
     # ── Always-visible video setup ──
-    openai_key_from_secrets = get_secret("OPENAI_API_KEY")
-    anthropic_key_from_secrets = get_secret("ANTHROPIC_API_KEY")
+    api_key_from_secrets = get_secret("ANTHROPIC_API_KEY")
     token_from_secrets = get_secret("MAGNIFIC_AUTH_TOKEN")
     xai_key_from_secrets = get_secret("XAI_API_KEY")
     director_key_from_secrets = get_secret("DIRECTOR_INGEST_KEY")
@@ -6368,10 +5888,8 @@ def main():
     queue_branch_from_secrets = get_secret("SEEDANCE_QUEUE_BRANCH") or "main"
     queue_path_from_secrets = get_secret("SEEDANCE_QUEUE_PATH") or SEEDANCE_QUEUE_PATH_DEFAULT
 
-    if "runtime_openai_api_key" not in st.session_state:
-        st.session_state["runtime_openai_api_key"] = openai_key_from_secrets
     if "runtime_anthropic_api_key" not in st.session_state:
-        st.session_state["runtime_anthropic_api_key"] = anthropic_key_from_secrets
+        st.session_state["runtime_anthropic_api_key"] = api_key_from_secrets
     if "runtime_magnific_token" not in st.session_state:
         st.session_state["runtime_magnific_token"] = token_from_secrets
     if "runtime_xai_api_key" not in st.session_state:
@@ -6460,7 +5978,7 @@ def main():
             voice_script = None
             st.info("Text-Hook B-Roll is fixed at 8 seconds and silent. Python selects a concrete unrelated opening scene for every generation, and regeneration avoids the previous scene. B-Roll now uses the same deal/FOMO hook library as Warehouse and Pool.")
 
-        api_key = st.session_state.get("runtime_openai_api_key", "")
+        api_key = st.session_state.get("runtime_anthropic_api_key", "")
         magnific_token = st.session_state.get("runtime_magnific_token", "")
         xai_api_key = st.session_state.get("runtime_xai_api_key", "")
         director_ingest_key = st.session_state.get("runtime_director_ingest_key", "")
@@ -6469,66 +5987,48 @@ def main():
         queue_repo = st.session_state.get("runtime_seedance_queue_repo", "")
         queue_branch = st.session_state.get("runtime_seedance_queue_branch", "main") or "main"
         queue_path = st.session_state.get("runtime_seedance_queue_path", SEEDANCE_QUEUE_PATH_DEFAULT) or SEEDANCE_QUEUE_PATH_DEFAULT
-        status_col_1, status_col_2, status_col_3, status_col_4, status_col_5, status_col_6 = st.columns(6)
+        status_col_1, status_col_2, status_col_3, status_col_4, status_col_5 = st.columns(5)
         if api_key:
-            status_col_1.success("OpenAI connected")
+            status_col_1.success("Anthropic connected")
         else:
-            status_col_1.warning("OpenAI key needed")
+            status_col_1.warning("Anthropic key needed")
         if magnific_token:
-            status_col_2.success("Magnific OAuth connected")
+            status_col_2.success("Magnific connected")
         else:
-            status_col_2.info("Magnific OAuth token needed")
-        if st.session_state.get("runtime_anthropic_api_key", ""):
-            status_col_3.success("MCP bridge connected")
-        else:
-            status_col_3.warning("MCP bridge key needed")
-        status_col_4.info("Nano Banana + Kling via Magnific")
+            status_col_2.info("Magnific needed for video")
+        status_col_3.info("Nano Banana + Kling via Magnific")
         if director_ingest_key:
-            status_col_5.success("Director connected")
+            status_col_4.success("Director connected")
         else:
-            status_col_5.info("Director key optional")
+            status_col_4.info("Director key optional")
         if queue_token and queue_repo:
-            status_col_6.success("Sniper inbox connected")
+            status_col_5.success("Sniper inbox connected")
         else:
-            status_col_6.info("Sniper inbox optional")
+            status_col_5.info("Sniper inbox optional")
         st.caption(f"{STYLE_LABELS[style]} · {resolved_style_duration(style, duration)}s")
 
-        required_connections_ready = bool(api_key and magnific_token and st.session_state.get("runtime_anthropic_api_key", ""))
+        required_connections_ready = bool(api_key and magnific_token)
         with st.expander("API connection", expanded=not required_connections_ready):
-            if openai_key_from_secrets:
-                st.success("OpenAI API key loaded from Streamlit secrets.")
-            else:
-                st.session_state["runtime_openai_api_key"] = st.text_input(
-                    "OpenAI API Key",
-                    type="password",
-                    value=st.session_state.get("runtime_openai_api_key", ""),
-                    key="runtime_openai_api_key_input",
-                )
-
-            if anthropic_key_from_secrets:
-                st.success("Anthropic key loaded for the Magnific MCP bridge only.")
+            if api_key_from_secrets:
+                st.success("Anthropic API key loaded from Streamlit secrets.")
             else:
                 st.session_state["runtime_anthropic_api_key"] = st.text_input(
-                    "Anthropic API Key — Magnific MCP bridge only",
+                    "Anthropic API Key",
                     type="password",
                     value=st.session_state.get("runtime_anthropic_api_key", ""),
                     key="runtime_anthropic_api_key_input",
-                    help="Used only by Claude Haiku to execute Magnific's OAuth MCP tools. OpenAI handles prompt writing and vision analysis.",
                 )
 
             if xai_key_from_secrets or st.session_state.get("runtime_xai_api_key", ""):
                 st.caption("xAI API key is stored, but Lifestyle Animation now uses Magnific Nano Banana 2 instead of Grok.")
 
-            if token_from_secrets:
-                st.success("Magnific OAuth token loaded from Streamlit secrets.")
-            else:
-                st.session_state["runtime_magnific_token"] = st.text_input(
-                    "Magnific OAuth token",
-                    type="password",
-                    value=st.session_state.get("runtime_magnific_token", ""),
-                    key="runtime_magnific_token_input",
-                    help="OAuth access token for the Magnific MCP server at https://mcp.magnific.com.",
-                )
+            st.session_state["runtime_magnific_token"] = st.text_input(
+                "Magnific token",
+                type="password",
+                value=st.session_state.get("runtime_magnific_token", ""),
+                key="runtime_magnific_token_input",
+                help="Paste a refreshed token here whenever Magnific authentication expires.",
+            )
 
             if director_key_from_secrets:
                 st.success("Momentum Director ingest key loaded from Streamlit secrets.")
@@ -6582,7 +6082,7 @@ def main():
                 ).strip().strip("/") or SEEDANCE_QUEUE_PATH_DEFAULT
 
             magnific_token = st.session_state.get("runtime_magnific_token", "")
-            api_key = st.session_state.get("runtime_openai_api_key", "")
+            api_key = st.session_state.get("runtime_anthropic_api_key", "")
             xai_api_key = st.session_state.get("runtime_xai_api_key", "")
             director_ingest_key = st.session_state.get("runtime_director_ingest_key", "")
             director_ingest_url = st.session_state.get("runtime_director_ingest_url", DIRECTOR_INGEST_URL_DEFAULT)
@@ -6606,22 +6106,19 @@ def main():
             st.markdown("**xAI key for image workflows**")
             st.markdown('Lifestyle approval images now use your existing **Magnific** connection with **Nano Banana 2 · Pro · 2k**. No xAI key is required for this workflow.')
 
-            st.markdown("**Magnific OAuth token**")
+            st.markdown("**How to refresh the Magnific token**")
             st.markdown("""
-Use the same OAuth-token workflow you were already using:
-
-1. In **MCP Inspector**, connect to `https://mcp.magnific.com` using **Streamable HTTP**.
-2. Choose **OAuth** and complete the Magnific browser sign-in.
-3. Copy the resulting authorization/access token.
-4. Add it to Streamlit secrets as `MAGNIFIC_AUTH_TOKEN = "..."`.
-
-No Magnific developer API key is required. The app uses Claude Haiku only as the native MCP transport bridge, so keep `ANTHROPIC_API_KEY` available too. OpenAI remains the model for prompt/vision work. If the token expires, repeat the OAuth sign-in and replace only `MAGNIFIC_AUTH_TOKEN`.
+1. Run `npx @modelcontextprotocol/inspector` on a computer with Node.js.
+2. Set **Transport Type** to `Streamable HTTP`.
+3. Set the URL to `https://mcp.magnific.com`.
+4. Connect, open Auth Settings, and complete the Quick OAuth Flow.
+5. Copy the `access_token` and paste it above.
             """)
 
 
     if style == "avatar_outfit":
         render_avatar_outfit_flow(
-            api_key=st.session_state.get("runtime_openai_api_key", ""),
+            api_key=st.session_state.get("runtime_anthropic_api_key", ""),
             xai_api_key=st.session_state.get("runtime_xai_api_key", ""),
             magnific_token=st.session_state.get("runtime_magnific_token", ""),
         )
@@ -7269,7 +6766,7 @@ No Magnific developer API key is required. The app uses Claude Haiku only as the
                 progress.progress(1.0, text="Done!")
                 st.rerun()
             elif hooks_btn and not api_key:
-                st.error("❌ OpenAI API key is missing. Add OPENAI_API_KEY in Streamlit secrets or paste it in API connection.")
+                st.error("❌ Anthropic API key is missing. Ask Sky to set it up.")
 
             # ── Step 3b: Show hooks + pick/accept ──
             if st.session_state["product_hooks"]:
@@ -7367,7 +6864,7 @@ No Magnific developer API key is required. The app uses Claude Haiku only as the
                 prompt_btn = st.button(prompt_label, type="primary", use_container_width=True)
 
         if (auto_btn or prompt_btn) and not api_key:
-            st.error("❌ OpenAI API key is missing. Add OPENAI_API_KEY in Streamlit secrets or paste it in API connection.")
+            st.error("❌ Anthropic API key is missing. Ask Sky to set it up.")
             auto_btn = False
             prompt_btn = False
     else:
@@ -7631,7 +7128,7 @@ No Magnific developer API key is required. The app uses Claude Haiku only as the
                     error_msg = gen_result.get("error", "")
                     st.error(f"❌ **{product['name']}** — {error_msg}")
                     if any(keyword in error_msg.lower() for keyword in ['401', 'unauthorized', 'auth', 'api key', 'token', 'forbidden', '403']):
-                        st.warning("🔄 Magnific authentication failed. Refresh/check the Magnific OAuth token in the API connection section.")
+                        st.warning("🔄 Magnific authentication failed. Refresh the Magnific token in the API connection section.")
                         token_expired = True
                 else:
                     st.warning(f"⚠️ **{product['name']}** — Status: {gen_result.get('status')}")
@@ -7942,30 +7439,14 @@ No Magnific developer API key is required. The app uses Claude Haiku only as the
                 refresh_status = refresh_result.get("status", "unknown")
                 is_lifestyle_image = (
                     refresh_result.get("style") == "lifestyle_animation"
-                    and (
-                        refresh_result.get("pipeline_stage") == "image"
-                        or str(refresh_result.get("status") or "").startswith("image_")
-                        or (
-                            refresh_result.get("lifestyle_creation_id")
-                            and str(refresh_result.get("lifestyle_creation_id")) == str(refresh_creation_id)
-                        )
-                    )
+                    and refresh_result.get("pipeline_stage") == "image"
                 )
-                terminal_statuses = {"completed", "prompt_only", "image_approved"}
-                if refresh_status == "error" and not _is_real_magnific_creation_id(refresh_creation_id):
-                    terminal_statuses.add("error")
+                terminal_statuses = {"completed", "error", "prompt_only", "image_approved"}
                 if refresh_status == "image_completed" and refresh_result.get("lifestyle_image_url"):
                     terminal_statuses.add("image_completed")
                 if refresh_creation_id and refresh_status not in terminal_statuses:
                     with st.spinner(f"Checking {refresh_result.get('product_name', 'video')}..."):
                         status_result = check_creation_status(api_key, magnific_token, refresh_creation_id)
-                    if status_result.get("error"):
-                        saved_gens[refresh_index]["last_refresh_error"] = status_result.get("error")
-                        if status_result.get("debug"):
-                            saved_gens[refresh_index]["last_refresh_debug"] = status_result.get("debug")
-                    else:
-                        saved_gens[refresh_index].pop("last_refresh_error", None)
-                        saved_gens[refresh_index].pop("last_refresh_debug", None)
                     if is_lifestyle_image:
                         raw_status = status_result.get("status", refresh_status)
                         mapped = {
@@ -7978,8 +7459,6 @@ No Magnific developer API key is required. The app uses Claude Haiku only as the
                         approved_image_url = status_result.get("url") or status_result.get("preview_url")
                         if approved_image_url:
                             saved_gens[refresh_index]["lifestyle_image_url"] = approved_image_url
-                            saved_gens[refresh_index]["status"] = "image_completed"
-                            saved_gens[refresh_index].pop("error", None)
                     else:
                         refreshed_status = status_result.get("status", refresh_status)
                         saved_gens[refresh_index]["status"] = refreshed_status
@@ -8123,33 +7602,19 @@ No Magnific developer API key is required. The app uses Claude Haiku only as the
                         st.caption(f"Image model: {LIFESTYLE_IMAGE_MODEL_LABEL}  |  Video model: {LIFESTYLE_VIDEO_MODEL_LABEL}")
                     if creation_id:
                         st.caption(f"Creation ID: `{creation_id}`")
-                    if result.get("last_refresh_error"):
-                        st.error(f"Refresh error: {result.get('last_refresh_error')}")
-                        if result.get("last_refresh_debug"):
-                            with st.expander("Magnific refresh details"):
-                                st.code(str(result.get("last_refresh_debug"))[:1800])
 
                 with header_actions:
                     stored_style = result.get("style") or "texthook_broll"
                     is_lifestyle = stored_style == "lifestyle_animation"
                     is_lifestyle_image_stage = is_lifestyle and result.get("pipeline_stage") == "image"
 
-                    terminal_statuses = {"completed", "prompt_only", "image_approved"}
-                    if status == "error" and not _is_real_magnific_creation_id(creation_id):
-                        terminal_statuses.add("error")
+                    terminal_statuses = {"completed", "error", "prompt_only", "image_approved"}
                     if status == "image_completed" and result.get("lifestyle_image_url"):
                         terminal_statuses.add("image_completed")
                     if creation_id and status not in terminal_statuses and magnific_token and api_key:
                         if st.button("🔄 Check status", key=f"chk_{i}", use_container_width=True):
                             with st.spinner("Checking..."):
                                 status_result = check_creation_status(api_key, magnific_token, creation_id)
-                            if status_result.get("error"):
-                                saved_gens[i]["last_refresh_error"] = status_result.get("error")
-                                if status_result.get("debug"):
-                                    saved_gens[i]["last_refresh_debug"] = status_result.get("debug")
-                            else:
-                                saved_gens[i].pop("last_refresh_error", None)
-                                saved_gens[i].pop("last_refresh_debug", None)
                             if is_lifestyle_image_stage:
                                 raw_status = status_result.get("status", status)
                                 saved_gens[i]["status"] = {
@@ -8161,8 +7626,6 @@ No Magnific developer API key is required. The app uses Claude Haiku only as the
                                 lifestyle_url = status_result.get("url") or status_result.get("preview_url")
                                 if lifestyle_url:
                                     saved_gens[i]["lifestyle_image_url"] = lifestyle_url
-                                    saved_gens[i]["status"] = "image_completed"
-                                    saved_gens[i].pop("error", None)
                             else:
                                 refreshed_status = status_result.get("status", status)
                                 saved_gens[i]["status"] = refreshed_status
