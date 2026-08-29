@@ -2468,9 +2468,9 @@ STYLE_LABELS = {
 LIFESTYLE_IMAGE_MODEL_LABEL = "Nano Banana 2 · Pro · 2k · 9:16"
 LIFESTYLE_VIDEO_MODEL_LABEL = "Kling O1 · 720p · 5s · start frame"
 AVATAR_OUTFIT_IMAGE_MODEL_LABEL = "Grok Image · 2K · 9:16 · Magnific · multi-reference"
-AVATAR_OUTFIT_VIDEO_MODEL_LABEL = "Grok Video · 720p · 8s · start frame"
+AVATAR_OUTFIT_VIDEO_MODEL_LABEL = "Grok Default Video · 720p · 8s · start frame"
 AVATAR_OUTFIT_IMAGE_MODEL_SLUG = "grok-imagine-image-quality"
-AVATAR_OUTFIT_VIDEO_MODEL_SLUG = "grok-imagine-video-1-5"
+AVATAR_OUTFIT_VIDEO_MODEL_SLUG = "grok-default"
 
 
 def resolved_style_duration(style: str, selected_duration: int = 15) -> int:
@@ -5134,7 +5134,7 @@ def generate_avatar_outfit_image_magnific(
 AVATAR_OUTFIT_KLING_SYSTEM = """You are a video production assistant with access to Magnific MCP tools.
 This is a dependent, MULTI-STEP MCP workflow. The task is NOT complete after the start-frame upload.
 1. Upload the approved Avatar Outfit image with Magnific's available upload tool.
-2. After upload succeeds, CONTINUE and call video_generate with the exact Grok video model slug `grok-imagine-video-1-5`.
+2. After upload succeeds, CONTINUE and call video_generate with the exact Grok video model slug `grok-default`.
 3. Use the uploaded approved image as the FIRST/START frame, not merely a generic reference.
 4. Use 9:16, 720p, EXACTLY 8 seconds, sound off, and the provided motion prompt.
 5. Submit exactly one video generation and stop immediately after the real ID is returned. Do not poll.
@@ -5170,14 +5170,14 @@ def generate_avatar_outfit_kling_magnific(
             initial_content=(
                 f"Approved Avatar Outfit start image: {approved_image_url}\n"
                 "Submit this to Magnific now. This is a multi-step task: upload the approved image, then CONTINUE to video_generate. "
-                f"Use Grok Video with the exact Magnific model slug `{AVATAR_OUTFIT_VIDEO_MODEL_SLUG}`, 720p, 9:16, EXACTLY 8 seconds, sound off. Use the approved image as the FIRST/START frame. "
+                f"Use Grok Default Video with the exact Magnific model slug `{AVATAR_OUTFIT_VIDEO_MODEL_SLUG}`, 720p, 9:16, EXACTLY 8 seconds, sound off. Use the approved image as the FIRST/START frame. "
                 "Stop only after Magnific returns the REAL creation/task ID. Do not poll.\n\n"
                 f"Kling prompt:\n{prompt}"
             ),
             mcp_servers=mcp_servers,
             max_turns=6,
             continuation_instruction=(
-                "Continue the SAME Magnific Grok video task now. Do not repeat a successful upload. "
+                "Continue the SAME Magnific Grok Default video task now. Do not repeat a successful upload. "
                 f"Use the uploaded start-frame handle/URL from the previous MCP result, call video_generate with exact slug `{AVATAR_OUTFIT_VIDEO_MODEL_SLUG}`, 720p, 9:16, 8 seconds, sound off, and stop only after the REAL creation/task ID is returned. Do not narrate."
             ),
         )
@@ -5404,8 +5404,12 @@ def _render_avatar_outfit_bulk_queue(api_key: str, magnific_token: str) -> None:
                 else:
                     video_url = video.get("url") or video.get("preview_url")
                     if video_url:
-                        st.video(video_url)
-                        video_bytes = fetch_video_bytes(video_url)
+                        queue_cache_key = f"{video.get('creation_id', job['job_id'])}_{hashlib.sha1(video_url.encode('utf-8')).hexdigest()[:12]}"
+                        video_bytes = fetch_video_bytes(video_url, cache_key=queue_cache_key)
+                        if video_bytes:
+                            st.video(video_bytes, format="video/mp4")
+                        else:
+                            st.video(video_url)
                         if video_bytes:
                             st.download_button(
                                 "⬇️ Download Avatar Outfit video",
@@ -5904,20 +5908,20 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
         st.info("Approve the generated image before sending it to Grok video.")
         return
 
-    st.success("Image approved. This exact image will be used as the Grok video start frame.")
+    st.success("Image approved. This exact image will be used as the Grok Default video start frame.")
     video_result = st.session_state.get("avatar_outfit_video_result") or {}
     creation_id = video_result.get("creation_id")
     video_status = video_result.get("status", "")
 
     if not creation_id:
         if st.button(
-            "🎬 Send 8s Grok Video to Magnific",
+            "🎬 Send 8s Grok Default Video to Magnific",
             type="primary",
             use_container_width=True,
             key="avatar_outfit_generate_video",
             disabled=not bool(api_key and magnific_token and generated_image_url),
         ):
-            with st.spinner("Sending the approved mirror image to Grok video as the start frame..."):
+            with st.spinner("Sending the approved mirror image to Grok Default video as the start frame..."):
                 result = generate_avatar_outfit_kling_magnific(
                     api_key=api_key,
                     magnific_token=magnific_token,
@@ -5936,7 +5940,7 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
                 st.rerun()
         return
 
-    st.markdown("### Grok mirror video")
+    st.markdown("### Grok Default mirror video")
     video_url = video_result.get("url") or video_result.get("preview_url")
 
     # Any real creation ID without a finished URL is an asynchronous job that must
@@ -5961,8 +5965,12 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
 
     if video_status == "completed" and video_url:
         refreshed_key = f"{creation_id}_{hashlib.sha1(video_url.encode('utf-8')).hexdigest()[:12]}"
-        st.video(video_url)
-        video_bytes = fetch_video_bytes(f"{video_url}#avatar_outfit={refreshed_key}")
+        video_bytes = fetch_video_bytes(video_url, cache_key=refreshed_key)
+        if video_bytes:
+            st.video(video_bytes, format="video/mp4")
+        else:
+            st.video(video_url)
+            st.caption("The browser is using the remote Magnific preview because the MP4 could not be cached locally.")
         if video_bytes:
             st.download_button(
                 "⬇️ Download Avatar Outfit video",
@@ -5974,12 +5982,12 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
             )
         regen_cols = st.columns(2)
         if regen_cols[0].button(
-            "🎬 Regenerate Grok video",
+            "🎬 Regenerate Grok Default video",
             key="avatar_outfit_regen_video",
             use_container_width=True,
             disabled=not bool(api_key and magnific_token and generated_image_url),
         ):
-            with st.spinner("Generating a fresh Grok mirror video from the approved image..."):
+            with st.spinner("Generating a fresh Grok Default mirror video from the approved image..."):
                 result = generate_avatar_outfit_kling_magnific(
                     api_key=api_key,
                     magnific_token=magnific_token,
