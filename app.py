@@ -5212,15 +5212,17 @@ def _render_avatar_outfit_bulk_queue(api_key: str, magnific_token: str) -> None:
                         bulk_creation_id = video.get("creation_id") or job["job_id"]
                         video_bytes = fetch_video_bytes(video_url, cache_key=f"bulk_{bulk_creation_id}")
                         if video_bytes:
-                            st.video(video_bytes, format="video/mp4")
-                            st.download_button(
-                                "⬇️ Download Avatar Outfit video",
-                                data=video_bytes,
-                                file_name=f"avatar_outfit_{bulk_creation_id}.mp4",
-                                mime="video/mp4",
-                                key=f"ao_bulk_download_{job['job_id']}",
-                                use_container_width=True,
-                            )
+                            bulk_preview_col, _bulk_preview_spacer = st.columns(2, gap="large")
+                            with bulk_preview_col:
+                                st.video(video_bytes, format="video/mp4")
+                                st.download_button(
+                                    "⬇️ Download Avatar Outfit video",
+                                    data=video_bytes,
+                                    file_name=f"avatar_outfit_{bulk_creation_id}.mp4",
+                                    mime="video/mp4",
+                                    key=f"ao_bulk_download_{job['job_id']}",
+                                    use_container_width=True,
+                                )
                         else:
                             st.caption("Video completed, but the signed MP4 URL needs a refresh before it can preview here.")
                     elif video.get("creation_id"):
@@ -5788,15 +5790,17 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
                 video_bytes = fetch_video_bytes(video_url, cache_key=refreshed_key)
 
         if video_bytes:
-            st.video(video_bytes, format="video/mp4")
-            st.download_button(
-                "⬇️ Download Avatar Outfit video",
-                data=video_bytes,
-                file_name=f"avatar_outfit_{creation_id}.mp4",
-                mime="video/mp4",
-                key="avatar_outfit_download_video",
-                use_container_width=True,
-            )
+            avatar_preview_col, _avatar_preview_spacer = st.columns(2, gap="large")
+            with avatar_preview_col:
+                st.video(video_bytes, format="video/mp4")
+                st.download_button(
+                    "⬇️ Download Avatar Outfit video",
+                    data=video_bytes,
+                    file_name=f"avatar_outfit_{creation_id}.mp4",
+                    mime="video/mp4",
+                    key="avatar_outfit_download_video",
+                    use_container_width=True,
+                )
         else:
             st.warning("The video is completed, but the signed Magnific MP4 could not be fetched yet. Click Refresh video below to request a fresh media URL.")
             if video_url:
