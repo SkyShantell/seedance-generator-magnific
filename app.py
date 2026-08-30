@@ -5754,7 +5754,7 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
     if creation_id and not video_url and video_status != "error":
         st.info(f"Sent to Magnific · Status: **{video_status or 'queued'}** · Creation ID: `{creation_id}`")
         if st.button(
-            "🔄 Refresh Kling video status",
+            "🔄 Refresh video result",
             key="avatar_outfit_check_video_status",
             type="primary",
             use_container_width=True,
@@ -5770,7 +5770,8 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
         return
 
     if video_status == "completed" and video_url:
-        refreshed_key = f"{creation_id}_{hashlib.sha1(video_url.encode('utf-8')).hexdigest()[:12]}"
+        preview_nonce = str(video_result.get("_preview_refresh_nonce") or "")
+        refreshed_key = f"{creation_id}_{hashlib.sha1(video_url.encode('utf-8')).hexdigest()[:12]}_{preview_nonce}"
         video_bytes = fetch_video_bytes(video_url, cache_key=refreshed_key)
 
         # Signed Magnific URLs can expire. If the first fetch fails, refresh the
@@ -5805,14 +5806,32 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
             st.warning("The video is completed, but the signed Magnific MP4 could not be fetched yet. Click Refresh video below to request a fresh media URL.")
             if video_url:
                 st.link_button("🔗 Open finished video", video_url, use_container_width=True)
-        regen_cols = st.columns(2)
-        if regen_cols[0].button(
-            "🎬 Regenerate Kling O1 video",
+        action_cols = st.columns(3)
+        if action_cols[0].button(
+            "🔄 Refresh video result",
+            key="avatar_outfit_refresh_completed_video",
+            type="primary",
+            use_container_width=True,
+            disabled=not bool(api_key and magnific_token and creation_id),
+        ):
+            with st.spinner("Refreshing the latest Magnific video result..."):
+                refreshed = check_creation_status(
+                    api_key=api_key,
+                    magnific_token=magnific_token,
+                    creation_id=creation_id,
+                )
+            merged = {**video_result, **{k: v for k, v in refreshed.items() if v is not None}}
+            # Force the next render to refetch media from the refreshed signed URL.
+            merged["_preview_refresh_nonce"] = time.time_ns()
+            st.session_state["avatar_outfit_video_result"] = merged
+            st.rerun()
+        if action_cols[1].button(
+            "🎬 Regenerate Grok video",
             key="avatar_outfit_regen_video",
             use_container_width=True,
             disabled=not bool(api_key and magnific_token and generated_image_url),
         ):
-            with st.spinner("Generating a fresh Kling O1 mirror video from the approved image..."):
+            with st.spinner("Generating a fresh Grok mirror video from the approved image..."):
                 result = generate_avatar_outfit_kling_magnific(
                     api_key=api_key,
                     magnific_token=magnific_token,
@@ -5826,7 +5845,7 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
                 result["product_name"] = analysis.get("product_name")
                 st.session_state["avatar_outfit_video_result"] = result
                 st.rerun()
-        if regen_cols[1].button(
+        if action_cols[2].button(
             "🧹 Start over",
             key="avatar_outfit_start_over",
             use_container_width=True,
@@ -5864,7 +5883,7 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
     else:
         st.warning("Magnific has not returned a finished video URL yet.")
         if st.button(
-            "🔄 Refresh Kling video status",
+            "🔄 Refresh video result",
             key="avatar_outfit_refresh_missing_url",
             type="primary",
             use_container_width=True,
