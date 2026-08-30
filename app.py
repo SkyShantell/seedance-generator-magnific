@@ -700,13 +700,28 @@ def fetch_video_bytes(video_url: str, cache_key: str = "") -> bytes | None:
     """Download video bytes; cache_key separates regenerated creations even when a CDN URL is reused."""
     _ = cache_key
     try:
+        # Never mutate Magnific's signed URL. Fragments/cache markers can invalidate
+        # some signed CDN links, so strip any accidental fragment before requesting.
+        clean_url = str(video_url or "").split("#", 1)[0].strip()
+        if not clean_url:
+            return None
         resp = requests.get(
-            video_url,
-            timeout=90,
-            headers={"Cache-Control": "no-cache", "Pragma": "no-cache"},
+            clean_url,
+            timeout=120,
+            allow_redirects=True,
+            headers={
+                "User-Agent": HEADERS.get("User-Agent", "Mozilla/5.0"),
+                "Accept": "video/mp4,video/*;q=0.9,application/octet-stream;q=0.8,*/*;q=0.5",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+            },
         )
         resp.raise_for_status()
-        return resp.content
+        data = resp.content or b""
+        # A real MP4 should be much larger than a tiny HTML/error response.
+        if len(data) < 1024:
+            return None
+        return data
     except Exception:
         return None
 
@@ -1506,18 +1521,15 @@ def lifestyle_images_zip_bytes(generations: list[dict]) -> tuple[bytes | None, i
 
 # ── Constants ───────────────────────────────────────────────────────
 MAGNIFIC_MCP_URL = "https://mcp.magnific.com"
-SOCIAVAULT_BASE_URL = "https://api.sociavault.com/v1"
-SOCIAVAULT_PRODUCT_DETAILS_URL = f"{SOCIAVAULT_BASE_URL}/scrape/tiktok-shop/product-details"
-SOCIAVAULT_PRODUCT_REVIEWS_URL = f"{SOCIAVAULT_BASE_URL}/scrape/tiktok-shop/product-reviews"
-SOCIAVAULT_REGION_DEFAULT = "US"
 XAI_IMAGE_API_URL = "https://api.x.ai/v1/images/edits"
+LIFESTYLE_MAGNIFIC_IMAGE_MODEL = "grok-imagine-image-quality"
 LIFESTYLE_MAGNIFIC_IMAGE_MODEL = "nano_banana_2"
 LIFESTYLE_MAGNIFIC_IMAGE_QUALITY = "pro"
 DIRECTOR_INGEST_URL_DEFAULT = "https://app.momentumacademy.co/api/director/ingest"
 SEEDANCE_QUEUE_SCHEMA = "momentum.seedance.batch.v1"
 SEEDANCE_QUEUE_PATH_DEFAULT = "seedance_inbox"
 MAGNIFIC_MCP_NAME = "magnific"
-MODEL = "claude-haiku-4-5-20251001"
+MODEL = "claude-sonnet-4-6"
 MCP_BETA = "mcp-client-2025-11-20"
 
 HEADERS = {
@@ -1768,9 +1780,9 @@ VOICEOVER_WITH_SCRIPT = '## Voiceover:\nInclude this voiceover (warm excited wom
 LIFESTYLE_PRODUCT_TYPES = {
     "small_handheld": {
         "label": "Small / handheld — supplements, beauty, personal care",
-        "description": "the exact small/handheld product in the exact physical package, container, vessel, housing, or form factor shown in reference image 1",
+        "description": "a small handheld product such as a bottle, jar, box, spray, cosmetic, supplement, accessory, or personal-care item",
         "framing": "Use a close phone-camera composition where the product fills roughly 45-75% of the frame without looking oversized.",
-        "appearance_help": "Lock the exact sold package/form from reference image 1: pouch, bag, sachet, stick pack, bottle, jar/tub, box/carton, can/canister, tube, device housing, etc. Include packaging color, label, closure, logo placement, count, material, and proportions. Never substitute a different container.",
+        "appearance_help": "Include packaging color, label, cap, logo placement, count, material, and proportions.",
     },
     "clothing_shoe": {
         "label": "Clothing / shoes — apparel, footwear, fashion accessories",
@@ -2367,13 +2379,12 @@ def build_lifestyle_image_prompt(
     scene_key: str,
     product_type: str = "other",
     custom_scene: str = "",
-    appearance_details: str = "",
 ) -> str:
     scene = resolve_lifestyle_scene(scene_key, custom_scene)
     profile = LIFESTYLE_PRODUCT_TYPES.get(product_type, LIFESTYLE_PRODUCT_TYPES["other"])
     normalized_name = (product_name or "").lower()
     supplement_like = any(word in normalized_name for word in (
-        "gummies", "capsules", "supplement", "vitamin", "powder", "drink mix", "prebiotic", "probiotic", "sea moss", "enzyme", "collagen", "protein coffee", "protein powder", "electrolyte"
+        "gummies", "capsules", "supplement", "vitamin", "powder", "drink mix", "prebiotic", "probiotic", "sea moss", "enzyme", "collagen"
     ))
     hand_rule = (
         "Show one natural hand only, with correct fingers and a believable grip; the hand must not hide the product. "
@@ -2388,43 +2399,23 @@ def build_lifestyle_image_prompt(
         )
     if supplement_like and scene_key in ("hand_kitchen", "counter_kitchen", "counter_bathroom"):
         brightness_rule += (
-            "For supplement, drink-mix, protein, or wellness products, make the counter especially clean and simple, with only one or two subtle "
-            "background objects and no moody shadows. Do not transfer the product contents into a different storage container. "
+            "For supplement or wellness products, make the counter scene especially clean and simple, with only one or two subtle "
+            "background objects and no moody shadows. "
         )
-
-    form_lock = (
-        "PRODUCT FORM LOCK — NON-NEGOTIABLE: Reference image 1 is the authoritative source for the exact product as sold. "
-        "Keep the identical package/container/form factor, silhouette, dimensions, closure, seams, edges, materials, label placement, and included parts shown in reference 1. "
-        "Do not infer a container from the product category or product name. Do not redesign, repackage, decant, transfer, reshape, open into a replacement vessel, or substitute the packaging. "
-        "If reference 1 is a flexible pouch or bag, it MUST remain that same flexible pouch/bag — never a jar, tub, bottle, canister, cup, shaker, or rigid container. "
-        "If it is a sachet or stick pack, keep that exact sachet/stick-pack form. If it is a bottle, jar/tub, box/carton, can/canister, tube, appliance, device, garment, or other object, keep that exact physical form. "
-        "Secondary listing/review references are SUPPORTING references only. If a customer review shows contents transferred into another jar, bottle, cup, shaker, organizer, or storage container, IGNORE that secondary container and preserve the sold package from reference 1. "
-        "Preserve the product's real function and sold configuration; do not turn the product into a different object or usage vessel. "
-    )
-
-    extra_lock = ""
-    if appearance_details:
-        extra_lock = (
-            "Additional product-lock details supplied by the user: "
-            + re.sub(r"\s+", " ", appearance_details.strip())[:700]
-            + ". These details are constraints, not suggestions. "
-        )
-
     safety_rule = (
         "Do not include moving water, fire, steam, dirt, sand, powder clouds, pulsing light, animated electronic screens, pets, animals, or any living beings. "
         "Do not show cluttered environments, other brand titles, prices, retail messaging, cartoon or abstract environments, spaceships, levitating products, physics-breaking product orientation, or the same environment as the original listing image. "
         "Keep all visible text clear and readable rather than warped, hieroglyphic, or illegible. The product must be fully visible in frame during image generation, correctly scaled, correctly colored, and realistically lit so it matches the environment. "
     )
-
     return (
-        f"{LIFESTYLE_IPHONE_STYLE}{form_lock}{extra_lock}Photograph the exact {product_name}. "
-        f"Treat it as {profile['description']} without changing its physical form, {scene['setting']}. "
-        f"{profile['framing']} {hand_rule}{brightness_rule}{safety_rule}"
-        "Use reference image 1 as the primary visual source of truth for the real product. Preserve its true dimensions, silhouette, package type, colors, materials, texture, seams, closure, controls, attachments, accessories, logo placement, physical label text where applicable, and exact proportions. "
-        "Never create a new package design or replacement container. Never use a review-photo storage vessel as the product packaging. "
-        "Do not turn a large item into a miniature and do not enlarge a small item unnaturally. Show only the correct number of products and included parts. "
-        "The environment should feel lived-in, casual, slightly imperfect, and believable, like a quick TikTok Shop customer photo. Do not make it look like AI, a 3D render, a catalog cutout, a floating mockup, a showroom, or a polished brand shoot. "
-        "No rendered captions, promotional text, prices, stickers, graphics, or watermarks. Physical writing printed on the real product is allowed."
+        f"{LIFESTYLE_IPHONE_STYLE}Photograph the exact {product_name} as {profile['description']}, {scene['setting']}. "
+        f"{profile['framing']} {hand_rule}{brightness_rule}{safety_rule}Use all uploaded images as strict visual references for the real product: preserve its "
+        "true dimensions, silhouette, colors, materials, texture, seams, controls, attachments, accessories, logo placement, "
+        "physical label text where applicable, and exact proportions. Do not turn a large item into a miniature and do not enlarge "
+        "a small item unnaturally. Show only the correct number of products and included parts. The environment should feel lived-in, "
+        "casual, slightly imperfect, and believable, like a quick TikTok Shop customer photo. Do not make it look like AI, a 3D render, "
+        "a catalog cutout, a floating mockup, a showroom, or a polished brand shoot. No rendered captions, promotional text, prices, "
+        "stickers, graphics, or watermarks. Physical writing printed on the real product is allowed."
     )
 
 
@@ -2445,7 +2436,7 @@ def build_lifestyle_kling_prompt(
         f"{product_name} {scene['placement']}. Treat it as {profile['description']} at the exact real-world scale shown in the approved image. "
         f"{subject.capitalize()} remain completely stationary and fixed for the entire clip; {pronoun} must not lift, rotate, slide, bend, "
         "float, duplicate, shrink, grow, melt, warp, open, close, or change shape. Strictly preserve these details: "
-        f"{product_details}. HARD FORM LOCK: preserve the exact package/container/form factor from the approved image for every frame; never turn a pouch into a jar/bottle/tub, never transfer contents into another vessel, and never redesign or repackage the product. Keep the same environment and lighting: {scene['background']}. Only the handheld phone camera moves: "
+        f"{product_details}. Keep the same environment and lighting: {scene['background']}. Only the handheld phone camera moves: "
         f"{scene.get('camera_motion', 'a natural side-to-side arc and slight push-in')}, with realistic parallax, contact shadows, reflections, "
         "depth of field, and small phone micro-shake. For furniture, appliances, vacuums, electronics, fitness equipment, and outdoor products, "
         "keep the full footprint and major parts visible and correctly attached. The product must stay entirely in frame and occupy most of the video, ideally 80% or more of the clip. Repeat: the product stays fixed while only the camera moves. "
@@ -2467,10 +2458,8 @@ STYLE_LABELS = {
 
 LIFESTYLE_IMAGE_MODEL_LABEL = "Nano Banana 2 · Pro · 2k · 9:16"
 LIFESTYLE_VIDEO_MODEL_LABEL = "Kling O1 · 720p · 5s · start frame"
-AVATAR_OUTFIT_IMAGE_MODEL_LABEL = "Grok Imagine 2.0 · Medium · 9:16 · Magnific · multi-reference"
-AVATAR_OUTFIT_VIDEO_MODEL_LABEL = "Grok default · 720p · 8s · start frame"
-AVATAR_OUTFIT_IMAGE_MODEL_SLUG = "grok-imagine-2"
-AVATAR_OUTFIT_VIDEO_MODEL_SLUG = "grok-default"
+AVATAR_OUTFIT_IMAGE_MODEL_LABEL = "GPT Image 2 · High · 2K · 9:16 · Magnific · multi-reference"
+AVATAR_OUTFIT_VIDEO_MODEL_LABEL = "Kling O1 · 720p · 10s · start frame"
 
 
 def resolved_style_duration(style: str, selected_duration: int = 15) -> int:
@@ -2972,313 +2961,142 @@ def _best_product_name(candidates):
     return cleaned[0][:100]
 
 
-def _sv_values(value) -> list:
-    """Normalize SociaVault arrays, which may arrive as lists or numeric-key dictionaries."""
-    if isinstance(value, list):
-        return value
-    if isinstance(value, dict):
-        return list(value.values())
-    return []
-
-
-def _sv_first_url(value) -> str:
-    """Return the best full-size URL from a SociaVault image/media object."""
-    if isinstance(value, str):
-        return value.strip() if value.startswith(("http://", "https://")) else ""
-    if not isinstance(value, dict):
-        return ""
-
-    # Prefer original/full-resolution URL collections before thumbnail fields.
-    for key in ("url_list", "urlList", "urls", "review_images", "reviewImages"):
-        for candidate in _sv_values(value.get(key)):
-            url = _sv_first_url(candidate)
-            if url:
-                return url
-
-    for key in (
-        "url", "image_url", "imageUrl", "display_image_url", "displayImageUrl",
-        "original_url", "originalUrl", "preview_url", "previewUrl",
-    ):
-        url = _sv_first_url(value.get(key))
-        if url:
-            return url
-
-    # Last resort: use thumbnail collection when no full-size field exists.
-    for key in ("thumb_url_list", "thumbUrlList", "thumbnail_url", "thumbnailUrl"):
-        url = _sv_first_url(value.get(key))
-        if url:
-            return url
-    return ""
-
-
-def _sv_collect_media_urls(value, max_depth: int = 7) -> list[str]:
-    """Collect image URLs from a SociaVault media subtree without pulling avatars/UI images."""
-    urls: list[str] = []
-
-    def add(url: str):
-        url = str(url or "").strip()
-        if url.startswith(("http://", "https://")) and url not in urls:
-            urls.append(url)
-
-    def walk(node, depth=0, path=()):
-        if depth > max_depth:
-            return
-        if isinstance(node, str):
-            path_text = " ".join(path).lower()
-            if node.startswith(("http://", "https://")) and not any(
-                bad in path_text for bad in ("avatar", "profile", "seller", "shop_logo", "icon")
-            ):
-                add(node)
-            return
-        if isinstance(node, list):
-            for item in node:
-                walk(item, depth + 1, path)
-            return
-        if isinstance(node, dict):
-            # Image objects usually expose url_list; grab one best full-size URL instead of every CDN duplicate.
-            best = _sv_first_url(node)
-            path_text = " ".join(path).lower()
-            if best and not any(bad in path_text for bad in ("avatar", "profile", "seller", "shop_logo", "icon")):
-                add(best)
-            for key, child in node.items():
-                key_text = str(key).lower()
-                if key_text in {"url_list", "urllist", "thumb_url_list", "thumburllist"} and best:
-                    continue
-                walk(child, depth + 1, path + (key_text,))
-
-    walk(value)
-    return urls
-
-
-def _sv_flatten_specifications(value) -> list[str]:
-    """Create compact readable specification lines for later prompt/product context."""
-    lines: list[str] = []
-    for item in _sv_values(value):
-        if not isinstance(item, dict):
-            continue
-        name = str(
-            item.get("name") or item.get("label") or item.get("spec_name")
-            or item.get("specName") or item.get("key") or ""
-        ).strip()
-        raw_value = (
-            item.get("value") or item.get("text") or item.get("spec_value")
-            or item.get("specValue") or item.get("values")
-        )
-        if isinstance(raw_value, (list, dict)):
-            vals = []
-            for part in _sv_values(raw_value):
-                if isinstance(part, dict):
-                    part = part.get("name") or part.get("value") or part.get("text")
-                if part not in (None, ""):
-                    vals.append(str(part).strip())
-            value_text = ", ".join(v for v in vals if v)
-        else:
-            value_text = str(raw_value or "").strip()
-        line = f"{name}: {value_text}".strip(": ")
-        if line and line not in lines:
-            lines.append(line)
-    return lines[:40]
-
-
-def _sv_description_text(product_base: dict) -> str:
-    """Extract useful text from SociaVault's rich product description without pricing/stock noise."""
-    desc = product_base.get("desc_detailv3") or product_base.get("description") or ""
-    parts: list[str] = []
-
-    def walk(node, depth=0):
-        if depth > 8:
-            return
-        if isinstance(node, str):
-            cleaned = re.sub(r"\\s+", " ", html_unescape(node)).strip()
-            if 3 <= len(cleaned) <= 1000 and not cleaned.startswith(("http://", "https://")):
-                if cleaned not in parts:
-                    parts.append(cleaned)
-            return
-        if isinstance(node, list):
-            for child in node:
-                walk(child, depth + 1)
-        elif isinstance(node, dict):
-            for key, child in node.items():
-                if str(key).lower() in {"url", "uri", "url_list", "thumb_url_list", "image"}:
-                    continue
-                walk(child, depth + 1)
-
-    walk(desc)
-    return " ".join(parts)[:4000]
-
-
-def _sociavault_request(endpoint: str, api_key: str, params: dict) -> tuple[dict | None, str | None]:
-    """Call SociaVault and normalize its {success,data} envelope."""
-    if not api_key:
-        return None, "SociaVault API key is missing."
+def scrape_product(url: str, api_key: str = "") -> dict | None:
     try:
-        response = requests.get(
-            endpoint,
-            headers={"X-API-Key": api_key, "Accept": "application/json"},
-            params=params,
-            timeout=90,
+        resp = requests.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
+        resp.raise_for_status()
+        html = resp.text
+
+        # og:image
+        img_match = re.search(
+            r'<meta\s+(?:property|name)=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
+            html, re.IGNORECASE
         )
-        try:
-            payload = response.json()
-        except Exception:
-            payload = None
-        if response.status_code >= 400:
-            detail = ""
-            if isinstance(payload, dict):
-                detail = str(payload.get("message") or payload.get("error") or payload.get("detail") or "")
-            return None, f"SociaVault HTTP {response.status_code}" + (f": {detail[:500]}" if detail else "")
-        if not isinstance(payload, dict):
-            return None, "SociaVault returned a non-JSON response."
-        if payload.get("success") is False:
-            return None, str(payload.get("message") or payload.get("error") or "SociaVault request failed.")
-        data = payload.get("data", payload)
-        if not isinstance(data, dict):
-            return None, "SociaVault response did not contain product data."
-        if data.get("success") is False:
-            return None, str(data.get("message") or data.get("error") or "SociaVault could not import this product.")
-        return data, None
-    except requests.Timeout:
-        return None, "SociaVault timed out while importing the product."
-    except Exception as exc:
-        return None, f"SociaVault request failed: {exc}"
+        if not img_match:
+            img_match = re.search(
+                r'content=["\']([^"\']+)["\']\s+(?:property|name)=["\']og:image["\']',
+                html, re.IGNORECASE
+            )
 
+        meta_name_candidates, meta_url_candidates = _extract_meta_candidates(html)
 
-def scrape_product(url: str, api_key: str = "", socialvault_api_key: str = "") -> dict | None:
-    """Import a TikTok Shop product through SociaVault instead of scraping TikTok HTML directly.
+        listing_images = []
+        review_images = []
+        name_candidates = list(meta_name_candidates)
+        name_candidates.extend(_extract_raw_title_candidates(html))
+        if img_match:
+            listing_images.append(img_match.group(1))
 
-    The legacy ``api_key`` argument is kept so existing call sites remain compatible; it is
-    no longer used for product scraping. SociaVault supplies the title, official listing
-    images, product metadata, and review/customer images in structured JSON.
-    """
-    _ = api_key  # Backward-compatible argument; Claude is no longer involved in importing products.
-    product_url = str(url or "").strip()
-    if not product_url:
-        return None
+        # JSON-LD normally contains official listing images.
+        ld_blocks = re.findall(
+            r'<script\s+type=["\']application/ld\+json["\']>\s*(.*?)\s*</script>',
+            html, re.DOTALL | re.IGNORECASE
+        )
+        for block in ld_blocks:
+            try:
+                ld = json.loads(html_unescape(block))
+                name_candidates.extend(_find_product_names_in_dict(ld))
+                ld_listing, ld_review = _collect_categorized_images(ld)
+                listing_images.extend(ld_listing)
+                review_images.extend(ld_review)
+            except (json.JSONDecodeError, TypeError):
+                pass
 
-    sv_key = str(socialvault_api_key or "").strip()
-    if not sv_key:
-        try:
-            sv_key = str(st.session_state.get("runtime_sociavault_api_key", "") or "").strip()
-        except Exception:
-            sv_key = ""
-    if not sv_key:
-        try:
-            sv_key = str(get_secret("SOCIAVAULT_API_KEY") or "").strip()
-        except Exception:
-            sv_key = str(os.environ.get("SOCIAVAULT_API_KEY", "") or "").strip()
+        # Parse all hydration/application JSON payloads. TikTok often places review media
+        # in these blocks even when it is not visible in the initial HTML markup.
+        json_blocks = re.findall(
+            r'<script[^>]*type=["\']application/json["\'][^>]*>\s*(.*?)\s*</script>',
+            html, re.DOTALL | re.IGNORECASE
+        )
+        for block in json_blocks:
+            try:
+                payload = json.loads(html_unescape(block))
+            except (json.JSONDecodeError, TypeError):
+                continue
+            name_candidates.extend(_find_product_names_in_dict(payload))
+            payload_listing, payload_review = _collect_categorized_images(payload)
+            listing_images.extend(payload_listing)
+            review_images.extend(payload_review)
 
-    region = ""
-    try:
-        region = str(get_secret("SOCIAVAULT_REGION") or "").strip().upper()
+        # Image URLs in raw HTML. Nearby review-related text determines the bucket.
+        raw_image_pattern = re.compile(
+            r'https?://[^"\'\s<>]+(?:\.jpg|\.jpeg|\.png|\.webp|\.avif)(?:\?[^"\'\s<>]*)?',
+            re.IGNORECASE,
+        )
+        for match in raw_image_pattern.finditer(html):
+            image_url = match.group(0)
+            context = html[max(0, match.start() - 450): min(len(html), match.end() + 450)].lower()
+            if any(token in context for token in REVIEW_IMAGE_HINTS):
+                review_images.append(image_url)
+            elif any(token in image_url.lower() for token in ("product", "pdp", "origin", "large", "800", "1000", "1200")):
+                listing_images.append(image_url)
+
+        listing_images = _dedupe_image_urls(listing_images)
+        review_images = _dedupe_image_urls(review_images)
+
+        # Do not repeat official listing images inside the review-photo section.
+        listing_set = set(listing_images)
+        review_images = [image for image in review_images if image not in listing_set]
+
+        if not listing_images and review_images:
+            # A review photo can still be used as the primary reference if that is all TikTok exposes.
+            listing_images = [review_images[0]]
+
+        all_images = _dedupe_image_urls(listing_images + review_images)
+        if not all_images:
+            return None
+
+        name = _best_product_name(name_candidates)
+        name_source = "page_metadata" if name else ""
+        if not name or name == "Unknown Product":
+            # Slug-based PDP and short-share redirects can still expose a readable name.
+            fallback_urls = [resp.url] + meta_url_candidates + [url]
+            for fallback_url in fallback_urls:
+                candidate_name = _name_from_url(fallback_url)
+                if candidate_name and candidate_name != "Unknown Product":
+                    name = candidate_name
+                    name_source = "url_slug"
+                    break
+
+        product_id = _product_id_from_url(resp.url) or _product_id_from_url(url)
+        if (not name or name == "Unknown Product") and api_key:
+            recovered_name = recover_product_name_with_page_context(
+                api_key=api_key,
+                html=html,
+                image_urls=all_images,
+                page_url=resp.url,
+                product_id=product_id,
+            )
+            if recovered_name:
+                name = recovered_name
+                name_source = "page_context_fallback"
+
+        if (not name or name == "Unknown Product") and api_key:
+            recovered_name = recover_product_name_from_images(
+                api_key=api_key,
+                image_urls=all_images,
+                product_id=product_id,
+            )
+            if recovered_name:
+                name = recovered_name
+                name_source = "image_fallback"
+
+        if not name:
+            name = "Unknown Product"
+            name_source = "unresolved"
+
+        return {
+            "name": name[:100],
+            "name_source": name_source,
+            "product_id": product_id,
+            "images": all_images[:36],
+            "listing_images": listing_images[:18],
+            "review_images": review_images[:24],
+            "source_url": url,
+        }
+
     except Exception:
-        region = str(os.environ.get("SOCIAVAULT_REGION", "") or "").strip().upper()
-    region = region or SOCIAVAULT_REGION_DEFAULT
-
-    data, error = _sociavault_request(
-        SOCIAVAULT_PRODUCT_DETAILS_URL,
-        sv_key,
-        {"url": product_url, "get_related_videos": "false", "region": region},
-    )
-    if error or not data:
-        try:
-            st.session_state["last_sociavault_error"] = error or "SociaVault returned no product data."
-        except Exception:
-            pass
         return None
-
-    product_base = data.get("product_base") or data.get("product") or {}
-    if not isinstance(product_base, dict):
-        product_base = {}
-
-    product_id = str(data.get("product_id") or product_base.get("id") or _product_id_from_url(product_url) or "").strip()
-    name = _clean_product_name_candidate(product_base.get("title") or product_base.get("name") or "")
-    if not name:
-        name = _name_from_url(product_url)
-    if not name:
-        name = "Unknown Product"
-
-    listing_images: list[str] = []
-    for image in _sv_values(product_base.get("images")):
-        best = _sv_first_url(image)
-        if best and best not in listing_images:
-            listing_images.append(best)
-    # Some response variants expose a share/cover image outside product_base.
-    if not listing_images:
-        for candidate in _sv_collect_media_urls(data.get("share_info") or {}):
-            if candidate not in listing_images:
-                listing_images.append(candidate)
-
-    review_images: list[str] = []
-    review_block = data.get("product_detail_review") or {}
-    review_items = _sv_values(review_block.get("review_items") if isinstance(review_block, dict) else None)
-    for item in review_items:
-        if not isinstance(item, dict):
-            continue
-        review = item.get("review") if isinstance(item.get("review"), dict) else item
-        for candidate in _sv_collect_media_urls({
-            "images": review.get("images"),
-            "media": review.get("media"),
-            "review_images": review.get("review_images"),
-            "display_image_url": review.get("display_image_url"),
-        }):
-            if candidate not in review_images and candidate not in listing_images:
-                review_images.append(candidate)
-
-    # Product Details usually includes review visuals. Only spend a second SociaVault
-    # credit when it exposes none, using the dedicated reviews endpoint as a fallback.
-    if not review_images and product_id:
-        review_data, _review_error = _sociavault_request(
-            SOCIAVAULT_PRODUCT_REVIEWS_URL,
-            sv_key,
-            {"product_id": product_id, "page": 1},
-        )
-        if review_data:
-            review_products = review_data.get("product_reviews") or {}
-            for review in _sv_values(review_products):
-                if not isinstance(review, dict):
-                    continue
-                for candidate in _sv_collect_media_urls({
-                    "review_images": review.get("review_images"),
-                    "display_image_url": review.get("display_image_url"),
-                }):
-                    if candidate not in review_images and candidate not in listing_images:
-                        review_images.append(candidate)
-
-    listing_images = _dedupe_image_urls(listing_images)[:18]
-    review_images = [u for u in _dedupe_image_urls(review_images) if u not in set(listing_images)][:24]
-    all_images = _dedupe_image_urls(listing_images + review_images)
-    if not all_images:
-        try:
-            st.session_state["last_sociavault_error"] = "SociaVault found the product but returned no usable product images."
-        except Exception:
-            pass
-        return None
-
-    seller = data.get("seller") if isinstance(data.get("seller"), dict) else {}
-    specs = _sv_flatten_specifications(product_base.get("specifications"))
-    description = _sv_description_text(product_base)
-
-    try:
-        st.session_state.pop("last_sociavault_error", None)
-    except Exception:
-        pass
-
-    return {
-        "name": name[:180],
-        "name_source": "SociaVault product_base.title",
-        "product_id": product_id,
-        "images": all_images[:36],
-        "listing_images": listing_images,
-        "review_images": review_images,
-        "source_url": product_url,
-        "import_source": "SociaVault",
-        "seller_name": str(seller.get("name") or "").strip(),
-        "category": str(product_base.get("category_name") or "").strip(),
-        "specifications": specs,
-        "description": description,
-        "product_rating": (review_block.get("product_rating") if isinstance(review_block, dict) else None),
-        "review_count": (review_block.get("review_count") if isinstance(review_block, dict) else None),
-    }
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -3523,17 +3341,15 @@ def generate_video(
 LIFESTYLE_IMAGE_GENERATE_SYSTEM = """You are an image production assistant with access to Magnific tools.
 Use the same Magnific MCP account already configured in the app.
 1. Upload EVERY provided reference image to Magnific using creations_upload_image.
-2. REFERENCE IMAGE 1 IS AUTHORITATIVE for the product as sold: exact package/container/form factor, silhouette, dimensions, closure, branding, label layout, colors, materials, and included parts. Never override reference 1 with a secondary image.
-3. References 2+ may be official alternate views or customer review photos. Use them only to improve secondary detail, real-world scale, texture, and appearance. If a review photo shows the product decanted, transferred, opened, poured, placed in another jar/bottle/container, or otherwise used differently from reference 1, IGNORE that alternate container/state for the final product form.
-4. HARD PRODUCT-FORM LOCK: never repackage, decant, transfer, reshape, or substitute the product. A pouch/bag must remain that exact pouch/bag; a sachet/stick pack must remain that exact sachet/stick pack; a bottle remains that bottle; a jar/tub remains that jar/tub; a box/carton remains that box/carton; a can/canister remains that can/canister; a tube remains that tube; an appliance/device remains its exact housing. Never convert one package type into another.
-5. Preserve the product's real function and sold configuration. Do not turn a powder/drink mix/supplement sold in a pouch into a jar, bottle, prepared drink, shaker, or other storage vessel. Do not invent replacement packaging.
-6. Generate EXACTLY ONE final lifestyle approval image.
-7. You MUST use the image model Nano Banana 2.
-8. You MUST use quality Pro.
-9. You MUST use resolution 2k.
-10. You MUST use aspect ratio 9:16.
-11. Submit the generation ONCE and return immediately after you receive the creation identifier. DO NOT call creations_get, DO NOT poll, and DO NOT wait for the image to finish.
-12. Return ONLY valid JSON (no markdown): {"creation_id":"the magnific creation identifier","status":"queued","url":null,"preview_url":null,"error":null}
+2. The supplied reference images all show the same product from official listing photos and/or customer review photos.
+3. Use ALL provided references together to preserve the exact product identity: packaging, branding, text, shape, scale, materials, colors, controls, accessories, proportions, and real-world appearance.
+4. Generate EXACTLY ONE final lifestyle approval image.
+5. You MUST use the image model Nano Banana 2.
+6. You MUST use quality Pro.
+7. You MUST use resolution 2k.
+8. You MUST use aspect ratio 9:16.
+9. Submit the generation ONCE and return immediately after you receive the creation identifier. DO NOT call creations_get, DO NOT poll, and DO NOT wait for the image to finish.
+10. Return ONLY valid JSON (no markdown): {"creation_id":"the magnific creation identifier","status":"queued","url":null,"preview_url":null,"error":null}
 """
 
 
@@ -3584,7 +3400,7 @@ def generate_lifestyle_image_magnific(
                 "content": (
                     f"Generate exactly one lifestyle approval image for {product_name}.\n"
                     "Required Magnific settings: use Nano Banana 2, quality Pro, resolution 2k, and aspect ratio 9:16.\n"
-                    "Reference image 1 is the PRIMARY source of truth for the exact sold package/container/form. Secondary images may show alternate views or customer usage but MUST NOT override the package type or physical form from reference 1. Preserve the product exactly while placing it into the requested clean, realistic lifestyle scene.\n\n"
+                    "Use the supplied reference images only as product references for the same item. Preserve the product exactly while placing it into the requested clean, realistic lifestyle scene.\n\n"
                     f"{refs_text}\n\n"
                     f"Final image prompt:\n{prompt}"
                 ),
@@ -4463,11 +4279,11 @@ def normalize_sniper_batch_products(
     progress_callback=None,
     api_key: str = "",
 ) -> tuple[list[dict], list[str]]:
-    """Import Sniper TikTok links through Seedance's SociaVault product flow.
+    """Re-scrape Sniper TikTok links with Seedance's normal scrape flow.
 
     This intentionally ignores transferred image URLs whenever a TikTok product
-    link is available. That gives imported products the same SociaVault listing
-    title, official product photos, and review/customer photos as products pasted directly into Step 1.
+    link is available. That gives imported products the same official listing
+    photos and review/customer photos as products pasted directly into Step 1.
     Older queue batches remain compatible because queued images are used only as
     a fallback when TikTok cannot be scraped.
     """
@@ -4511,7 +4327,7 @@ def normalize_sniper_batch_products(
                 "sniper_meta": dict(raw_product.get("sniper_meta") or {}),
                 "sniper_batch_id": batch.get("batch_id"),
                 "sniper_preset": batch.get("preset"),
-                "sniper_transfer_mode": "sociavault_product_import",
+                "sniper_transfer_mode": "tiktok_link_rescrape",
             })
             continue
 
@@ -4880,13 +4696,6 @@ For the outfit, combine evidence from ALL outfit references. Describe ONLY the c
 
 Determine whether shoes are visibly included in any selected outfit reference. If shoes are visible, describe them. If not, return clean white sneakers as the default. If only a top is visible across all selected references with no matching bottom, set bottom_fallback to black fitted jogger pants; otherwise leave bottom_fallback empty.
 
-Determine pose_focus using exactly one value: "shirt", "pants", "outfit", or "shoes".
-- shirt = top/tee/blouse/hoodie/jacket/sweater or other upper-body garment is the product.
-- pants = jeans/pants/shorts/leggings/joggers/skirt or other lower-body garment is the product.
-- outfit = matching set, dress, jumpsuit, romper, or both top and bottom are the product together.
-- shoes = footwear is the product.
-Set back_design_visible true only when a notable back graphic/print/design should be shown.
-
 Return ONLY valid JSON:
 {
   "avatar_description":"concise visible physical description",
@@ -4894,9 +4703,7 @@ Return ONLY valid JSON:
   "shoes_description":"visible shoes or clean white sneakers",
   "bottom_fallback":"black fitted jogger pants or empty string",
   "outfit_has_shoes":true,
-  "outfit_has_bottom":true,
-  "pose_focus":"shirt|pants|outfit|shoes",
-  "back_design_visible":false
+  "outfit_has_bottom":true
 }"""
 
     try:
@@ -4956,19 +4763,6 @@ Return ONLY valid JSON:
             return {"error": "Could not extract both avatar and outfit descriptions."}
         parsed["shoes_description"] = (parsed.get("shoes_description") or "clean white sneakers").strip()
         parsed["bottom_fallback"] = (parsed.get("bottom_fallback") or "").strip()
-        pose_focus = str(parsed.get("pose_focus") or "").strip().lower()
-        if pose_focus not in {"shirt", "pants", "outfit", "shoes"}:
-            desc = str(parsed.get("outfit_description") or "").lower()
-            top_hit = any(k in desc for k in ("shirt","tee","top","blouse","hoodie","sweater","jacket","coat","cardigan","tank"))
-            bottom_hit = any(k in desc for k in ("jean","pant","trouser","legging","jogger","short","skirt","cargo","waistband"))
-            shoe_hit = any(k in desc for k in ("shoe","sneaker","boot","heel","sandal","loafer","clog","slipper"))
-            if shoe_hit and not top_hit and not bottom_hit: pose_focus = "shoes"
-            elif top_hit and bottom_hit: pose_focus = "outfit"
-            elif bottom_hit: pose_focus = "pants"
-            elif top_hit: pose_focus = "shirt"
-            else: pose_focus = "outfit" if parsed.get("outfit_has_bottom") else "shirt"
-        parsed["pose_focus"] = pose_focus
-        parsed["back_design_visible"] = bool(parsed.get("back_design_visible", False))
         parsed["outfit_reference_count"] = usable_count
         return parsed
     except Exception as exc:
@@ -4979,26 +4773,25 @@ def build_avatar_outfit_image_prompt(
     outfit_description: str,
     shoes_description: str,
     bottom_fallback: str = "",
-    pose_focus: str = "outfit",
-    back_design_visible: bool = False,
 ) -> str:
-    """Build the Grok try-on image prompt with product-aware posing."""
+    """Build the image prompt from the kling-tryon-image skill."""
     outfit_line = outfit_description.strip()
     if bottom_fallback:
         outfit_line += f" Pair the visible top with {bottom_fallback}."
-    focus = (pose_focus or "outfit").strip().lower()
-    if focus == "pants":
-        pose = "Show off the pants: full lower body visible, free hand naturally near the waistband, thigh, pocket, or pant leg, stance chosen to make the fit and shape of the bottoms obvious."
-    elif focus == "shirt":
-        pose = "Show off the shirt/top: free hand naturally touches or gestures to the chest, collar, sleeve, or hem while keeping the upper garment as the obvious focus."
-    elif focus == "shoes":
-        pose = "Show off the shoes: full body remains visible, one foot slightly forward and legs angled so the footwear is easy to see."
-    else:
-        pose = "Show off the whole outfit: use a natural full-body styling pose that clearly presents both the top and bottom together."
-    if back_design_visible:
-        pose += " Use a slight natural turn so the back design is also partially visible."
 
-    prompt = f"""Authentic iPhone mirror selfie, 9:16 vertical, dimly lit room at night. Use the person from reference image 1 as the subject and preserve that exact identity and visible appearance: {avatar_description}. Do not preserve the avatar's original clothing. Dress the subject in the clothing from references 2+ and reproduce the product accurately: {outfit_line}. Shoes: {shoes_description}. {pose} Full-body head-to-toe mirror selfie inside a luxury modern penthouse at night. Subject holds a black iPhone at face level in the right hand so it partially covers the face. Floor-to-ceiling glass, illuminated blue infinity pool, night city skyline, palm trees, minimalist lounge furniture, warm polished tile and recessed ceiling lights. Real iPhone UGC: slight low-light sensor grain, natural pores and skin texture, subtle mirror smudge, realistic fabric texture and creases, mixed warm indoor and cool pool light, natural shadows, no studio lighting or beauty retouching. One person only. No pets, text, captions, prices, watermarks, extra logos, collage, split screen, or extra people."""
+    prompt = f"""Generate an image that looks like an authentic iPhone 15 Pro mirror selfie taken in a dimly lit room at night. Portrait orientation, 9:16 aspect ratio.
+
+Use the person from the FIRST reference image as the subject. Preserve the exact same identity and visible appearance. Visible avatar reference: {avatar_description}. Do not preserve the avatar's original clothing.
+
+Dress the subject in the outfit from the SECOND reference image. Replicate the clothing exactly: same colors, pattern, fit, silhouette, fabric look and visible construction details. Outfit: {outfit_line}
+
+Shoes: {shoes_description}. Also add a thick gold Cuban link chain necklace, gold luxury wristwatch, and gold rings.
+
+Scene: full-body head-to-toe mirror selfie inside a luxury modern penthouse at night. The subject stands before a full-length mirror and holds a black iPhone 16 in the right hand at face level so the phone partially covers the face. Slightly off-center natural handheld composition. Behind the subject: floor-to-ceiling glass windows, illuminated blue infinity pool, night city skyline and palm trees, minimalist lounge furniture, warm polished tile floor and warm recessed ceiling lights.
+
+iPhone UGC realism is critical: slight low-light sensor grain/noise in shadows; faint cool phone-screen glow on fingers and near side of face; barely visible mirror smudge/fingerprint; natural pores and skin texture; slightly muted warm iPhone nighttime colors; sharpest focus on torso/outfit with softer frame edges; very subtle free-hand motion blur; mixed warm ceiling light and cool blue pool light; no HDR, studio fill, rim light or beauty lighting; natural shadows; realistic fabric texture and slight worn creases.
+
+It must look like a real TikTok mirror selfie, not an AI render or polished fashion campaign. One person only. Full body entirely in frame. No extra people, pets or animals. No text, captions, prices, watermarks, logos added by the generator, or overlays."""
     return re.sub(r"\s+", " ", prompt).strip()
 
 
@@ -5006,251 +4799,56 @@ def build_avatar_outfit_kling_prompt(
     avatar_description: str,
     outfit_description: str,
     shoes_description: str,
-    pose_focus: str = "outfit",
-    back_design_visible: bool = False,
 ) -> str:
-    """Build an 8-second Grok mirror-video prompt with product-aware motion."""
-    avatar = re.sub(r"\s+", " ", avatar_description.strip())[:170]
-    outfit = re.sub(r"\s+", " ", outfit_description.strip())[:300]
-    shoes = re.sub(r"\s+", " ", shoes_description.strip())[:90] or "clean white sneakers"
-    focus = (pose_focus or "outfit").strip().lower()
-    if focus == "pants":
-        motion = "[0-2s] full-body front pose, pants fully visible. [2-4s] shift weight and free hand points/touches waistband, thigh, pocket or pant leg. [4-6s] slight side turn to show pant fit and leg shape. [6-8s] confident angle, small pant-leg or waistband adjustment, bottoms remain the focus."
-    elif focus == "shirt":
-        motion = "[0-2s] front mirror pose, shirt clearly visible. [2-4s] free hand touches chest, collar, sleeve or hem to show the top. [4-6s] slight side turn to show shirt shape" + (" and rotate enough to reveal the back design." if back_design_visible else ".") + " [6-8s] return to slight angle and lightly adjust the hem/sleeve, shirt remains the focus."
-    elif focus == "shoes":
-        motion = "[0-2s] full-body pose with one foot forward. [2-4s] shift weight and angle legs to emphasize footwear. [4-6s] small step/turn showing shoes from front and side. [6-8s] final pose with one foot forward, shoes remain easy to see."
-    else:
-        motion = "[0-2s] full-body front pose showing the whole outfit. [2-4s] shift weight and free hand gestures across top and lower outfit. [4-6s] slight side turn showing the complete look" + (" and enough rotation to hint at the back design." if back_design_visible else ".") + " [6-8s] confident slight-angle final pose with a small natural garment adjustment, full outfit remains visible."
-    prompt = f"""8-second 9:16 vertical TikTok UGC mirror-selfie video, one continuous take, no cuts. Preserve the exact person and approved start-image identity: {avatar}. Subject wears {outfit}; shoes: {shoes}. Phone stays at face level in the right hand and partially covers the face. Luxury penthouse at night with floor-to-ceiling glass, blue infinity pool, city skyline, palm trees, warm recessed lights and polished tile. {motion} Natural casual try-on movement like a real person showing clothing in a mirror, not runway choreography. Keep full body visible unless the product-focused gesture requires a brief emphasis. Preserve exact clothing colors, pattern, fit and construction from the approved image. One person only. No morphing, wardrobe change, extra limbs, animals, text, captions, watermarks, voiceover, music or sound. Photorealistic iPhone UGC."""
-    return re.sub(r"\s+", " ", prompt).strip()[:1899]
+    """Build a Kling O1 10-second prompt from the kling-mirror-tryon skill and keep it under 1,900 chars."""
+    avatar = re.sub(r"\s+", " ", avatar_description.strip())[:180]
+    outfit = re.sub(r"\s+", " ", outfit_description.strip())[:330]
+    shoes = re.sub(r"\s+", " ", shoes_description.strip())[:100] or "clean white sneakers"
+
+    prompt = f"""9:16 vertical video, single continuous mirror-selfie shot, no cuts. {avatar} stands before a full-length mirror in a luxury penthouse at night, holding a smartphone at face level in the right hand. The phone partially covers the face the entire video. The subject wears {outfit}, {shoes}, a thick gold Cuban link chain, gold luxury watch, and gold rings. Behind the subject: floor-to-ceiling glass, illuminated blue infinity pool, city skyline, palm trees, night sky, warm recessed lighting, polished tile floor.
+
+[00:00-00:02] Standing centered in mirror, full body head-to-toe, legs shoulder-width, upright and still. Outfit clearly displayed from front. Gentle handheld sway.
+
+[00:02-00:04] Shift weight to one side. Free hand lightly touches the shirt or garment front. Slight quarter-turn showing the outfit at an angle. Phone stays at face level covering the face.
+
+[00:04-00:06] Step back for a wider full-body view, shift between legs and turn to show the outfit from the side. Free arm gestures casually. Full outfit remains visible head-to-toe.
+
+[00:06-00:08] Move back into a centered confident pose at a slight angle and lightly adjust the watch, chain, or hemline. Outfit fully displayed.
+
+[00:08-00:10] Hold a clean final pose with a subtle sway and a tiny finishing garment adjustment so the last two seconds feel natural. Keep the full outfit visible and end calmly without freezing.
+
+Preserve the exact avatar identity, outfit colors/pattern/fit, shoes, penthouse environment and lighting from the approved start image. One person only. No animals. No voiceover, on-screen text, captions, subtitles, watermarks, music or sound. Photorealistic iPhone UGC realism."""
+    prompt = re.sub(r"\s+", " ", prompt).strip()
+
+    if len(prompt) >= 1900:
+        avatar = avatar[:110]
+        outfit = outfit[:220]
+        prompt = f"""9:16 vertical, single continuous mirror-selfie shot, no cuts. {avatar} stands before a full-length mirror in a luxury penthouse at night, holding a phone at face level so it partially covers the face throughout. Wearing {outfit}, {shoes}, thick gold Cuban link chain, gold watch, gold rings. Behind: floor-to-ceiling glass, illuminated blue infinity pool, city skyline, palm trees, warm recessed lights, polished tile.
+[00:00-00:02] Full body head-to-toe, front view, upright and still, gentle handheld sway.
+[00:02-00:04] Shift weight, free hand touches garment front, slight quarter-turn. Phone remains at face level.
+[00:04-00:06] Step back, wider full-body view, turn to show the outfit from the side, casual free-arm gesture.
+[00:06-00:08] Return to a confident slight-angle pose and lightly adjust watch, chain, or hemline.
+[00:08-00:10] Hold a natural final pose with subtle sway and a tiny finishing garment adjustment. End calmly, no freeze.
+Preserve exact identity, outfit, shoes, setting and lighting from the approved start image. One person only. No animals. No voiceover, text, captions, subtitles, watermarks, music or sound. Photorealistic iPhone UGC."""
+        prompt = re.sub(r"\s+", " ", prompt).strip()
+    return prompt[:1899]
 
 
-AVATAR_OUTFIT_IMAGE_GENERATE_SYSTEM = """You are a precise Magnific MCP operator for one Avatar Outfit image task.
-The caller has already handled local-file bytes. Only use the exact Magnific tool requested in each step.
-Never substitute models, never reorder reference identifiers, and never invent identifiers.
+AVATAR_OUTFIT_IMAGE_GENERATE_SYSTEM = """You are an image production assistant with access to Magnific tools.
+Use the same Magnific MCP account already configured in the app.
+1. Upload EVERY provided reference image to Magnific using creations_upload_image.
+2. Reference image 1 is the avatar/identity reference. Preserve this exact person's appearance and identity.
+3. Reference images 2+ are outfit/clothing references from official listing photos and/or customer review photos.
+4. Use ALL provided outfit references together for clothing accuracy: garment type, colors, pattern, fit, silhouette, fabric, details, and styling.
+5. Generate EXACTLY ONE final mirror-selfie try-on image.
+6. You MUST use model slug gpt_image_2.
+7. You MUST use quality high.
+8. You MUST use resolution 2k.
+9. You MUST use aspect ratio 9:16.
+10. Do not use GPT Image 1, Nano Banana, Grok, Auto, or any default fallback image model.
+11. Submit the generation ONCE and return immediately after you receive the creation identifier. DO NOT call creations_get, DO NOT poll, and DO NOT wait for the image to finish.
+12. Return ONLY valid JSON (no markdown): {"creation_id":"the magnific creation identifier","status":"queued","url":null,"preview_url":null,"error":null}
 """
-
-
-def _mcp_tool_result_records(response) -> list[dict]:
-    """Return MCP tool-result records with tool names plus parsed/raw content."""
-    names = {}
-    records = []
-    for block in getattr(response, "content", []) or []:
-        if getattr(block, "type", "") == "mcp_tool_use":
-            names[str(getattr(block, "id", "") or "")] = str(getattr(block, "name", "") or "")
-    for block in getattr(response, "content", []) or []:
-        if getattr(block, "type", "") != "mcp_tool_result":
-            continue
-        tool_use_id = str(getattr(block, "tool_use_id", "") or "")
-        tool_name = names.get(tool_use_id, "")
-        is_error = bool(getattr(block, "is_error", False))
-        subcontents = getattr(block, "content", None) or []
-        if isinstance(subcontents, str):
-            subcontents = [subcontents]
-        raw_parts = []
-        payloads = []
-        for sub in subcontents:
-            raw = sub if isinstance(sub, str) else getattr(sub, "text", None)
-            if not raw:
-                continue
-            raw = str(raw)
-            raw_parts.append(raw)
-            try:
-                parsed = json.loads(raw)
-                payloads.append(parsed)
-                if isinstance(parsed, dict) and isinstance(parsed.get("text"), str):
-                    payloads.append({"_wrapped_text": parsed.get("text")})
-            except Exception:
-                payloads.append({"_raw_text": raw})
-        records.append({
-            "tool_name": tool_name,
-            "is_error": is_error,
-            "raw": "\n".join(raw_parts),
-            "payloads": payloads,
-        })
-    return records
-
-
-def _run_exact_magnific_tool(
-    api_key: str,
-    magnific_token: str,
-    tool_name: str,
-    instruction: str,
-    max_turns: int = 4,
-):
-    """Ask Haiku to execute exactly one named Magnific MCP tool and return its result."""
-    client = anthropic.Anthropic(api_key=api_key)
-    mcp_servers = [{
-        "type": "url",
-        "url": MAGNIFIC_MCP_URL,
-        "name": MAGNIFIC_MCP_NAME,
-        "authorization_token": magnific_token,
-    }]
-    messages = [{"role": "user", "content": instruction}]
-    last_response = None
-    for _ in range(max(1, int(max_turns))):
-        response = client.beta.messages.create(
-            model=MODEL,
-            max_tokens=700,
-            system=(
-                f"Execute exactly the Magnific MCP tool `{tool_name}` requested by the user. "
-                "Do not call a different creation/generation tool. Do not narrate before the tool call. "
-                "Return after the requested tool result is available."
-            ),
-            messages=messages,
-            mcp_servers=mcp_servers,
-            tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
-            betas=[MCP_BETA],
-        )
-        last_response = response
-        records = _mcp_tool_result_records(response)
-        if any(r.get("tool_name") == tool_name for r in records):
-            return response, records
-
-        assistant_content = _anthropic_blocks_to_message_params(getattr(response, "content", []) or [])
-        stop_reason = str(getattr(response, "stop_reason", "") or "").strip().lower()
-        pending = {str(b.get("id")) for b in assistant_content if isinstance(b, dict) and b.get("type") == "mcp_tool_use" and b.get("id")}
-        complete = {str(b.get("tool_use_id")) for b in assistant_content if isinstance(b, dict) and b.get("type") == "mcp_tool_result" and b.get("tool_use_id")}
-        if assistant_content:
-            messages.append({"role": "assistant", "content": assistant_content})
-        if stop_reason == "pause_turn" or (pending - complete):
-            continue
-        messages.append({"role": "user", "content": f"Call `{tool_name}` now exactly as instructed. Do not call any other tool."})
-    return last_response, _mcp_tool_result_records(last_response) if last_response is not None else []
-
-
-def _record_error(records: list[dict], tool_name: str) -> str:
-    for record in records or []:
-        if record.get("tool_name") == tool_name and record.get("is_error"):
-            return (record.get("raw") or f"{tool_name} failed")[:1800]
-    return ""
-
-
-def _extract_upload_target(records: list[dict]) -> tuple[str, str]:
-    proxy_url = ""
-    path = ""
-    for record in records or []:
-        for payload in record.get("payloads") or []:
-            if isinstance(payload, dict):
-                if isinstance(payload.get("proxyUploadUrl"), str):
-                    proxy_url = payload["proxyUploadUrl"]
-                if isinstance(payload.get("path"), str):
-                    path = payload["path"]
-                raw_text = str(payload.get("_wrapped_text") or payload.get("_raw_text") or "")
-                if raw_text:
-                    if not proxy_url:
-                        m = re.search(r'proxyUploadUrl\s*[:=]\s*["\']?(https?://[^"\'\s]+)', raw_text)
-                        if m:
-                            proxy_url = m.group(1)
-                    if not path:
-                        m = re.search(r'(?m)^path\s*:\s*["\']?([^"\'\n]+)', raw_text)
-                        if m:
-                            path = m.group(1).strip()
-        raw = str(record.get("raw") or "")
-        if raw:
-            if not proxy_url:
-                m = re.search(r'proxyUploadUrl["\']?\s*[:=]\s*["\'](https?://[^"\']+)', raw)
-                if m:
-                    proxy_url = m.group(1)
-            if not path:
-                m = re.search(r'"path"\s*:\s*"([^"]+)"', raw)
-                if m:
-                    path = m.group(1)
-    return proxy_url, path
-
-
-def _extract_creation_identifier(response, records: list[dict]) -> str:
-    parsed = _parse_magnific_creation_response(response) if response is not None else {}
-    candidate = str(parsed.get("creation_id") or "").strip()
-    if _is_real_magnific_creation_id(candidate):
-        return candidate
-    for record in records or []:
-        raw = str(record.get("raw") or "")
-        for pattern in (
-            r'(?i)"identifier"\s*:\s*"([A-Za-z0-9_-]{8,})"',
-            r'(?im)^identifier\s*:\s*["\']?([A-Za-z0-9_-]{8,})',
-            r'(?i)(?:creation|task|job)[ _-]?(?:id|identifier)\s*[:=]\s*["\']?([A-Za-z0-9_-]{8,})',
-        ):
-            m = re.search(pattern, raw)
-            if m and _is_real_magnific_creation_id(m.group(1)):
-                return m.group(1)
-    return ""
-
-
-def _decode_reference_data_uri(reference: str) -> tuple[bytes, str]:
-    reference = str(reference or "").strip()
-    if not reference.startswith("data:") or "," not in reference:
-        return b"", ""
-    header, encoded = reference.split(",", 1)
-    mime = header[5:].split(";", 1)[0].strip().lower() or "image/jpeg"
-    try:
-        return base64.b64decode(encoded), mime
-    except Exception:
-        return b"", mime
-
-
-def _upload_reference_to_magnific(
-    api_key: str,
-    magnific_token: str,
-    reference: str,
-    label: str,
-) -> dict:
-    """Upload one reference and return its Magnific creation identifier."""
-    reference = str(reference or "").strip()
-    if reference.startswith(("http://", "https://")):
-        instruction = (
-            "Call `creations_upload_image` exactly once with this public URL and return the tool result. "
-            f"URL: {reference}"
-        )
-        response, records = _run_exact_magnific_tool(api_key, magnific_token, "creations_upload_image", instruction)
-        error = _record_error(records, "creations_upload_image")
-        identifier = _extract_creation_identifier(response, records)
-        if error or not identifier:
-            return {"identifier": None, "error": error or f"Magnific did not return an identifier for {label}."}
-        return {"identifier": identifier, "error": None}
-
-    image_bytes, mime = _decode_reference_data_uri(reference)
-    if not image_bytes:
-        return {"identifier": None, "error": f"{label} is not a usable local image or public URL."}
-    if mime not in {"image/jpeg", "image/png", "image/webp"}:
-        mime = "image/jpeg"
-
-    request_instruction = (
-        "Call `creations_request_upload` exactly once. "
-        f"Use mimeType `{mime}` and count 1. Return the complete tool result."
-    )
-    request_response, request_records = _run_exact_magnific_tool(
-        api_key, magnific_token, "creations_request_upload", request_instruction
-    )
-    error = _record_error(request_records, "creations_request_upload")
-    proxy_url, temp_path = _extract_upload_target(request_records)
-    if error or not proxy_url or not temp_path:
-        return {"identifier": None, "error": error or f"Could not get a Magnific upload target for {label}."}
-
-    try:
-        put_response = requests.put(
-            proxy_url,
-            data=image_bytes,
-            headers={"Content-Type": mime},
-            timeout=60,
-        )
-        put_response.raise_for_status()
-    except Exception as exc:
-        return {"identifier": None, "error": f"Uploading {label} bytes to Magnific failed: {exc}"}
-
-    finalize_instruction = (
-        "Call `creations_finalize_upload` exactly once with this exact path and return the complete tool result. "
-        f"path: {temp_path}"
-    )
-    finalize_response, finalize_records = _run_exact_magnific_tool(
-        api_key, magnific_token, "creations_finalize_upload", finalize_instruction
-    )
-    error = _record_error(finalize_records, "creations_finalize_upload")
-    identifier = _extract_creation_identifier(finalize_response, finalize_records)
-    if error or not identifier:
-        return {"identifier": None, "error": error or f"Magnific did not finalize {label} into a creation identifier."}
-    return {"identifier": identifier, "error": None}
 
 
 def generate_avatar_outfit_image_magnific(
@@ -5260,7 +4858,7 @@ def generate_avatar_outfit_image_magnific(
     outfit_references: list[str],
     prompt: str,
 ) -> dict:
-    """Upload refs deterministically, then generate one Grok Imagine 2.0 try-on image."""
+    """Use Magnific GPT Image 2 High at 2K with one avatar plus multiple outfit references."""
     if not api_key:
         return {"creation_id": None, "status": "error", "error": "The Anthropic API key is missing."}
     if not magnific_token:
@@ -5271,76 +4869,80 @@ def generate_avatar_outfit_image_magnific(
     if not avatar_reference or not outfit_references:
         return {"creation_id": None, "status": "error", "error": "Choose an avatar and at least one outfit reference."}
 
+    # Keep the MCP payload compact while still preserving multi-reference support.
+    original_outfit_count = len(outfit_references)
     outfit_references = outfit_references[:5]
-    uploaded_ids = []
-    tools_seen = []
-
-    # HARD ORDER: avatar is fully uploaded/finalized first, before any outfit ref.
-    avatar_upload = _upload_reference_to_magnific(api_key, magnific_token, avatar_reference, "avatar reference")
-    if avatar_upload.get("error"):
-        return {"creation_id": None, "status": "error", "error": avatar_upload["error"], "mcp_tools_called": tools_seen}
-    avatar_id = avatar_upload["identifier"]
-    uploaded_ids.append(avatar_id)
-
-    for index, ref in enumerate(outfit_references, start=1):
-        uploaded = _upload_reference_to_magnific(api_key, magnific_token, ref, f"outfit reference {index}")
-        if uploaded.get("error"):
-            return {
-                "creation_id": None,
-                "status": "error",
-                "error": uploaded["error"],
-                "avatar_identifier": avatar_id,
-                "reference_identifiers": uploaded_ids,
-            }
-        uploaded_ids.append(uploaded["identifier"])
-
-    reference_payload = [
-        {"identifier": identifier, "type": "image"}
-        for identifier in uploaded_ids
-    ]
-    instruction = (
-        "Call `images_generate` exactly once. Do not upload anything else. "
-        f"Use mode `{AVATAR_OUTFIT_IMAGE_MODEL_SLUG}`, quality `medium`, aspectRatio `9:16`, count 1. "
-        "OMIT resolution because this Grok model does not expose a resolution parameter. "
-        "Use the following references in EXACTLY this order; the first identifier is the AVATAR and must stay first: "
-        f"{json.dumps(reference_payload)}\n"
-        f"Prompt: {prompt}"
+    avatar_reference, outfit_references, payload_omitted = _trim_magnific_reference_payload(
+        avatar_reference, outfit_references, max_data_uri_chars=700_000
     )
-    response, records = _run_exact_magnific_tool(api_key, magnific_token, "images_generate", instruction, max_turns=5)
-    error = _record_error(records, "images_generate")
-    result = _parse_magnific_creation_response(response) if response is not None else {
-        "creation_id": None, "status": "error", "url": None, "preview_url": None
-    }
-    creation_id = _extract_creation_identifier(response, records)
-    if creation_id:
-        result["creation_id"] = creation_id
-    if error or not _is_real_magnific_creation_id(result.get("creation_id")):
+    omitted_reference_count = max(0, original_outfit_count - len(outfit_references)) + int(payload_omitted or 0)
+    if not outfit_references:
         return {
             "creation_id": None,
             "status": "error",
-            "url": None,
-            "preview_url": None,
-            "error": error or "Grok Imagine 2.0 did not return a real generated-image creation ID.",
-            "avatar_identifier": avatar_id,
-            "reference_identifiers": uploaded_ids,
+            "error": "The selected local outfit references are still too large for the MCP request. Try fewer manual images or use TikTok-hosted product photos.",
         }
-    if not (result.get("url") or result.get("preview_url")):
-        result["status"] = "queued"
-    result["error"] = None
-    result["provider"] = "Magnific"
-    result["image_model"] = AVATAR_OUTFIT_IMAGE_MODEL_SLUG
-    result["image_quality"] = "medium"
-    result["image_resolution"] = "model default"
-    result["image_aspect_ratio"] = "9:16"
-    result["reference_count"] = len(uploaded_ids)
-    result["outfit_reference_count"] = len(outfit_references)
-    result["avatar_identifier"] = avatar_id
-    result["reference_identifiers"] = uploaded_ids
-    return result
+
+    mcp_servers = [{
+        "type": "url",
+        "url": MAGNIFIC_MCP_URL,
+        "name": MAGNIFIC_MCP_NAME,
+        "authorization_token": magnific_token,
+    }]
+
+    reference_lines = [f"Reference image 1 (AVATAR identity): {avatar_reference}"]
+    for idx, ref in enumerate(outfit_references, start=2):
+        reference_lines.append(f"Reference image {idx} (OUTFIT reference): {ref}")
+    refs_text = "\n\n".join(reference_lines)
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.beta.messages.create(
+            model=MODEL,
+            max_tokens=2048,
+            system=AVATAR_OUTFIT_IMAGE_GENERATE_SYSTEM,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "Generate one Avatar Outfit mirror-selfie try-on image.\n"
+                    "Required Magnific settings: model slug = gpt_image_2, quality = high, resolution = 2k, aspect ratio = 9:16.\n"
+                    "Use all supplied reference images together. Reference image 1 is the avatar identity to preserve exactly. "
+                    "Reference images 2+ are outfit / clothing / shoe references from official listing images and customer reviews.\n"
+                    "Upload every provided reference to Magnific using creations_upload_image, then generate the final image.\n"
+                    "Submit the generation exactly once and return as soon as you receive the real Magnific creation ID. Do not poll.\n\n"
+                    f"{refs_text}\n\n"
+                    f"Final image prompt:\n{prompt}"
+                ),
+            }],
+            mcp_servers=mcp_servers,
+            tools=[{"type": "mcp_toolset", "mcp_server_name": MAGNIFIC_MCP_NAME}],
+            betas=[MCP_BETA],
+        )
+        result = _parse_magnific_creation_response(response)
+        result["provider"] = "Magnific"
+        result["image_model"] = "gpt_image_2"
+        result["image_quality"] = "high"
+        result["image_resolution"] = "2K"
+        result["image_aspect_ratio"] = "9:16"
+        result["reference_count"] = 1 + len(outfit_references)
+        result["outfit_reference_count"] = len(outfit_references)
+        result["omitted_reference_count"] = omitted_reference_count
+        return result
+    except Exception as exc:
+        return {"creation_id": None, "status": "error", "error": f"Avatar Outfit image generation failed: {exc}"}
 
 
-AVATAR_OUTFIT_KLING_SYSTEM = """You are a precise Magnific MCP video operator.
-Call video_generate exactly once with the exact settings supplied by the user. Never substitute a model slug.
+
+AVATAR_OUTFIT_KLING_SYSTEM = """You are a video production assistant with access to Magnific MCP tools.
+This is a dependent, MULTI-STEP MCP workflow. The task is NOT complete after the start-frame upload.
+1. Upload the approved Avatar Outfit image with Magnific's available upload tool (currently exposed as creations_upload_file).
+2. After upload succeeds, CONTINUE and call video_generate with **Kling O1**.
+3. Use the uploaded approved image as the FIRST/START frame, not merely a generic reference.
+4. Use 9:16, 720p, EXACTLY 10 seconds, sound off, and the provided motion prompt.
+5. Magnific offers 5 or 10 seconds here; choose 10 seconds.
+6. Do not stop to narrate after upload. Continue until video_generate returns the REAL Magnific creation/task ID.
+7. Submit exactly one video generation and stop immediately after the real ID is returned. Do not poll.
+8. Never invent an identifier. Preserve any actual MCP error.
 """
 
 
@@ -5350,7 +4952,7 @@ def generate_avatar_outfit_kling_magnific(
     approved_image_url: str,
     prompt: str,
 ) -> dict:
-    """Animate the approved image with Grok default at 720p for exactly 8 seconds."""
+    """Animate the approved try-on image with Kling O1 using a multi-turn MCP sequence."""
     if not api_key:
         return {"creation_id": None, "status": "error", "error": "Anthropic API key is missing."}
     if not magnific_token:
@@ -5358,36 +4960,50 @@ def generate_avatar_outfit_kling_magnific(
     if not approved_image_url:
         return {"creation_id": None, "status": "error", "error": "Approve a generated try-on image first."}
 
-    instruction = (
-        "Call `video_generate` exactly once with ONE clip and these exact values: "
-        f"slug `{AVATAR_OUTFIT_VIDEO_MODEL_SLUG}`, duration 8, aspectRatio `9:16`, resolution `720p`, "
-        "no sound effects, and use the approved image as keyframes.start with type `image`. "
-        f"Approved start-frame URL: {approved_image_url}\n"
-        f"Prompt: {prompt}\n"
-        "Do not upload the image first. video_generate accepts the asset URL directly as the start keyframe. "
-        "Do not call any other video model and do not poll."
-    )
-    response, records = _run_exact_magnific_tool(api_key, magnific_token, "video_generate", instruction, max_turns=5)
-    error = _record_error(records, "video_generate")
-    result = _parse_magnific_creation_response(response) if response is not None else {}
-    creation_id = _extract_creation_identifier(response, records)
-    if creation_id:
-        result["creation_id"] = creation_id
-    if error or not _is_real_magnific_creation_id(result.get("creation_id")):
-        return {
-            "creation_id": None,
-            "status": "error",
-            "error": error or "Magnific did not return a real Grok video creation ID.",
-        }
-    if not (result.get("url") or result.get("preview_url")):
-        result["status"] = "queued"
-    result["error"] = None
-    result["video_model"] = AVATAR_OUTFIT_VIDEO_MODEL_SLUG
-    result["video_resolution"] = "720p"
-    result["video_duration"] = 8
-    result["video_aspect_ratio"] = "9:16"
-    result["submitted_at"] = datetime.now().isoformat(timespec="seconds")
-    return result
+    mcp_servers = [{
+        "type": "url",
+        "url": MAGNIFIC_MCP_URL,
+        "name": MAGNIFIC_MCP_NAME,
+        "authorization_token": magnific_token,
+    }]
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        result = _run_magnific_mcp_sequence(
+            client=client,
+            system=AVATAR_OUTFIT_KLING_SYSTEM,
+            initial_content=(
+                f"Approved Avatar Outfit start image: {approved_image_url}\n"
+                "Submit this to Magnific now. This is a multi-step task: upload the approved image, then CONTINUE to video_generate. "
+                "Use Kling O1, 720p, 9:16, EXACTLY 10 seconds, sound off. Use the approved image as the FIRST/START frame. "
+                "Stop only after Magnific returns the REAL creation/task ID. Do not poll.\n\n"
+                f"Kling prompt:\n{prompt}"
+            ),
+            mcp_servers=mcp_servers,
+            max_turns=6,
+            continuation_instruction=(
+                "Continue the SAME Magnific Kling O1 task now. Do not repeat a successful upload. "
+                "Use the uploaded start-frame handle/URL from the previous MCP result, call video_generate with Kling O1, "
+                "720p, 9:16, 10 seconds, sound off, and stop only after the REAL creation/task ID is returned. Do not narrate."
+            ),
+        )
+        creation_id = result.get("creation_id")
+        if not _is_real_magnific_creation_id(creation_id):
+            if result.get("error"):
+                return result
+            return {
+                "creation_id": None,
+                "status": "error",
+                "url": None,
+                "preview_url": None,
+                "error": "Magnific MCP did not return a real Kling creation ID, so the video was not confirmed as submitted.",
+                "mcp_tools_called": result.get("mcp_tools_called", []),
+            }
+        if not (result.get("url") or result.get("preview_url")):
+            result["status"] = "queued"
+        result["submitted_at"] = datetime.now().isoformat(timespec="seconds")
+        return result
+    except Exception as exc:
+        return {"creation_id": None, "status": "error", "error": str(exc)}
 
 
 def _reset_avatar_outfit_generated_state() -> None:
@@ -5557,13 +5173,13 @@ def _render_avatar_outfit_bulk_queue(api_key: str, magnific_token: str) -> None:
                 st.image(image_url, caption="Generated try-on image", use_container_width=True)
                 if not job.get("approved"):
                     if st.button(
-                        "✅ Approve image & queue Grok video",
+                        "✅ Approve image & queue Kling O1",
                         key=f"ao_bulk_approve_{job['job_id']}",
                         type="primary",
                         use_container_width=True,
                         disabled=not bool(api_key and magnific_token),
                     ):
-                        with st.spinner("Submitting Grok video job..."):
+                        with st.spinner("Submitting Kling O1 video job..."):
                             video_result = generate_avatar_outfit_kling_magnific(
                                 api_key=api_key,
                                 magnific_token=magnific_token,
@@ -5571,12 +5187,12 @@ def _render_avatar_outfit_bulk_queue(api_key: str, magnific_token: str) -> None:
                                 prompt=job.get("kling_prompt") or "",
                             )
                         if video_result.get("error") or not _is_real_magnific_creation_id(video_result.get("creation_id")):
-                            st.error(video_result.get("error") or "Magnific did not return a real Grok video creation ID.")
+                            st.error(video_result.get("error") or "Magnific did not return a real Kling creation ID.")
                         else:
                             job["approved"] = True
                             job["video"] = video_result
                             st.session_state["avatar_outfit_bulk_jobs"] = jobs
-                            st.session_state["avatar_outfit_queue_message"] = f"Grok video job sent to Magnific: {video_result.get('creation_id')}. Continue working and refresh later."
+                            st.session_state["avatar_outfit_queue_message"] = f"Kling O1 job sent to Magnific: {video_result.get('creation_id')}. Continue working and refresh later."
                             st.rerun()
             else:
                 creation_id = image.get("creation_id")
@@ -5587,28 +5203,28 @@ def _render_avatar_outfit_bulk_queue(api_key: str, magnific_token: str) -> None:
 
             if job.get("approved"):
                 if not video:
-                    st.info("Image approved. Grok video has not been queued yet.")
+                    st.info("Image approved. Kling O1 has not been queued yet.")
                 elif video_status == "error":
-                    st.error(video.get("error") or "Grok video generation failed.")
+                    st.error(video.get("error") or "Kling O1 generation failed.")
                 else:
                     video_url = video.get("url") or video.get("preview_url")
                     if video_url:
-                        video_bytes = fetch_video_bytes(video_url)
+                        bulk_creation_id = video.get("creation_id") or job["job_id"]
+                        video_bytes = fetch_video_bytes(video_url, cache_key=f"bulk_{bulk_creation_id}")
                         if video_bytes:
                             st.video(video_bytes, format="video/mp4")
-                        else:
-                            st.video(video_url)
-                        if video_bytes:
                             st.download_button(
                                 "⬇️ Download Avatar Outfit video",
                                 data=video_bytes,
-                                file_name=f"avatar_outfit_{video.get('creation_id', job['job_id'])}.mp4",
+                                file_name=f"avatar_outfit_{bulk_creation_id}.mp4",
                                 mime="video/mp4",
                                 key=f"ao_bulk_download_{job['job_id']}",
                                 use_container_width=True,
                             )
+                        else:
+                            st.caption("Video completed, but the signed MP4 URL needs a refresh before it can preview here.")
                     elif video.get("creation_id"):
-                        st.info(f"Grok video submitted: `{video.get('creation_id')}` · {video_status or 'processing'}")
+                        st.info(f"Kling O1 submitted: `{video.get('creation_id')}` · {video_status or 'processing'}")
 
             if st.button(
                 "🗑️ Remove from queue",
@@ -5626,10 +5242,10 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
         "Choose a saved avatar, then paste a TikTok Shop clothing link or upload outfit photos. You can select multiple official listing photos and customer review photos before generating the try-on."
     )
     st.info(
-        "Selected outfit photos are analyzed together and sent to Magnific Grok Imagine 2.0 as supporting references. The avatar reference is uploaded and finalized first, then the outfit references are attached after it. The Avatar Outfit video is a clean, silent Grok default mirror try-on at 720p for 8 seconds."
+        "Selected outfit photos are analyzed together and sent to Magnific GPT Image 2 High at 2K as supporting references. The Avatar Outfit video remains a clean, silent Kling O1 mirror try-on with no hook text, captions, voiceover, music, or soundtrack."
     )
     st.caption(
-        "Large avatar/outfit files are optimized automatically. Claude analysis gets a resized copy. For Magnific, local avatar bytes are uploaded through the real presigned upload flow so the avatar becomes a valid Magnific reference instead of being dropped."
+        "Large avatar/outfit files are optimized automatically. Claude analysis gets a resized copy, and local images get a separate compact reference copy for the Magnific MCP request so the request stays lightweight while still using the simpler one-pass GPT Image 2 flow."
     )
 
     _render_avatar_outfit_bulk_queue(api_key, magnific_token)
@@ -5684,18 +5300,18 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
                 "TikTok Shop clothing link",
                 key="avatar_outfit_tiktok_link",
                 placeholder="https://www.tiktok.com/view/product/...",
-                help="Import the product through SociaVault, then select official listing photos and customer review photos below.",
+                help="Scrape official product photos and customer review photos, then select multiple references below.",
             ).strip()
             if st.button(
-                "📦 Import outfit with SociaVault",
+                "🔎 Scrape outfit product",
                 key="avatar_outfit_scrape_link_btn",
                 use_container_width=True,
                 disabled=not bool(outfit_link),
             ):
-                with st.spinner("Importing listing and customer review photos from SociaVault..."):
+                with st.spinner("Scraping listing and customer review photos..."):
                     scraped = scrape_product(outfit_link, api_key=api_key)
                 if not scraped:
-                    st.error("Could not import that TikTok Shop outfit link through SociaVault.")
+                    st.error("Could not scrape that TikTok Shop outfit link.")
                 else:
                     st.session_state["avatar_outfit_scraped_product"] = scraped
                     st.session_state["avatar_outfit_scraped_source_url"] = outfit_link
@@ -5708,7 +5324,7 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
 
             if scraped:
                 outfit_name_prefill = scraped.get("name") or ""
-                st.success(f"Imported product: {scraped.get('name', 'Unknown Product')}")
+                st.success(f"Scraped product: {scraped.get('name', 'Unknown Product')}")
                 if scraped.get("name_source"):
                     st.caption(f"Name source: {scraped.get('name_source')}")
                 product_name_manual = st.text_input(
@@ -5886,7 +5502,7 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
     if not api_key:
         st.warning("Connect the Anthropic API key above to analyze the avatar and outfit references.")
     if not magnific_token:
-        st.warning("Connect Magnific above to generate the Avatar Outfit try-on image and run the Grok video step.")
+        st.warning("Connect Magnific above to generate the Avatar Outfit try-on image and run the Kling O1 video step.")
 
     analysis = st.session_state.get("avatar_outfit_analysis") or {}
     if not analysis:
@@ -5925,34 +5541,25 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
     if bottom_fallback:
         st.caption(f"Only a top was detected, so the image skill will pair it with: **{bottom_fallback}**")
 
-    pose_focus = analysis.get("pose_focus", "outfit")
-    back_design_visible = bool(analysis.get("back_design_visible", False))
-
     image_prompt = build_avatar_outfit_image_prompt(
         avatar_description=avatar_desc,
         outfit_description=outfit_desc,
         shoes_description=shoes_desc,
         bottom_fallback=bottom_fallback,
-        pose_focus=pose_focus,
-        back_design_visible=back_design_visible,
     )
     kling_prompt = build_avatar_outfit_kling_prompt(
         avatar_description=avatar_desc,
         outfit_description=outfit_desc,
         shoes_description=shoes_desc,
-        pose_focus=pose_focus,
-        back_design_visible=back_design_visible,
     )
-
-    st.caption(f"Reference send order: avatar FIRST → {len(saved_outfit_refs)} outfit reference(s) after it")
 
     with st.expander("📋 Skill prompts", expanded=False):
         st.markdown("**Try-on image prompt**")
         st.code(image_prompt, language=None)
         st.caption(f"Image model: {AVATAR_OUTFIT_IMAGE_MODEL_LABEL} · Outfit refs: {len(saved_outfit_refs)}")
-        st.markdown("**Grok mirror-video prompt**")
+        st.markdown("**Kling O1 mirror prompt**")
         st.code(kling_prompt, language=None)
-        st.caption(f"Grok prompt characters: {len(kling_prompt)}/1900 · {AVATAR_OUTFIT_VIDEO_MODEL_LABEL}")
+        st.caption(f"Kling prompt characters: {len(kling_prompt)}/1900 · {AVATAR_OUTFIT_VIDEO_MODEL_LABEL}")
 
     image_result = st.session_state.get("avatar_outfit_image_result") or {}
     generated_image_url = image_result.get("url") or image_result.get("preview_url")
@@ -5991,7 +5598,7 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
         )
 
         if queue_submit or single_submit:
-            with st.spinner(f"Submitting Magnific Grok Imagine 2.0 with {len(saved_outfit_refs)} outfit reference(s)..."):
+            with st.spinner(f"Submitting Magnific GPT Image 2 with {len(saved_outfit_refs)} outfit reference(s)..."):
                 result = generate_avatar_outfit_image_magnific(
                     api_key=api_key,
                     magnific_token=magnific_token,
@@ -6075,7 +5682,7 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
             key="avatar_outfit_regen_image",
             disabled=not bool(api_key and magnific_token and saved_avatar_ref and saved_outfit_refs),
         ):
-            with st.spinner("Generating another Magnific Grok Imagine 2.0 try-on image with the same selected references..."):
+            with st.spinner("Generating another Magnific GPT Image 2 try-on image with the same selected references..."):
                 result = generate_avatar_outfit_image_magnific(
                     api_key=api_key,
                     magnific_token=magnific_token,
@@ -6102,23 +5709,23 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
             st.rerun()
 
     if not st.session_state.get("avatar_outfit_image_approved"):
-        st.info("Approve the generated image before sending it to Grok video.")
+        st.info("Approve the generated image before sending it to Kling O1.")
         return
 
-    st.success("Image approved. This exact image will be used as the Grok video start frame.")
+    st.success("Image approved. This exact image will be used as the Kling O1 start frame.")
     video_result = st.session_state.get("avatar_outfit_video_result") or {}
     creation_id = video_result.get("creation_id")
     video_status = video_result.get("status", "")
 
     if not creation_id:
         if st.button(
-            "🎬 Send 8s Grok Video to Magnific",
+            "🎬 Send 10s Kling O1 Video to Magnific",
             type="primary",
             use_container_width=True,
             key="avatar_outfit_generate_video",
             disabled=not bool(api_key and magnific_token and generated_image_url),
         ):
-            with st.spinner("Sending the approved mirror image to Grok default as the start frame..."):
+            with st.spinner("Sending the approved mirror image to Kling O1 as the start frame..."):
                 result = generate_avatar_outfit_kling_magnific(
                     api_key=api_key,
                     magnific_token=magnific_token,
@@ -6137,7 +5744,7 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
                 st.rerun()
         return
 
-    st.markdown("### Grok mirror video")
+    st.markdown("### Kling O1 mirror video")
     video_url = video_result.get("url") or video_result.get("preview_url")
 
     # Any real creation ID without a finished URL is an asynchronous job that must
@@ -6145,13 +5752,13 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
     if creation_id and not video_url and video_status != "error":
         st.info(f"Sent to Magnific · Status: **{video_status or 'queued'}** · Creation ID: `{creation_id}`")
         if st.button(
-            "🔄 Refresh Grok video status",
+            "🔄 Refresh Kling video status",
             key="avatar_outfit_check_video_status",
             type="primary",
             use_container_width=True,
             disabled=not bool(api_key and magnific_token and creation_id),
         ):
-            with st.spinner("Checking Magnific for the finished Grok video..."):
+            with st.spinner("Checking Magnific for the finished Kling O1 video..."):
                 refreshed = check_creation_status(api_key=api_key, magnific_token=magnific_token, creation_id=creation_id)
             merged = {**video_result, **{k: v for k, v in refreshed.items() if v is not None}}
             if merged.get("status") == "completed" and not (merged.get("url") or merged.get("preview_url")):
@@ -6162,13 +5769,26 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
 
     if video_status == "completed" and video_url:
         refreshed_key = f"{creation_id}_{hashlib.sha1(video_url.encode('utf-8')).hexdigest()[:12]}"
-        video_bytes = fetch_video_bytes(f"{video_url}#avatar_outfit={refreshed_key}")
+        video_bytes = fetch_video_bytes(video_url, cache_key=refreshed_key)
+
+        # Signed Magnific URLs can expire. If the first fetch fails, refresh the
+        # creation once to obtain a fresh output URL, then retry with that URL.
+        if not video_bytes and api_key and magnific_token and creation_id:
+            refreshed = check_creation_status(
+                api_key=api_key,
+                magnific_token=magnific_token,
+                creation_id=creation_id,
+            )
+            fresh_url = refreshed.get("url") or refreshed.get("preview_url")
+            if fresh_url:
+                merged = {**video_result, **{k: v for k, v in refreshed.items() if v is not None}}
+                st.session_state["avatar_outfit_video_result"] = merged
+                video_url = fresh_url
+                refreshed_key = f"{creation_id}_{hashlib.sha1(video_url.encode('utf-8')).hexdigest()[:12]}_fresh"
+                video_bytes = fetch_video_bytes(video_url, cache_key=refreshed_key)
+
         if video_bytes:
             st.video(video_bytes, format="video/mp4")
-        else:
-            st.video(video_url)
-            st.caption("Preview is using the remote Magnific URL because the MP4 bytes could not be fetched yet.")
-        if video_bytes:
             st.download_button(
                 "⬇️ Download Avatar Outfit video",
                 data=video_bytes,
@@ -6177,14 +5797,18 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
                 key="avatar_outfit_download_video",
                 use_container_width=True,
             )
+        else:
+            st.warning("The video is completed, but the signed Magnific MP4 could not be fetched yet. Click Refresh video below to request a fresh media URL.")
+            if video_url:
+                st.link_button("🔗 Open finished video", video_url, use_container_width=True)
         regen_cols = st.columns(2)
         if regen_cols[0].button(
-            "🎬 Regenerate Grok video",
+            "🎬 Regenerate Kling O1 video",
             key="avatar_outfit_regen_video",
             use_container_width=True,
             disabled=not bool(api_key and magnific_token and generated_image_url),
         ):
-            with st.spinner("Generating a fresh Grok mirror video from the approved image..."):
+            with st.spinner("Generating a fresh Kling O1 mirror video from the approved image..."):
                 result = generate_avatar_outfit_kling_magnific(
                     api_key=api_key,
                     magnific_token=magnific_token,
@@ -6215,7 +5839,7 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
         return
 
     if video_status == "error":
-        st.error(video_result.get("error") or "Grok video failed.")
+        st.error(video_result.get("error") or "Kling O1 failed.")
         retry_cols = st.columns(2)
         if retry_cols[0].button(
             "🎬 Retry Send to Magnific",
@@ -6236,7 +5860,7 @@ def render_avatar_outfit_flow(api_key: str, xai_api_key: str, magnific_token: st
     else:
         st.warning("Magnific has not returned a finished video URL yet.")
         if st.button(
-            "🔄 Refresh Grok video status",
+            "🔄 Refresh Kling video status",
             key="avatar_outfit_refresh_missing_url",
             type="primary",
             use_container_width=True,
@@ -6263,7 +5887,7 @@ def main():
         <section class="apple-hero">
             <div class="apple-kicker">✦ AI VIDEO WORKSPACE</div>
             <h1>Seedance Studio</h1>
-            <p>Turn TikTok Shop products into multiple video formats, or create Avatar Outfit mirror try-ons from an avatar + clothing reference using Magnific Grok Imagine 2.0 + Grok default video, then refine supported workflows with the existing editor.</p>
+            <p>Turn TikTok Shop products into multiple video formats, or create Avatar Outfit mirror try-ons from an avatar + clothing reference using Magnific GPT Image 2 + Kling O1, then refine supported workflows with the existing editor.</p>
         </section>
         """,
         unsafe_allow_html=True,
@@ -6272,7 +5896,6 @@ def main():
     # ── Always-visible video setup ──
     api_key_from_secrets = get_secret("ANTHROPIC_API_KEY")
     token_from_secrets = get_secret("MAGNIFIC_AUTH_TOKEN")
-    socialvault_key_from_secrets = get_secret("SOCIAVAULT_API_KEY")
     xai_key_from_secrets = get_secret("XAI_API_KEY")
     director_key_from_secrets = get_secret("DIRECTOR_INGEST_KEY")
     director_url_from_secrets = get_secret("DIRECTOR_INGEST_URL") or DIRECTOR_INGEST_URL_DEFAULT
@@ -6285,8 +5908,6 @@ def main():
         st.session_state["runtime_anthropic_api_key"] = api_key_from_secrets
     if "runtime_magnific_token" not in st.session_state:
         st.session_state["runtime_magnific_token"] = token_from_secrets
-    if "runtime_sociavault_api_key" not in st.session_state:
-        st.session_state["runtime_sociavault_api_key"] = socialvault_key_from_secrets
     if "runtime_xai_api_key" not in st.session_state:
         st.session_state["runtime_xai_api_key"] = xai_key_from_secrets
     if "runtime_director_ingest_key" not in st.session_state:
@@ -6365,7 +5986,7 @@ def main():
             duration = 8
             voice_script = None
             st.info(
-                "Avatar Outfit uses the two uploaded try-on skills as one workflow: upload the avatar and outfit separately, analyze both, generate a 9:16 iPhone-style penthouse mirror selfie with Magnific Grok Imagine 2.0, approve it, then use that exact image as the Grok default start frame for an 8-second 720p silent mirror try-on video."
+                "Avatar Outfit uses the two uploaded try-on skills as one workflow: upload the avatar and outfit separately, analyze both, generate a 9:16 iPhone-style penthouse mirror selfie with Magnific GPT Image 2, approve it, then use that exact image as the Kling O1 start frame for the silent mirror try-on video."
             )
             st.caption(f"Image model: {AVATAR_OUTFIT_IMAGE_MODEL_LABEL}  |  Video model: {AVATAR_OUTFIT_VIDEO_MODEL_LABEL}")
         else:
@@ -6376,7 +5997,6 @@ def main():
         api_key = st.session_state.get("runtime_anthropic_api_key", "")
         magnific_token = st.session_state.get("runtime_magnific_token", "")
         xai_api_key = st.session_state.get("runtime_xai_api_key", "")
-        socialvault_api_key = st.session_state.get("runtime_sociavault_api_key", "")
         director_ingest_key = st.session_state.get("runtime_director_ingest_key", "")
         director_ingest_url = st.session_state.get("runtime_director_ingest_url", DIRECTOR_INGEST_URL_DEFAULT)
         queue_token = st.session_state.get("runtime_seedance_queue_token", "")
@@ -6392,10 +6012,7 @@ def main():
             status_col_2.success("Magnific connected")
         else:
             status_col_2.info("Magnific needed for video")
-        if socialvault_api_key:
-            status_col_3.success("SociaVault connected")
-        else:
-            status_col_3.warning("SociaVault key needed")
+        status_col_3.info("Nano Banana + Kling via Magnific")
         if director_ingest_key:
             status_col_4.success("Director connected")
         else:
@@ -6406,7 +6023,7 @@ def main():
             status_col_5.info("Sniper inbox optional")
         st.caption(f"{STYLE_LABELS[style]} · {resolved_style_duration(style, duration)}s")
 
-        required_connections_ready = bool(api_key and magnific_token and socialvault_api_key)
+        required_connections_ready = bool(api_key and magnific_token)
         with st.expander("API connection", expanded=not required_connections_ready):
             if api_key_from_secrets:
                 st.success("Anthropic API key loaded from Streamlit secrets.")
@@ -6416,17 +6033,6 @@ def main():
                     type="password",
                     value=st.session_state.get("runtime_anthropic_api_key", ""),
                     key="runtime_anthropic_api_key_input",
-                )
-
-            if socialvault_key_from_secrets:
-                st.success("SociaVault API key loaded from Streamlit secrets. Product imports use SociaVault.")
-            else:
-                st.session_state["runtime_sociavault_api_key"] = st.text_input(
-                    "SociaVault API Key",
-                    type="password",
-                    value=st.session_state.get("runtime_sociavault_api_key", ""),
-                    key="runtime_sociavault_api_key_input",
-                    help="Used for TikTok Shop product titles, official listing images, specifications, and customer review images.",
                 )
 
             if xai_key_from_secrets or st.session_state.get("runtime_xai_api_key", ""):
@@ -6494,7 +6100,6 @@ def main():
             magnific_token = st.session_state.get("runtime_magnific_token", "")
             api_key = st.session_state.get("runtime_anthropic_api_key", "")
             xai_api_key = st.session_state.get("runtime_xai_api_key", "")
-            socialvault_api_key = st.session_state.get("runtime_sociavault_api_key", "")
             director_ingest_key = st.session_state.get("runtime_director_ingest_key", "")
             director_ingest_url = st.session_state.get("runtime_director_ingest_url", DIRECTOR_INGEST_URL_DEFAULT)
             queue_token = st.session_state.get("runtime_seedance_queue_token", "")
@@ -6548,8 +6153,8 @@ def main():
             st.markdown("### 📥 Momentum Sniper Inbox")
             st.caption(
                 "Momentum Sniper sends the TikTok links and research data. When you import a batch, "
-                "Seedance imports every TikTok product through SociaVault using the same flow as pasted links so you get "
-                "the exact listing title, official product photos, and customer review photos."
+                "Seedance re-scrapes every TikTok page using the same flow as pasted links so you get "
+                "official listing photos and customer review photos."
             )
         with inbox_refresh_col:
             if st.button(
@@ -6715,7 +6320,7 @@ def main():
     # ════════════════════════════════════════════════════════════════
     #  STEP 1 — PASTE LINKS
     # ════════════════════════════════════════════════════════════════
-    st.subheader("① Import TikTok Shop Products")
+    st.subheader("① Paste Product Links")
     links_input = st.text_area(
         "One TikTok Shop URL per line",
         placeholder=(
@@ -6726,7 +6331,7 @@ def main():
         label_visibility="collapsed",
     )
 
-    scrape_btn = st.button("📦 Import with SociaVault", use_container_width=True)
+    scrape_btn = st.button("🔍 Scrape Product & Review Photos", use_container_width=True)
 
     links = [
         line.strip() for line in links_input.strip().split("\n")
@@ -6745,17 +6350,16 @@ def main():
         st.caption("Choose official listing photos, customer review photos, or both. Multiple references improve product accuracy.")
 
         scraped_products = []
-        progress = st.progress(0, text="Importing from SociaVault...")
+        progress = st.progress(0, text="Scraping...")
 
         for i, url in enumerate(links):
-            progress.progress(i / len(links), text=f"Importing {i+1}/{len(links)} with SociaVault...")
+            progress.progress(i / len(links), text=f"Scraping {i+1}/{len(links)}...")
             scraped = scrape_product(url, api_key=api_key)
 
             if scraped and scraped["images"]:
                 scraped_products.append(scraped)
             else:
-                sv_error = st.session_state.get("last_sociavault_error", "")
-                st.error(f"❌ Couldn't import: {url[:70]}..." + (f" — {sv_error}" if sv_error else ""))
+                st.error(f"❌ Couldn't scrape: {url[:70]}...")
 
         progress.progress(1.0, text=f"Found {len(scraped_products)} product(s)")
 
@@ -6765,7 +6369,7 @@ def main():
             st.session_state["scraped"] = scraped_products
             st.session_state["product_hooks"] = {}
         else:
-            st.error("No products could be imported. Check your SociaVault key and TikTok Shop links.")
+            st.error("No products could be scraped. Check your links.")
 
     # ── Show image selection if we have scraped data (doesn't block the rest of the page) ──
     if "scraped" in st.session_state:
@@ -7057,11 +6661,11 @@ def main():
                         st.info("Describe the custom scene before generating so Nano Banana knows the correct environment and scale.")
 
                 appearance_details = st.text_area(
-                    "Product form / packaging / appearance lock",
+                    "Product appearance and scale details",
                     placeholder=LIFESTYLE_PRODUCT_TYPES[resolved_product_type]["appearance_help"],
                     height=92,
                     key=f"lifestyle_appearance_{product_fingerprint}",
-                    help="Used by BOTH the lifestyle image and the animation. Add any exact package/form detail that must never change, e.g. ‘flexible stand-up pouch, NOT a jar or bottle’. The primary reference image is still the source of truth.",
+                    help="Kling uses this after image approval. Include every feature that must stay unchanged, especially overall size, materials, controls, accessories, and proportions.",
                 ).strip()
                 default_appearance = (
                     "the exact real-world size, silhouette, construction, colors, materials, controls, accessories, branding, "
@@ -7121,7 +6725,7 @@ def main():
                     "custom_scene": custom_scene,
                     "appearance_details": appearance_details,
                     "lifestyle_prompt": build_lifestyle_image_prompt(
-                        product["name"], scene_key, product_type, custom_scene, appearance_details
+                        product["name"], scene_key, product_type, custom_scene
                     ),
                     "kling_prompt": build_lifestyle_kling_prompt(
                         product["name"], appearance_details, scene_key, product_type, custom_scene
